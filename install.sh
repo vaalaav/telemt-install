@@ -714,7 +714,7 @@ step_install_mytelemtinfo() {
     info "Скачивание менеджера /usr/local/bin/mytelemtinfo"
     confirm "Установить?" skip || return 0
 
-    curl -fsSL "https://raw.githubusercontent.com/vaalaav/telemt-install/main/mytelemtinfo.sh" \
+    curl -fsSL "https://raw.githubusercontent.com/vaalaav/telemt-install/main/mytelemtinfo.sh?v=$(date +%s)" \
         -o /usr/local/bin/mytelemtinfo
     chmod +x /usr/local/bin/mytelemtinfo
     ok "Установлено: mytelemtinfo"
