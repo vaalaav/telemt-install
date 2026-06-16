@@ -73,6 +73,17 @@ svc_status_color() {
     esac
 }
 
+# ─── Получить публичный IP сервера ───────────────────────────────────────────
+get_public_ip() {
+    local ip
+    ip=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null) || true
+    [[ -z "$ip" ]] && ip=$(curl -s --max-time 3 https://ifconfig.me 2>/dev/null) || true
+    [[ -z "$ip" ]] && ip=$(curl -s --max-time 3 https://ipv4.icanhazip.com 2>/dev/null) || true
+    [[ -z "$ip" ]] && ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}')
+    [[ -z "$ip" ]] && ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    echo "$ip"
+}
+
 # ─── Получить ссылку из API ───────────────────────────────────────────────────
 get_link() {
     local api=$1
@@ -270,6 +281,70 @@ menu_proxy() {
 proxy_show_links() {
     draw_header
     echo -e "  ${BOLD}Ссылки для клиентов Telegram${RESET}\n"
+
+    # Проверяем что во всех конфигах прописан public_host (иначе ссылки будут с 0.0.0.0)
+    local need_fix=()
+    for f in /etc/telemt/telemt*.toml; do
+        [[ ! -f "$f" ]] && continue
+        if ! grep -q 'public_host' "$f" 2>/dev/null; then
+            need_fix+=("$f")
+        fi
+    done
+
+    if [[ ${#need_fix[@]} -gt 0 ]]; then
+        warn "В ${#need_fix[@]} конфигах нет public_host — ссылки будут с IP 0.0.0.0"
+        echo -e "  ${DIM}Файлы: ${need_fix[*]}${RESET}"
+        echo ""
+        read -rp "  Автоматически добавить public_host? [Y/n]: " ans
+        if [[ ! "${ans,,}" =~ ^(n|no)$ ]]; then
+            local pub_ip; pub_ip=$(get_public_ip)
+            if [[ -z "$pub_ip" ]]; then
+                read -rp "  Не удалось определить IP. Введите вручную: " pub_ip
+            else
+                info "Публичный IP: ${BOLD}${pub_ip}${RESET}"
+                read -rp "  Подтвердить или ввести свой [${pub_ip}]: " inp
+                pub_ip="${inp:-$pub_ip}"
+            fi
+
+            for f in "${need_fix[@]}"; do
+                python3 - "$f" "$pub_ip" << 'PYEOF'
+import sys, re
+path, ip = sys.argv[1], sys.argv[2]
+content = open(path).read()
+
+# Удаляем существующую секцию [general.links] если есть (на всякий случай)
+content = re.sub(r'\n*\[general\.links\][^\[]*', '\n', content, flags=re.DOTALL)
+
+# Вставляем [general.links] сразу после [general.modes]
+modes_match = re.search(r'(\[general\.modes\][^\[]*)', content, flags=re.DOTALL)
+if modes_match:
+    insert_after = modes_match.end()
+    block = f'\n[general.links]\nshow = "*"\npublic_host = "{ip}"\n'
+    content = content[:insert_after] + block + content[insert_after:]
+else:
+    # Вставляем в начало после [general]
+    content = re.sub(r'(\[general\][^\[]*)', r'\1\n[general.links]\nshow = "*"\npublic_host = "' + ip + '"\n\n', content, count=1)
+
+# Чистим тройные пустые строки
+content = re.sub(r'\n{3,}', '\n\n', content)
+open(path, 'w').write(content)
+print(f"  {path}")
+PYEOF
+            done
+            chown -R telemt:telemt /etc/telemt 2>/dev/null || true
+            ok "public_host добавлен"
+
+            # Перезапуск
+            local insts; read -ra insts <<< "$(active_instances)"
+            info "Перезапуск инстансов..."
+            for n in "${insts[@]}"; do
+                systemctl restart "telemt${n}" 2>/dev/null && ok "telemt${n}" || err "telemt${n} ошибка"
+            done
+            sleep 3
+            echo ""
+        fi
+    fi
+
     local insts; read -ra insts <<< "$(active_instances)"
     for n in "${insts[@]}"; do
         local api="${INSTANCE_APIS[$n]}"
@@ -654,6 +729,14 @@ proxy_add() {
     # Создаём конфиг
     local tg_line=""
     [[ "$has_timeouts" == true ]] && tg_line="tg_connect = ${tm_tg}"
+    local pub_ip; pub_ip=$(get_public_ip)
+    if [[ -z "$pub_ip" ]]; then
+        warn "Не удалось определить публичный IP. Введите вручную."
+        read -rp "  IP сервера: " pub_ip
+    else
+        info "Публичный IP сервера: ${BOLD}${pub_ip}${RESET}"
+    fi
+
     cat > "/etc/telemt/telemt${slot}.toml" << TOML
 [general]
 fast_mode = true
@@ -664,6 +747,10 @@ ${tg_line}
 classic = false
 secure = false
 tls = true
+
+[general.links]
+show = "*"
+public_host = "${pub_ip}"
 
 [network]
 ipv4 = true
