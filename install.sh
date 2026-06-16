@@ -190,14 +190,25 @@ select_components() {
         [[ "${ans,,}" =~ ^(n|no|н|нет)$ ]] && DO_RATELIMIT=false
     fi
 
-    # --- TCP Keepalive ---
+    # --- Сетевой тюнинг: TCP Keepalive + BBR ---
     echo ""
-    echo -e "  ${BOLD}TCP Keepalive${RESET} — ускоряет отлов мёртвых мобильных соединений:"
+    echo -e "  ${BOLD}Сетевой тюнинг ядра${RESET}"
+    echo ""
+    echo -e "  ${BOLD}TCP Keepalive${RESET} — ускоряет отлов мёртвых мобильных соединений (фикс iOS-фона)."
     echo -e "  Прописывает sysctl: keepalive_time=60 / intvl=15 / probes=3"
-    echo -e "  Мёртвый коннект рвётся за ~105с вместо ~2 часов по дефолту."
+    echo -e "  ${DIM}Когда iPhone усыпляет Telegram, сокет рвётся \"грязно\". Без keepalive сервер${RESET}"
+    echo -e "  ${DIM}держит мёртвый коннект часами и при возврате клиент залипает.${RESET}"
     DO_KEEPALIVE=true
     read -rp "$(echo -e "${YELLOW}?${RESET} Настроить TCP keepalive? [Y/n]: ")" ans
     [[ "${ans,,}" =~ ^(n|no|н|нет)$ ]] && DO_KEEPALIVE=false
+
+    echo ""
+    echo -e "  ${BOLD}BBR + fq qdisc${RESET} — congestion control от Google."
+    echo -e "  Улучшает скорость и латентность на нестабильных/мобильных каналах."
+    echo -e "  ${DIM}Безопасно: если BBR недоступен (старое ядро) — пропустится автоматически.${RESET}"
+    DO_BBR=true
+    read -rp "$(echo -e "${YELLOW}?${RESET} Включить BBR + fq? [Y/n]: ")" ans
+    [[ "${ans,,}" =~ ^(n|no|н|нет)$ ]] && DO_BBR=false
 
     # --- nft SYN Limiter ---
     echo ""
@@ -528,100 +539,81 @@ PYEOF
         warn "iptables не показывает (возможно nftables — это нормально)"
 }
 
-# ─── ШАГ 8: TCP Keepalive (sysctl) ───────────────────────────────────────────
+# ─── ШАГ 8: Сетевой тюнинг (Keepalive + BBR) ─────────────────────────────────
 step_keepalive() {
-    [[ "${DO_KEEPALIVE:-false}" != true ]] && return 0
-    hdr "Шаг 8 — TCP Keepalive (sysctl)"
+    # Пропускаем шаг полностью если ни keepalive, ни BBR не выбраны
+    [[ "${DO_KEEPALIVE:-false}" != true && "${DO_BBR:-false}" != true ]] && return 0
+    hdr "Шаг 8 — Сетевой тюнинг ядра"
 
     echo ""
-    echo -e "  Будет создан ${BOLD}/etc/sysctl.d/99-tg-keepalive.conf${RESET}:"
-    echo -e "  tcp_keepalive_time  = ${BOLD}60${RESET}   (первая проба через 60с тишины)"
-    echo -e "  tcp_keepalive_intvl = ${BOLD}15${RESET}   (повтор каждые 15с)"
-    echo -e "  tcp_keepalive_probes= ${BOLD}3${RESET}    (3 без ответа → RST)"
-    echo -e "  Мёртвый коннект рвётся за ~${BOLD}105с${RESET} вместо ~7200с по умолчанию."
-    echo ""
+    # Проверяем BBR доступен ли вообще
+    local bbr_available=false
+    if [[ "${DO_BBR:-false}" == true ]]; then
+        if sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q bbr; then
+            bbr_available=true
+        else
+            # Пробуем загрузить модуль
+            modprobe tcp_bbr 2>/dev/null || true
+            if sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q bbr; then
+                bbr_available=true
+                ok "Модуль tcp_bbr загружен"
+            else
+                warn "BBR недоступен в этом ядре — пропуск BBR-настроек"
+                DO_BBR=false
+            fi
+        fi
+    fi
 
-    confirm "Применить?" skip || return 0
+    # Формируем конфиг
+    local sysctl_file="/etc/sysctl.d/99-telemt-net.conf"
+    {
+        echo "# telemt — сетевой тюнинг ядра"
+        echo ""
+        if [[ "${DO_KEEPALIVE:-false}" == true ]]; then
+            echo "# --- TCP keepalive: быстро реапим мёртвые коннекты (фикс iOS-фона) ---"
+            echo "net.ipv4.tcp_keepalive_time = 60"
+            echo "net.ipv4.tcp_keepalive_intvl = 15"
+            echo "net.ipv4.tcp_keepalive_probes = 3"
+            echo ""
+        fi
+        if [[ "${DO_BBR:-false}" == true ]]; then
+            echo "# --- BBR + fq: лучше латентность и throughput на плохих сетях ---"
+            echo "net.core.default_qdisc = fq"
+            echo "net.ipv4.tcp_congestion_control = bbr"
+        fi
+    } > "$sysctl_file"
 
-    cat > /etc/sysctl.d/99-tg-keepalive.conf << 'SYSCTL'
-# telemt — агрессивный keepalive для отлова мёртвых мобильных соединений
-# после 60с тишины — первая keepalive-проба
-net.ipv4.tcp_keepalive_time = 60
-# повтор пробы каждые 15с
-net.ipv4.tcp_keepalive_intvl = 15
-# 3 неотвеченных пробы → RST
-net.ipv4.tcp_keepalive_probes = 3
-SYSCTL
+    # Удаляем старый файл если был (миграция со старого имени)
+    [[ -f /etc/sysctl.d/99-tg-keepalive.conf ]] && rm -f /etc/sysctl.d/99-tg-keepalive.conf
 
-    sysctl --system > /dev/null
-    ok "sysctl применён"
+    sysctl --system > /dev/null 2>&1
+    ok "Применён $sysctl_file"
 
     # Проверка
-    local t i p
-    t=$(sysctl -n net.ipv4.tcp_keepalive_time)
-    i=$(sysctl -n net.ipv4.tcp_keepalive_intvl)
-    p=$(sysctl -n net.ipv4.tcp_keepalive_probes)
-    echo -e "  Проверка ядра: time=${BOLD}$t${RESET} intvl=${BOLD}$i${RESET} probes=${BOLD}$p${RESET}"
-
-    if [[ "$t" == "60" && "$i" == "15" && "$p" == "3" ]]; then
-        ok "Keepalive настроен корректно"
-    else
-        warn "Значения не совпадают с ожидаемыми — проверь вручную"
-    fi
-
-    # Проверка активных соединений (если уже есть трафик)
     echo ""
-    read -rp "$(echo -e "${YELLOW}?${RESET} Запустить диагностику keepalive на текущих соединениях? [y/N]: ")" ans
-    if [[ "${ans,,}" =~ ^(y|yes|д|да)$ ]]; then
-        python3 << 'PYEOF'
-import subprocess, re, glob
-from collections import Counter
-
-ports = set()
-for f in glob.glob("/etc/telemt/*.toml"):
-    for line in open(f):
-        m = re.match(r'\s*port\s*=\s*(\d+)', line)
-        if m: ports.add(m.group(1))
-
-out = subprocess.run(["ss","-tinoH","state","established"], capture_output=True, text=True).stdout
-records, buf = [], ""
-for ln in out.split("\n"):
-    if not ln.strip(): continue
-    if ln[0].isspace(): buf += " " + ln.strip()
-    else:
-        if buf: records.append(buf)
-        buf = ln.strip()
-if buf: records.append(buf)
-
-timers, total = Counter(), 0
-for r in records:
-    f = r.split()
-    local = f[2] if len(f) > 2 else ""
-    if not any(local.endswith(":"+p) for p in ports): continue
-    total += 1
-    m = re.search(r'timer:\((\w+)', r)
-    timers[m.group(1) if m else "—"] += 1
-
-W = 44
-print("╭" + "─"*W + "╮")
-print("│ " + "KEEPALIVE CHECK".ljust(W-1) + "│")
-print("├" + "─"*W + "┤")
-print("│ " + f"Порты telemt:  {', '.join(sorted(ports)) or '—'}".ljust(W-1) + "│")
-print("│ " + f"Соединений:    {total}".ljust(W-1) + "│")
-print("├" + "─"*W + "┤")
-if total == 0:
-    print("│ " + "Нет активных соединений (норма при первом запуске)".ljust(W-1) + "│")
-else:
-    for name, cnt in timers.most_common():
-        bar = "█" * min(cnt, 20)
-        print("│ " + f"{name:<12} {cnt:>4}  {bar}".ljust(W-1) + "│")
-print("╰" + "─"*W + "╯")
-PYEOF
+    if [[ "${DO_KEEPALIVE:-false}" == true ]]; then
+        local t i p
+        t=$(sysctl -n net.ipv4.tcp_keepalive_time)
+        i=$(sysctl -n net.ipv4.tcp_keepalive_intvl)
+        p=$(sysctl -n net.ipv4.tcp_keepalive_probes)
+        echo -e "  Keepalive: time=${BOLD}$t${RESET} intvl=${BOLD}$i${RESET} probes=${BOLD}$p${RESET}"
+        if [[ "$t" == "60" && "$i" == "15" && "$p" == "3" ]]; then
+            ok "Keepalive — фикс iOS-фона активен (мёртвый коннект рвётся за ~105с)"
+        else
+            warn "Значения keepalive не совпадают с ожидаемыми"
+        fi
     fi
-
-    # Откат
-    echo ""
-    info "Для отката: rm /etc/sysctl.d/99-tg-keepalive.conf && sysctl -w net.ipv4.tcp_keepalive_time=7200 net.ipv4.tcp_keepalive_intvl=75 net.ipv4.tcp_keepalive_probes=9 && sysctl --system"
+    if [[ "${DO_BBR:-false}" == true ]]; then
+        local cc qdisc
+        cc=$(sysctl -n net.ipv4.tcp_congestion_control)
+        qdisc=$(sysctl -n net.core.default_qdisc)
+        echo -e "  BBR: congestion=${BOLD}$cc${RESET} qdisc=${BOLD}$qdisc${RESET}"
+        if [[ "$cc" == "bbr" && "$qdisc" == "fq" ]]; then
+            ok "BBR + fq qdisc активны"
+        else
+            warn "BBR/fq не применились — проверь sysctl вручную"
+        fi
+    fi
 }
 
 # ─── ШАГ 9: nft inbound SYN per-client limiter ───────────────────────────────
@@ -870,7 +862,8 @@ print_summary() {
     echo -e "  ${BOLD}Установлено:${RESET}"
     [[ "$DO_UFW"               == true ]] && echo -e "  ${GREEN}✓${RESET} UFW фаервол"
     [[ "$DO_RATELIMIT"         == true ]] && echo -e "  ${GREEN}✓${RESET} UFW rate-limit (xt_recent)"
-    [[ "${DO_KEEPALIVE:-false}" == true ]] && echo -e "  ${GREEN}✓${RESET} TCP keepalive (time=60 intvl=15 probes=3)"
+    [[ "${DO_KEEPALIVE:-false}" == true ]] && echo -e "  ${GREEN}✓${RESET} TCP keepalive (time=60 intvl=15 probes=3)  ${DIM}— фикс iOS-фона${RESET}"
+    [[ "${DO_BBR:-false}"       == true ]] && echo -e "  ${GREEN}✓${RESET} BBR + fq qdisc                            ${DIM}— скорость на плохих сетях${RESET}"
     [[ "${DO_NFT:-false}"      == true ]] && echo -e "  ${GREEN}✓${RESET} nft SYN limiter (${NFT_RATE} burst ${NFT_BURST})"
     [[ "${DO_TIMEOUTS:-false}" == true ]] && echo -e "  ${GREEN}✓${RESET} [timeouts]: tg_connect=${TM_TG} handshake=${TM_HS} keepalive=${TM_KA}"
 
@@ -914,6 +907,7 @@ main() {
     echo -e "  Инстансы:   ${INSTANCES[*]}"
     echo -e "  UFW:        $DO_UFW | rate-limit: $DO_RATELIMIT"
     echo -e "  Keepalive:  ${DO_KEEPALIVE:-false}"
+    echo -e "  BBR + fq:   ${DO_BBR:-false}"
     echo -e "  nft limiter:${DO_NFT:-false}"
     echo -e "  Таймауты:   ${DO_TIMEOUTS:-false}"
     echo ""
