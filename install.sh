@@ -633,6 +633,20 @@ SERVICE
     nft list chain inet telemt_limit input 2>/dev/null | grep "packets" || warn "Правил нет — проверь вывод выше"
 }
 
+
+# ─── ШАГ: Установка mytelemtinfo ─────────────────────────────────────────────
+step_install_mytelemtinfo() {
+    hdr "Установка команды mytelemtinfo"
+    info "Скачивание менеджера /usr/local/bin/mytelemtinfo"
+    confirm "Установить?" skip || return 0
+
+    curl -fsSL "https://raw.githubusercontent.com/vaalaav/telemt-install/main/mytelemtinfo.sh" \
+        -o /usr/local/bin/mytelemtinfo
+    chmod +x /usr/local/bin/mytelemtinfo
+    ok "Установлено: mytelemtinfo"
+    info "Запуск: ${BOLD}mytelemtinfo${RESET} или ${BOLD}sudo mytelemtinfo${RESET}"
+}
+
 # ─── ШАГ 10: Запуск сервисов ──────────────────────────────────────────────────
 step_start() {
     hdr "Шаг 10 — Запуск сервисов"
@@ -717,7 +731,10 @@ print_summary() {
     [[ "${DO_KEEPALIVE:-false}" == true ]] && echo -e "  sysctl net.ipv4.tcp_keepalive_time       # проверка keepalive"
 
     echo ""
-    echo -e "  ${BOLD}Обновление telemt:${RESET}"
+    echo -e "  ${BOLD}Менеджер:${RESET}"
+  echo -e "  ${CYAN}mytelemtinfo${RESET}  — интерактивное управление (прокси / keepalive / nft / таймауты)"
+  echo ""
+  echo -e "  ${BOLD}Обновление telemt:${RESET}"
     echo -e "  bash <(curl -fsSL https://raw.githubusercontent.com/vaalaav/telemt-install/main/install.sh) --update"
     echo ""
 }
@@ -769,6 +786,7 @@ main() {
     step_ratelimit
     step_keepalive
     step_nft_limiter
+    step_install_mytelemtinfo
     step_start
     step_links
     print_summary
