@@ -16,10 +16,10 @@ err()  { echo -e "  ${RED}✗${RESET} $*"; }
 pause(){ echo ""; read -rp "  Нажмите Enter для продолжения..." _; }
 
 # ─── Хелперы инстансов ────────────────────────────────────────────────────────
-declare -A INSTANCE_PORTS=([1]=443 [2]=5223 [3]=8530 [4]=0)
-declare -A INSTANCE_DOMAINS=([1]="www.cloudflare.com" [2]="www.apple.com" [3]="www.microsoft.com" [4]="")
-declare -A INSTANCE_APIS=([1]=9091 [2]=9092 [3]=9093 [4]=9094)
-INSTANCES_ALL=(1 2 3 4)
+declare -A INSTANCE_PORTS=([1]=443 [2]=5223 [3]=8530 [4]=0 [5]=0 [6]=0 [7]=0 [8]=0 [9]=0 [10]=0)
+declare -A INSTANCE_DOMAINS=([1]="www.cloudflare.com" [2]="www.apple.com" [3]="www.microsoft.com" [4]="" [5]="" [6]="" [7]="" [8]="" [9]="" [10]="")
+declare -A INSTANCE_APIS=([1]=9091 [2]=9092 [3]=9093 [4]=9094 [5]=9095 [6]=9096 [7]=9097 [8]=9098 [9]=9099 [10]=9100)
+INSTANCES_ALL=(1 2 3 4 5 6 7 8 9 10)
 
 # Перечитываем реальные значения порта/SNI из существующих конфигов
 load_instance_config() {
@@ -40,6 +40,14 @@ active_instances() {
         [[ -f "/etc/telemt/telemt${n}.toml" ]] && result+=("$n")
     done
     echo "${result[@]}"
+}
+
+# Найти первый свободный слот для нового инстанса (1-10)
+next_free_slot() {
+    for n in "${INSTANCES_ALL[@]}"; do
+        [[ ! -f "/etc/telemt/telemt${n}.toml" ]] && echo "$n" && return
+    done
+    echo ""
 }
 
 # Вызываем загрузку при старте
@@ -216,9 +224,11 @@ menu_proxy() {
         echo -e "  ${BOLD}3.${RESET} Остановить все инстансы"
         echo -e "  ${BOLD}4.${RESET} Запустить все инстансы"
         echo -e "  ${BOLD}5.${RESET} Управление отдельным инстансом"
-        echo -e "  ${BOLD}6.${RESET} Обновить бинарник telemt"
-        echo -e "  ${BOLD}7.${RESET} Просмотр логов"
-        echo -e "  ${BOLD}8.${RESET} ${RED}Удалить telemt полностью${RESET}"
+        echo -e "  ${GREEN}${BOLD}6.${RESET} ${GREEN}Добавить новый инстанс${RESET}"
+        echo -e "  ${YELLOW}${BOLD}7.${RESET} ${YELLOW}Удалить отдельный инстанс${RESET}"
+        echo -e "  ${BOLD}8.${RESET} Обновить бинарник telemt"
+        echo -e "  ${BOLD}9.${RESET} Просмотр логов"
+        echo -e "  ${BOLD}10.${RESET} ${RED}Удалить telemt полностью${RESET}"
         echo -e "  ${BOLD}0.${RESET} ← Назад"
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
         echo ""
@@ -229,9 +239,11 @@ menu_proxy() {
             3) proxy_stop_all ;;
             4) proxy_start_all ;;
             5) proxy_single ;;
-            6) proxy_update ;;
-            7) proxy_logs ;;
-            8) proxy_remove ;;
+            6) proxy_add ;;
+            7) proxy_remove_single ;;
+            8) proxy_update ;;
+            9) proxy_logs ;;
+            10) proxy_remove ;;
             0|b) return ;;
             *) warn "Неверный пункт"; sleep 1 ;;
         esac
@@ -296,7 +308,7 @@ proxy_single() {
     done
     echo ""
     read -rp "  Номер инстанса ($(IFS=/; echo "${insts[*]}")): " n
-    [[ ! "$n" =~ ^[1-4]$ ]] && { warn "Неверный номер"; sleep 1; return; }
+    [[ ! "$n" =~ ^([1-9]|10)$ ]] && { warn "Неверный номер"; sleep 1; return; }
     [[ ! -f "/etc/telemt/telemt${n}.toml" ]] && { warn "Инстанс $n не установлен"; sleep 1; return; }
 
     while true; do
@@ -361,11 +373,414 @@ proxy_logs() {
             echo -e "\n${BOLD}${CYAN}── telemt${n} ──────────────────────────────${RESET}"
             journalctl -u "telemt${n}" -n 20 --no-pager
         done
-    elif [[ "$ch" =~ ^[1-4]$ ]] && [[ -f "/etc/systemd/system/telemt${ch}.service" ]]; then
+    elif [[ "$ch" =~ ^([1-9]|10)$ ]] && [[ -f "/etc/systemd/system/telemt${ch}.service" ]]; then
         journalctl -u "telemt${ch}" -n 60 --no-pager
     else
         warn "Неверный выбор"
     fi
+    pause
+}
+
+# ─── Синхронизация зависимостей при изменениях инстансов ─────────────────────
+
+# UFW: добавить правило порта
+ufw_add_port() {
+    local port=$1
+    if ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow "${port}/tcp" >/dev/null 2>&1 && ok "UFW: порт $port открыт" || warn "UFW: не удалось открыть $port"
+    fi
+}
+
+# UFW: удалить правило порта
+ufw_del_port() {
+    local port=$1
+    if ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw delete allow "${port}/tcp" >/dev/null 2>&1 && ok "UFW: порт $port закрыт" || true
+    fi
+}
+
+# UFW rate-limit: перегенерировать правила в before.rules под актуальные порты
+ufw_resync_ratelimit() {
+    if ! grep -q "MTProto rate-limit" /etc/ufw/before.rules 2>/dev/null; then
+        return 0  # rate-limit не установлен — нечего синхронизировать
+    fi
+
+    # Собираем актуальные порты из активных конфигов
+    local ports=()
+    for f in /etc/telemt/telemt*.toml; do
+        [[ ! -f "$f" ]] && continue
+        local p; p=$(grep -m1 '^\s*port\s*=' "$f" 2>/dev/null | grep -oE '[0-9]+')
+        [[ -n "$p" ]] && ports+=("$p")
+    done
+
+    info "Пересинхронизация rate-limit (xt_recent) для портов: ${ports[*]:-(нет)}"
+    cp /etc/ufw/before.rules "/etc/ufw/before.rules.bak.$(date +%s)"
+
+    local port_list=""
+    [[ ${#ports[@]} -gt 0 ]] && port_list=$(IFS=,; echo "${ports[*]}")
+
+    python3 - "$port_list" << 'PYEOF'
+import sys
+ports = [int(p) for p in sys.argv[1].split(",") if p]
+path = "/etc/ufw/before.rules"
+lines = open(path).readlines()
+# Удаляем старый блок
+out, skip = [], False
+for l in lines:
+    if "MTProto rate-limit" in l and "конец" not in l: skip = True
+    if not skip: out.append(l)
+    if "конец MTProto rate-limit" in l: skip = False
+# Если порты есть — вставляем новый блок
+if ports:
+    idx = None
+    for i, l in enumerate(out):
+        if "ufw-before-input -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" in l:
+            idx = i + 1; break
+    if idx is not None:
+        block = ["\n# === MTProto rate-limit (1 SYN/сек на IP per-port) ===\n"]
+        for p in ports:
+            block.append(f"-A ufw-before-input -p tcp --dport {p} --syn -m recent --name mtp{p} --rcheck --seconds 1 -j DROP\n")
+            block.append(f"-A ufw-before-input -p tcp --dport {p} --syn -m recent --name mtp{p} --set -j ACCEPT\n")
+        block.append("# === конец MTProto rate-limit ===\n")
+        out[idx:idx] = block
+open(path,"w").writelines(out)
+print(f"  {len(ports)} портов в rate-limit")
+PYEOF
+    ufw reload >/dev/null 2>&1 && ok "UFW перезагружен" || warn "Ошибка ufw reload"
+}
+
+# nft SYN limiter: перегенерировать правила
+nft_resync() {
+    if [[ ! -f /usr/local/sbin/telemt-nft-limit.sh ]]; then
+        return 0  # nft не установлен
+    fi
+
+    info "Пересинхронизация nft SYN limiter под актуальные порты..."
+
+    # Получаем параметры из существующего скрипта
+    local rate burst timeout ip
+    rate=$(grep -oP '(?<=^RATE=")[^"]+' /usr/local/sbin/telemt-nft-limit.sh 2>/dev/null || echo "1/second")
+    burst=$(grep -oP '(?<=^BURST=")[^"]+' /usr/local/sbin/telemt-nft-limit.sh 2>/dev/null || echo "1")
+    timeout=$(grep -oP '(?<=^METER_TIMEOUT=")[^"]+' /usr/local/sbin/telemt-nft-limit.sh 2>/dev/null || echo "60s")
+    ip=$(grep -oP '(?<=^SERVER_IP=")[^"]+' /usr/local/sbin/telemt-nft-limit.sh 2>/dev/null)
+
+    if [[ -z "$ip" ]]; then
+        ip=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null \
+             || ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}' \
+             || hostname -I | awk '{print $1}')
+    fi
+
+    # Собираем актуальные порты
+    local ports=()
+    for f in /etc/telemt/telemt*.toml; do
+        [[ ! -f "$f" ]] && continue
+        local p; p=$(grep -m1 '^\s*port\s*=' "$f" 2>/dev/null | grep -oE '[0-9]+')
+        [[ -n "$p" ]] && ports+=("$p")
+    done
+
+    # Перезаписываем скрипт telemt-nft-limit.sh
+    {
+        echo '#!/bin/bash'
+        echo '# telemt nft inbound SYN per-client limiter (auto-regenerated)'
+        echo 'set -eu'
+        echo ''
+        echo 'TABLE="telemt_limit"'
+        echo "SERVER_IP=\"${ip}\""
+        echo "RATE=\"${rate}\""
+        echo "BURST=\"${burst}\""
+        echo "METER_TIMEOUT=\"${timeout}\""
+        echo ''
+        echo 'nft delete table inet "$TABLE" 2>/dev/null || true'
+        echo 'nft add table inet "$TABLE"'
+        echo 'nft "add chain inet $TABLE input { type filter hook input priority 0; policy accept; }"'
+        echo ''
+        for p in "${ports[@]}"; do
+            echo "nft \"add rule inet \$TABLE input ip daddr \$SERVER_IP tcp dport ${p} tcp flags & (syn | ack) == syn meter telemt_in_syn_p${p} { ip saddr timeout \$METER_TIMEOUT limit rate over \$RATE burst \$BURST packets } counter drop comment \\\"telemt_syn_p${p}\\\"\""
+            echo "echo \"Правило применено: порт ${p}\""
+        done
+        echo ''
+        echo 'echo "=== Применённые правила ==="'
+        echo 'nft list chain inet telemt_limit input'
+    } > /usr/local/sbin/telemt-nft-limit.sh
+    chmod +x /usr/local/sbin/telemt-nft-limit.sh
+
+    if [[ ${#ports[@]} -eq 0 ]]; then
+        # Нет инстансов — просто очищаем таблицу
+        nft delete table inet telemt_limit 2>/dev/null || true
+        ok "nft: таблица удалена (нет инстансов)"
+    else
+        /usr/local/sbin/telemt-nft-limit.sh >/dev/null 2>&1 && \
+            ok "nft: правила обновлены для портов ${ports[*]}" || \
+            warn "Ошибка применения nft-правил"
+    fi
+}
+
+# ─── Добавление нового инстанса ──────────────────────────────────────────────
+proxy_add() {
+    draw_header
+    echo -e "  ${BOLD}Добавление нового инстанса telemt${RESET}\n"
+
+    # Находим свободный слот
+    local slot; slot=$(next_free_slot)
+    if [[ -z "$slot" ]]; then
+        err "Достигнут лимит в 10 инстансов. Сначала удалите ненужные."
+        pause; return
+    fi
+    info "Будет создан инстанс ${BOLD}#${slot}${RESET}"
+    echo ""
+
+    # Собираем уже занятые порты
+    local used_ports=()
+    for f in /etc/telemt/telemt*.toml; do
+        [[ ! -f "$f" ]] && continue
+        local p; p=$(grep -m1 '^\s*port\s*=' "$f" 2>/dev/null | grep -oE '[0-9]+')
+        [[ -n "$p" ]] && used_ports+=("$p")
+    done
+
+    echo -e "  ${DIM}Уже заняты порты: ${used_ports[*]:-(нет)}${RESET}"
+    echo -e "  ${DIM}Популярные SNI: www.cloudflare.com, www.apple.com, www.microsoft.com,${RESET}"
+    echo -e "  ${DIM}                www.google.com, www.amazon.com, www.youtube.com${RESET}"
+    echo ""
+
+    # Запрос порта
+    local new_port
+    while true; do
+        read -rp "  ? Порт (1-65535): " new_port
+        if ! [[ "$new_port" =~ ^[0-9]+$ ]] || (( new_port < 1 || new_port > 65535 )); then
+            warn "Порт должен быть числом от 1 до 65535"; continue
+        fi
+        local dup=false
+        for p in "${used_ports[@]}"; do [[ "$p" == "$new_port" ]] && dup=true && break; done
+        if [[ "$dup" == true ]]; then
+            warn "Порт $new_port уже занят другим инстансом"
+        else
+            break
+        fi
+    done
+
+    # Запрос SNI
+    local new_sni
+    while true; do
+        read -rp "  ? SNI домен: " new_sni
+        if [[ -n "$new_sni" && "$new_sni" == *.* ]]; then
+            break
+        else
+            warn "Введите корректный домен (например www.google.com)"
+        fi
+    done
+
+    # Генерация секрета
+    local new_secret; new_secret=$(openssl rand -hex 16)
+
+    # Получаем настройки таймаутов из существующих конфигов (если включены)
+    local has_timeouts=false tm_tg=10 tm_hs=15 tm_ka=60
+    for f in /etc/telemt/telemt*.toml; do
+        [[ ! -f "$f" ]] && continue
+        if grep -q '\[timeouts\]' "$f" 2>/dev/null; then
+            has_timeouts=true
+            tm_tg=$(grep -m1 'tg_connect' "$f" 2>/dev/null | grep -oE '[0-9]+' || echo 10)
+            tm_hs=$(grep -m1 'client_handshake' "$f" 2>/dev/null | grep -oE '[0-9]+' || echo 15)
+            tm_ka=$(grep -m1 'client_keepalive' "$f" 2>/dev/null | grep -oE '[0-9]+' || echo 60)
+            break
+        fi
+    done
+
+    echo ""
+    echo -e "  ${BOLD}Будет создан инстанс:${RESET}"
+    echo -e "    Слот:    ${BOLD}${slot}${RESET}"
+    echo -e "    Порт:    ${BOLD}${new_port}${RESET}"
+    echo -e "    SNI:     ${CYAN}${new_sni}${RESET}"
+    echo -e "    API:     127.0.0.1:${INSTANCE_APIS[$slot]}"
+    echo -e "    Секрет:  ${BOLD}${new_secret}${RESET}"
+    [[ "$has_timeouts" == true ]] && \
+        echo -e "    Таймауты: tg_connect=$tm_tg handshake=$tm_hs keepalive=$tm_ka ${DIM}(скопированы)${RESET}"
+    echo ""
+    read -rp "  Подтвердить создание? [Y/n]: " ans
+    [[ "${ans,,}" =~ ^(n|no)$ ]] && { info "Отменено"; pause; return; }
+
+    # Создаём конфиг
+    local tg_line=""
+    [[ "$has_timeouts" == true ]] && tg_line="tg_connect = ${tm_tg}"
+    cat > "/etc/telemt/telemt${slot}.toml" << TOML
+[general]
+fast_mode = true
+use_middle_proxy = false
+${tg_line}
+
+[general.modes]
+classic = false
+secure = false
+tls = true
+
+[network]
+ipv4 = true
+ipv6 = false
+prefer = 4
+
+[server]
+port = ${new_port}
+listen_addr_ipv4 = "0.0.0.0"
+client_mss = "tspu"
+
+[server.api]
+enabled = true
+listen = "127.0.0.1:${INSTANCE_APIS[$slot]}"
+whitelist = ["127.0.0.1/32"]
+
+[censorship]
+tls_domain = "${new_sni}"
+mask = true
+mask_port = 443
+tls_emulation = true
+unknown_sni_action = "reject_handshake"
+fake_cert_len = 2048
+
+[access]
+replay_check_len = 65536
+ignore_time_skew = false
+
+[access.users]
+user${slot} = "${new_secret}"
+TOML
+
+    if [[ "$has_timeouts" == true ]]; then
+        cat >> "/etc/telemt/telemt${slot}.toml" << TOMLTIME
+
+[timeouts]
+client_handshake = ${tm_hs}
+client_keepalive = ${tm_ka}
+TOMLTIME
+    fi
+
+    chown -R telemt:telemt /etc/telemt 2>/dev/null || true
+    ok "Конфиг /etc/telemt/telemt${slot}.toml создан"
+
+    # Обновляем нашу копию данных
+    INSTANCE_PORTS[$slot]="$new_port"
+    INSTANCE_DOMAINS[$slot]="$new_sni"
+
+    # Создаём systemd-сервис
+    cat > "/etc/systemd/system/telemt${slot}.service" << SERVICE
+[Unit]
+Description=Telemt Proxy ${slot} (port ${new_port} / ${new_sni})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=telemt
+Group=telemt
+WorkingDirectory=/opt/telemt
+ExecStart=/bin/telemt /etc/telemt/telemt${slot}.toml
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+    systemctl daemon-reload
+    ok "Сервис telemt${slot}.service создан"
+
+    # Открываем порт в UFW
+    ufw_add_port "$new_port"
+
+    # Синхронизируем зависимости
+    ufw_resync_ratelimit
+    nft_resync
+
+    # Запускаем
+    systemctl enable "telemt${slot}" >/dev/null 2>&1
+    if systemctl start "telemt${slot}" 2>/dev/null; then
+        sleep 2
+        local st; st=$(systemctl is-active "telemt${slot}")
+        if [[ "$st" == "active" ]]; then
+            ok "Инстанс telemt${slot} запущен"
+        else
+            err "Инстанс не запустился, статус: $st"
+            warn "Проверьте: journalctl -u telemt${slot} -n 30"
+        fi
+    else
+        err "systemctl start telemt${slot} вернул ошибку"
+    fi
+
+    # Показываем ссылку
+    echo ""
+    info "Получение ссылки для клиента..."
+    sleep 3
+    local link; link=$(get_link "${INSTANCE_APIS[$slot]}")
+    if [[ -n "$link" ]]; then
+        echo -e "  ${GREEN}${link}${RESET}"
+    else
+        warn "API ещё не ответил. Получите ссылку позже из главного меню."
+    fi
+    pause
+}
+
+# ─── Удаление отдельного инстанса ────────────────────────────────────────────
+proxy_remove_single() {
+    draw_header
+    echo -e "  ${BOLD}${YELLOW}Удаление отдельного инстанса${RESET}\n"
+
+    local insts; read -ra insts <<< "$(active_instances)"
+    if [[ ${#insts[@]} -eq 0 ]]; then
+        warn "Нет установленных инстансов"
+        pause; return
+    fi
+
+    echo -e "  ${BOLD}Доступные инстансы:${RESET}"
+    for n in "${insts[@]}"; do
+        local st; st=$(svc_status "$n")
+        printf "    ${BOLD}%-2s${RESET}  порт %-6s  %-24s  %b\n" \
+            "$n" "${INSTANCE_PORTS[$n]}" "${INSTANCE_DOMAINS[$n]}" "$(svc_status_color "$st")"
+    done
+    echo ""
+    read -rp "  Номер инстанса для удаления (или 'q' для отмены): " n
+    [[ "$n" == "q" || -z "$n" ]] && return
+    if ! [[ "$n" =~ ^([1-9]|10)$ ]] || [[ ! -f "/etc/telemt/telemt${n}.toml" ]]; then
+        warn "Инстанс $n не существует"; pause; return
+    fi
+
+    local port="${INSTANCE_PORTS[$n]}"
+    local domain="${INSTANCE_DOMAINS[$n]}"
+
+    echo ""
+    warn "Будет удалён инстанс ${BOLD}#${n}${RESET} — порт ${BOLD}${port}${RESET}, SNI ${CYAN}${domain}${RESET}"
+    read -rp "  Подтвердить? [y/N]: " ans
+    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && { info "Отменено"; pause; return; }
+
+    # Останавливаем и удаляем сервис
+    systemctl stop    "telemt${n}" 2>/dev/null || true
+    systemctl disable "telemt${n}" 2>/dev/null || true
+    rm -f "/etc/systemd/system/telemt${n}.service"
+    systemctl daemon-reload
+    ok "Сервис telemt${n} удалён"
+
+    # Удаляем конфиг
+    rm -f "/etc/telemt/telemt${n}.toml"
+    ok "Конфиг telemt${n}.toml удалён"
+
+    # Сбрасываем в массивах
+    INSTANCE_PORTS[$n]=0
+    INSTANCE_DOMAINS[$n]=""
+
+    # Спрашиваем закрыть ли порт в UFW
+    if ufw status 2>/dev/null | grep -qE "${port}/tcp"; then
+        read -rp "  Закрыть порт $port в UFW? [Y/n]: " ans_ufw
+        [[ ! "${ans_ufw,,}" =~ ^(n|no)$ ]] && ufw_del_port "$port"
+    fi
+
+    # Синхронизируем зависимости
+    ufw_resync_ratelimit
+    nft_resync
+
+    echo ""
+    ok "Инстанс ${BOLD}#${n}${RESET} полностью удалён"
+    local remaining; read -ra remaining <<< "$(active_instances)"
+    info "Оставшиеся инстансы: ${remaining[*]:-(нет)}"
     pause
 }
 
