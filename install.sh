@@ -14,8 +14,8 @@ RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 
 # ─── Глобальные настройки инстансов (заполняются в select_components) ─────────
-declare -A CUSTOM_PORTS=([1]=443  [2]=5223 [3]=8530)
-declare -A CUSTOM_DOMAINS=([1]="www.cloudflare.com" [2]="www.apple.com" [3]="www.microsoft.com")
+declare -A CUSTOM_PORTS=([1]=443 [2]=5223 [3]=8530 [4]=0)
+declare -A CUSTOM_DOMAINS=([1]="www.cloudflare.com" [2]="www.apple.com" [3]="www.microsoft.com" [4]="")
 
 ok()   { echo -e "${GREEN}✓${RESET} $*"; }
 info() { echo -e "${CYAN}→${RESET} $*"; }
@@ -109,74 +109,66 @@ detect_ssh_port() {
 select_components() {
     hdr "Шаг 0 — Выбор компонентов"
 
-    # --- Инстансы + SNI/порт ---
+    # --- Инстансы ---
     echo ""
     echo -e "  ${BOLD}Инстансы telemt:${RESET}"
-    echo -e "  ${DIM}Enter — принять дефолт, или введите свой порт/SNI${RESET}"
-    echo -e "  ${DIM}Популярные SNI: cloudflare.com, apple.com, microsoft.com, google.com, amazon.com${RESET}"
+    echo -e "  ${GREEN}1${RESET} — порт ${BOLD}443${RESET}   | ${CYAN}www.cloudflare.com${RESET}  (HTTPS/CDN)"
+    echo -e "  ${GREEN}2${RESET} — порт ${BOLD}5223${RESET}  | ${CYAN}www.apple.com${RESET}       (Apple Push / Anti-DPI)"
+    echo -e "  ${GREEN}3${RESET} — порт ${BOLD}8530${RESET}  | ${CYAN}www.microsoft.com${RESET}   (Windows Update)"
+    echo -e "  ${GREEN}4${RESET} — ${BOLD}свой инстанс${RESET} | ${DIM}задаются вручную SNI и порт${RESET}"
     echo ""
-
-    INSTANCES=()
-    for n in 1 2 3; do
-        local def_port def_domain label
-        def_port="${CUSTOM_PORTS[$n]}"
-        def_domain="${CUSTOM_DOMAINS[$n]}"
-        case $n in
-            1) label="HTTPS/CDN" ;;
-            2) label="Apple Push / Anti-DPI" ;;
-            3) label="Windows Update" ;;
-        esac
-        echo -e "  ${BOLD}${GREEN}$n${RESET} — порт ${BOLD}${def_port}${RESET} | ${CYAN}${def_domain}${RESET}  ${DIM}(${label})${RESET}"
-        read -rp "$(echo -e "    ${YELLOW}?${RESET} Включить? [Y/n/custom]: ")" ans_inst
-        case "${ans_inst,,}" in
-            n|no|н|нет)
-                echo -e "    ${DIM}пропущен${RESET}"
-                ;;
-            custom|с|своё)
-                INSTANCES+=("$n")
-                # Порт
-                while true; do
-                    read -rp "$(echo -e "    ${YELLOW}→${RESET} Порт [${def_port}]: ")" inp_port
-                    inp_port="${inp_port:-$def_port}"
-                    if [[ "$inp_port" =~ ^[0-9]+$ ]] && (( inp_port >= 1 && inp_port <= 65535 )); then
-                        local dup=false
-                        for other in "${INSTANCES[@]}"; do
-                            [[ "$other" != "$n" && "${CUSTOM_PORTS[$other]}" == "$inp_port" ]] && dup=true && break
-                        done
-                        if [[ "$dup" == true ]]; then
-                            warn "Порт $inp_port уже занят другим инстансом"
-                        else
-                            CUSTOM_PORTS[$n]="$inp_port"; break
-                        fi
-                    else
-                        warn "Порт: число от 1 до 65535"
-                    fi
-                done
-                # SNI
-                while true; do
-                    read -rp "$(echo -e "    ${YELLOW}→${RESET} SNI домен [${def_domain}]: ")" inp_domain
-                    inp_domain="${inp_domain:-$def_domain}"
-                    if [[ -n "$inp_domain" && "$inp_domain" == *.* ]]; then
-                        CUSTOM_DOMAINS[$n]="$inp_domain"; break
-                    else
-                        warn "Введите корректный домен (например: www.google.com)"
-                    fi
-                done
-                ok "Инстанс $n: порт=${BOLD}${CUSTOM_PORTS[$n]}${RESET}  SNI=${CYAN}${CUSTOM_DOMAINS[$n]}${RESET}"
-                ;;
-            *)
-                # Y / Enter — оставить дефолт
-                INSTANCES+=("$n")
-                ok "Инстанс $n: порт=${BOLD}${def_port}${RESET}  SNI=${CYAN}${def_domain}${RESET}"
-                ;;
-        esac
-        echo ""
+    echo -e "  Введите номера через пробел или ${BOLD}all${RESET} (1 2 3, без 4):"
+    while true; do
+        read -rp "$(echo -e "${YELLOW}?${RESET} Инстансы [all]: ")" sel
+        sel="${sel:-all}"
+        if [[ "$sel" == "all" ]]; then INSTANCES=(1 2 3); break; fi
+        INSTANCES=(); valid=true
+        for n in $sel; do
+            [[ "$n" =~ ^[1-4]$ ]] && INSTANCES+=("$n") || { warn "Неверный номер: $n (допустимо 1-4)"; valid=false; break; }
+        done
+        [[ "$valid" == true && ${#INSTANCES[@]} -gt 0 ]] && break
     done
 
-    if [[ ${#INSTANCES[@]} -eq 0 ]]; then
-        warn "Не выбран ни один инстанс. Выход."
-        exit 1
+    # Если выбран кастомный инстанс — спрашиваем SNI и порт
+    if [[ " ${INSTANCES[*]} " =~ " 4 " ]]; then
+        echo ""
+        echo -e "  ${BOLD}Настройка кастомного инстанса (№4)${RESET}"
+        echo -e "  ${DIM}Популярные SNI: www.google.com, www.amazon.com, www.youtube.com,${RESET}"
+        echo -e "  ${DIM}                www.netflix.com, www.github.com, www.discord.com${RESET}"
+        echo ""
+
+        # Порт
+        while true; do
+            read -rp "$(echo -e "  ${YELLOW}?${RESET} Порт (1-65535): ")" inp_port
+            if [[ "$inp_port" =~ ^[0-9]+$ ]] && (( inp_port >= 1 && inp_port <= 65535 )); then
+                # Проверяем что не совпадает со стандартными
+                local dup=false
+                for other in "${INSTANCES[@]}"; do
+                    [[ "$other" != "4" && "${CUSTOM_PORTS[$other]}" == "$inp_port" ]] && dup=true && break
+                done
+                if [[ "$dup" == true ]]; then
+                    warn "Порт $inp_port уже используется другим выбранным инстансом"
+                else
+                    CUSTOM_PORTS[4]="$inp_port"; break
+                fi
+            else
+                warn "Порт должен быть числом от 1 до 65535"
+            fi
+        done
+
+        # SNI домен
+        while true; do
+            read -rp "$(echo -e "  ${YELLOW}?${RESET} SNI домен (например www.google.com): ")" inp_domain
+            if [[ -n "$inp_domain" && "$inp_domain" == *.* ]]; then
+                CUSTOM_DOMAINS[4]="$inp_domain"; break
+            else
+                warn "Введите корректный домен (с точкой, например www.google.com)"
+            fi
+        done
+
+        ok "Инстанс 4 (свой): порт=${BOLD}${CUSTOM_PORTS[4]}${RESET}  SNI=${CYAN}${CUSTOM_DOMAINS[4]}${RESET}"
     fi
+    ok "Инстансы: ${INSTANCES[*]}"
 
     # --- UFW ---
     echo ""
@@ -245,7 +237,7 @@ select_components() {
 # Читают из CUSTOM_PORTS / CUSTOM_DOMAINS, заполненных в select_components()
 instance_port()   { echo "${CUSTOM_PORTS[$1]}"; }
 instance_domain() { echo "${CUSTOM_DOMAINS[$1]}"; }
-instance_api()    { local -A m=([1]=9091 [2]=9092  [3]=9093); echo "${m[$1]}"; }
+instance_api()    { local -A m=([1]=9091 [2]=9092 [3]=9093 [4]=9094); echo "${m[$1]}"; }
 
 # ─── ШАГ 1: Подготовка системы ───────────────────────────────────────────────
 step_prepare() {
