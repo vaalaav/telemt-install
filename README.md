@@ -1,154 +1,159 @@
 # telemt-install
 
-Скрипт автоматической установки **[telemt](https://github.com/telemt/telemt)** — Telegram MTProxy на Rust — на чистый Ubuntu VPS.
+Автоустановка **[telemt](https://github.com/telemt/telemt)** — Telegram MTProxy на Rust — на чистый Ubuntu VPS, с интерактивным менеджером `mytelemtinfo` для дальнейшего управления.
 
-Источники:
+Источники инструкций:
 - [Основной гайд](https://assyoucandy.github.io/telemt-server-guide/)
-- [Keepalive гайд](https://assyoucandy.github.io/telemt-server-guide/telemt-keepalive-guide.html)
+- [Keepalive](https://assyoucandy.github.io/telemt-server-guide/telemt-keepalive-guide.html)
 - [nft SYN limiter](https://h1de0x.github.io/telemt-tune/)
 
 ---
 
-## Быстрая установка
+## Установка
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/vaalaav/telemt-install/main/install.sh)
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/vaalaav/telemt-install/main/install.sh)
 ```
 
-> Требуется root. Ubuntu 20.04 / 22.04 / 24.04, архитектура x86\_64.
+> Требуется root. Поддержка: Ubuntu 20.04 / 22.04 / 24.04, архитектура x86_64.
+
+После установки управление прокси и всеми компонентами — командой `sudo mytelemtinfo`.
 
 ---
 
-## Обновление telemt
+## Как работает установка
 
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/vaalaav/telemt-install/main/install.sh) --update
-```
+Скрипт интерактивно спрашивает: SSH-порт, какие инстансы поднимать, и хочешь ли ставить дополнительные компоненты (UFW, keepalive, nft, таймауты). Затем показывает итоговый план и одно финальное «поехали?». **После этого установка идёт автоматически без промежуточных вопросов** — на экране только прогресс.
+
+В конце выводится таблица статуса инстансов и готовые `tg://proxy?...` ссылки для клиентов с реальным публичным IP сервера.
 
 ---
 
-## Что делает скрипт
+## Инстансы
 
-На каждом шаге можно **подтвердить** (`y`), **пропустить** (Enter / `n`) или полностью **прервать** (`q`).
+Три преднастроенных инстанса с разными портами и SNI-доменами для маскировки:
 
-### Компоненты на выбор
-
-#### 3 инстанса telemt
-
-| # | Порт | SNI домен            | Маскируется под                |
+| # | Порт | SNI                  | Маскируется под                |
 |---|------|----------------------|--------------------------------|
 | 1 | 443  | `www.cloudflare.com` | Обычный HTTPS / CDN            |
 | 2 | 5223 | `www.apple.com`      | Apple Push Notification (APNs) |
 | 3 | 8530 | `www.microsoft.com`  | Windows Update (WSUS)          |
 
-Можно выбрать любое подмножество: `1`, `2 3`, или `all`.
+Можно выбрать любое подмножество (`1`, `2 3`, `all`) или добавить **свой** инстанс с произвольными SNI и портом (пункт 4 в выборе).
 
-#### UFW фаервол + rate-limit (xt_recent)
-
-Открывает нужные порты, включает фаервол, опционально добавляет правила `xt_recent` в `/etc/ufw/before.rules` — ограничение 1 SYN/сек на IP per-port. Защищает от активного зондирования DPI/РКН.
-
-#### TCP Keepalive (sysctl)
-
-Настраивает агрессивный keepalive через `/etc/sysctl.d/99-tg-keepalive.conf`:
-
-```
-tcp_keepalive_time  = 60    ← первая проба через 60с тишины (дефолт: 7200)
-tcp_keepalive_intvl = 15    ← повтор каждые 15с
-tcp_keepalive_probes = 3    ← 3 без ответа → RST
-```
-
-Мёртвый коннект рвётся за ~105с вместо ~2 часов. Лечит залипание мобильных клиентов после выхода из фона. telemt выставляет `SO_KEEPALIVE` на сокеты, поэтому достаточно подкрутить sysctl — ядро делает всё само.
-
-Включает диагностику активных соединений (показывает таймеры keepalive на живых коннектах).
-
-#### nft inbound SYN per-client limiter
-
-Создаёт per-client ограничение входящих SYN для каждого порта telemt через nftables. Лечит зависания при подключении у некоторых провайдеров.
-
-Адаптировано для **non-Docker** установки (`hook input` вместо `hook forward`). Раздельные meter-ы на каждый порт, чтобы переключение между инстансами в Telegram не триггерило лимит.
-
-Настраиваемые параметры:
-
-| Параметр        | Дефолт      | Когда менять                              |
-|-----------------|-------------|-------------------------------------------|
-| `RATE`          | `1/second`  | Увеличить если клиентам не хватает burst  |
-| `BURST`         | `1`         | `3` — мягче для многих клиентов           |
-| `METER_TIMEOUT` | `60s`       | `30s` быстрее / `120s` дольше помнит IP   |
-
-Создаёт постоянный скрипт `/usr/local/sbin/telemt-nft-limit.sh` и systemd-сервис `telemt-nft-limit.service` для автовосстановления после перезагрузки.
-
-#### Тюнинг [timeouts] telemt
-
-Опциональная секция в конфигах telemt для проблемных сетей. По умолчанию **не устанавливается** — telemt работает хорошо на дефолтах:
-
-| Параметр           | Дефолт | Для проблемных сетей |
-|--------------------|--------|----------------------|
-| `tg_connect`       | 10     | 30 (нестабильный DC) |
-| `client_handshake` | 15     | 120 (медленный мобайл) |
-| `client_keepalive` | 60     | 90 (нестабильный NAT)  |
+Уже после установки через `mytelemtinfo` можно добавлять и удалять инстансы — всего поддерживается до 10 параллельных.
 
 ---
 
-## Шаги установки
+## Опциональные компоненты
 
-```
-Шаг 0  — Выбор компонентов, SSH-порта, параметров nft/keepalive/таймаутов
-Шаг 1  — Зависимости, пользователь telemt, директории
-Шаг 2  — Скачивание бинарника (последний релиз GitHub)
-Шаг 3  — Генерация секретов (openssl rand -hex 16)
-Шаг 4  — Создание конфигов /etc/telemt/telemtN.toml
-Шаг 5  — Создание systemd-сервисов
-Шаг 6  — UFW: открытие портов
-Шаг 7  — UFW rate-limit (xt_recent, анти-DPI)
-Шаг 8  — TCP keepalive sysctl + диагностика
-Шаг 9  — nft SYN limiter: скрипт + systemd-сервис
-Шаг 10 — Запуск сервисов + проверка статуса
-Шаг 11 — Вывод готовых tg://proxy?... ссылок
-```
+### UFW фаервол + rate-limit
+
+Открывает порты выбранных инстансов, включает UFW. Опционально добавляет правила `xt_recent` в `/etc/ufw/before.rules` — 1 SYN/сек на IP per-port, защита от активного зондирования DPI. Раздельные списки на каждый порт чтобы переключение между инстансами в Telegram не триггерило лимит.
+
+### TCP Keepalive
+
+Прописывает `/etc/sysctl.d/99-tg-keepalive.conf` с агрессивными таймерами `time=60 / intvl=15 / probes=3`. Мёртвый коннект рвётся за ~105с вместо дефолтных ~2 часов — лечит залипание мобильных клиентов после выхода из фона. telemt сам выставляет `SO_KEEPALIVE` на сокеты, поэтому ядро делает всё остальное.
+
+### nft inbound SYN per-client limiter
+
+Per-client ограничение входящих SYN на каждый порт telemt через nftables. Лечит зависания подключения у некоторых провайдеров. Адаптировано для **non-Docker** (`hook input`). Создаёт `/usr/local/sbin/telemt-nft-limit.sh` и systemd-сервис `telemt-nft-limit.service` для автовосстановления после перезагрузки.
+
+Параметры: `RATE=1/second`, `BURST=1`, `METER_TIMEOUT=60s` (настраиваемые в установщике и через mytelemtinfo).
+
+### Тюнинг [timeouts]
+
+Опциональная секция в конфигах telemt для проблемных сетей. По умолчанию **не добавляется** — telemt хорошо работает на дефолтах. Включается явно, с настройкой `tg_connect / client_handshake / client_keepalive`.
 
 ---
 
-## Управление после установки
+## mytelemtinfo — интерактивный менеджер
+
+После установки доступна команда `sudo mytelemtinfo` — TUI-меню с подменю под каждый компонент. На главном экране показывается сводный статус всех компонентов.
+
+### 1. Управление прокси
+
+- Показать ссылки для клиентов (с реальным публичным IP)
+- Перезапустить / остановить / запустить все инстансы
+- Управление отдельным инстансом (статус, логи, конфиг, ссылка)
+- **Добавить новый инстанс** — пресет (1/2/3 — cloudflare/apple/microsoft) или свой (сначала SNI, затем порт). Авто-синхронизация UFW и nft-правил.
+- **Удалить отдельный инстанс** — снимает сервис, чистит конфиг, закрывает порт в UFW, пересоздаёт rate-limit и nft под оставшиеся порты.
+- Обновить бинарник telemt (последний релиз с GitHub)
+- Просмотр логов
+- Удалить telemt полностью (с опциональным откатом UFW / keepalive / nft)
+
+При удалении единственного инстанса меню сразу предлагает добавить новый, чтобы не вываливать пользователя из меню.
+
+### 2. TCP Keepalive
+
+- Применить рекомендуемые настройки (`60/15/3`)
+- Изменить значения вручную
+- Диагностика активных соединений — Python-скрипт читает таймеры через `ss` и показывает счётчики
+- Откатить к дефолтам ядра (`7200/75/9`)
+
+### 3. nft SYN Limiter
+
+- Применить / перезапустить правила
+- Изменить параметры (rate / burst / timeout) — перегенерирует правила под актуальные порты
+- Показать счётчики дропов
+- Временно отключить (без удаления скрипта)
+- Удалить полностью
+
+### 4. Таймауты telemt
+
+- Установить / изменить `tg_connect / client_handshake / client_keepalive` для всех или отдельных инстансов
+- Сбросить к дефолтам telemt (удаляет секцию `[timeouts]`)
+
+### 5. UFW / Rate-limit
+
+- Полный статус UFW
+- Включить UFW
+- Добавить / удалить rate-limit правила в `before.rules`
+
+---
+
+## Обновление
 
 ```bash
-# Статус
-systemctl status telemt1 telemt2 telemt3
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/vaalaav/telemt-install/main/install.sh) --update
+```
 
-# Логи в реальном времени
-journalctl -u telemt1 -f
+Обновляет только бинарник telemt без переустановки конфигов.
 
-# Ссылки для клиентов
-curl -s http://127.0.0.1:9091/v1/users | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['links']['tls'][0])"
-curl -s http://127.0.0.1:9092/v1/users | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['links']['tls'][0])"
-curl -s http://127.0.0.1:9093/v1/users | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['links']['tls'][0])"
-
-# Статистика подключений
-curl -s http://127.0.0.1:9091/v1/stats/summary | python3 -m json.tool
-
-# Рестарт
-systemctl restart telemt1 telemt2 telemt3
-
-# nft: счётчики SYN лимитера
-nft list chain inet telemt_limit input
-
-# Keepalive: проверка значений ядра
-sysctl net.ipv4.tcp_keepalive_time net.ipv4.tcp_keepalive_intvl net.ipv4.tcp_keepalive_probes
-
-# Откат keepalive к дефолтам
-rm -f /etc/sysctl.d/99-tg-keepalive.conf
-sysctl -w net.ipv4.tcp_keepalive_time=7200 net.ipv4.tcp_keepalive_intvl=75 net.ipv4.tcp_keepalive_probes=9
-sysctl --system
-
-# Отключить nft limiter
-systemctl stop telemt-nft-limit.service
-nft delete table inet telemt_limit 2>/dev/null
+Чтобы обновить сам `mytelemtinfo`:
+```bash
+sudo curl -fsSL "https://raw.githubusercontent.com/vaalaav/telemt-install/main/mytelemtinfo.sh?v=$(date +%s)" -o /usr/local/bin/mytelemtinfo && sudo chmod +x /usr/local/bin/mytelemtinfo
 ```
 
 ---
 
-## Источники
+## Структура установки
 
-- Основной гайд: https://assyoucandy.github.io/telemt-server-guide/
-- Keepalive: https://assyoucandy.github.io/telemt-server-guide/telemt-keepalive-guide.html
-- nft SYN limiter: https://h1de0x.github.io/telemt-tune/
-- telemt releases: https://github.com/telemt/telemt/releases
+```
+/bin/telemt                              — бинарник
+/etc/telemt/telemt{N}.toml               — конфиги инстансов (N = 1..10)
+/etc/systemd/system/telemt{N}.service    — systemd-сервисы
+/opt/telemt/                             — рабочая директория, TLS-кэш
+/usr/local/bin/mytelemtinfo              — интерактивный менеджер
+/etc/sysctl.d/99-tg-keepalive.conf       — keepalive (если включён)
+/usr/local/sbin/telemt-nft-limit.sh      — nft-лимитер (если включён)
+/etc/systemd/system/telemt-nft-limit.service — автозапуск nft-лимитера
+```
+
+API-порты инстансов: `9091-9100` (только на 127.0.0.1).
+
+---
+
+## Управление через systemd
+
+```bash
+systemctl status telemt1 telemt2 telemt3
+journalctl -u telemt1 -f
+systemctl restart telemt1
+```
+
+---
+
+## Полное удаление
+
+Через mytelemtinfo: главное меню → 1 → 10. Скрипт остановит и удалит все сервисы, конфиги, бинарник, и опционально откатит UFW / keepalive / nft к системным дефолтам.
