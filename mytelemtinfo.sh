@@ -838,22 +838,46 @@ timeouts_set() {
 
     for n in "${targets[@]}"; do
         local f="/etc/telemt/telemt${n}.toml"
-        # Удаляем старую секцию если есть
-        python3 - "$f" << 'PYEOF'
-import sys
-path = sys.argv[1]
-lines = open(path).readlines()
-out, skip = [], False
-for l in lines:
-    if l.strip() == "[timeouts]": skip = True
-    # следующая секция [xxx] — выходим из skip
-    elif skip and l.strip().startswith("[") and l.strip() != "[timeouts]": skip = False
-    if not skip: out.append(l)
-open(path, "w").writelines(out)
+        python3 - "$f" "$tg" "$hs" "$ka" << 'PYEOF'
+import sys, re
+path, tg, hs, ka = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+content = open(path).read()
+
+# 1. Удаляем существующую секцию [timeouts] (всё до следующей секции или EOF)
+content = re.sub(r'\n*\[timeouts\][^\[]*', '\n', content, flags=re.DOTALL)
+
+# 2. Удаляем все существующие строки tg_connect везде
+content = re.sub(r'^\s*tg_connect\s*=.*\n', '', content, flags=re.MULTILINE)
+
+# 3. Удаляем "висячие" блоки [general] без содержимого (после удаления tg_connect)
+# Если после [general] идёт сразу другая секция — пропускаем такую "пустую" [general]
+# Но обычно в [general] остаются fast_mode, use_middle_proxy — поэтому просто добавим tg_connect туда
+
+# 4. Вставляем tg_connect в существующий [general] (после use_middle_proxy)
+if 'tg_connect' not in content:
+    if 'use_middle_proxy' in content:
+        content = re.sub(
+            r'(use_middle_proxy\s*=\s*\w+)',
+            r'\1\ntg_connect = ' + tg,
+            content, count=1
+        )
+    elif '[general]' in content:
+        # Вставка прямо после строки [general]
+        content = re.sub(
+            r'(\[general\]\n)',
+            r'\1tg_connect = ' + tg + '\n',
+            content, count=1
+        )
+
+# 5. Очищаем тройные пустые строки
+content = re.sub(r'\n{3,}', '\n\n', content)
+if not content.endswith('\n'): content += '\n'
+
+# 6. Добавляем [timeouts] в конец
+content += f'\n[timeouts]\nclient_handshake = {hs}\nclient_keepalive = {ka}\n'
+
+open(path, 'w').write(content)
 PYEOF
-        # Добавляем новые значения
-        printf '\n[general]\ntg_connect = %s\n\n[timeouts]\nclient_handshake = %s\nclient_keepalive = %s\n' \
-            "$tg" "$hs" "$ka" >> "$f"
         ok "Инстанс $n обновлён"
     done
 
@@ -879,21 +903,19 @@ timeouts_reset() {
     for n in "${insts[@]}"; do
         local f="/etc/telemt/telemt${n}.toml"
         python3 - "$f" << 'PYEOF'
-import sys
+import sys, re
 path = sys.argv[1]
-lines = open(path).readlines()
-out, skip = [], False
-for l in lines:
-    if l.strip() == "[timeouts]": skip = True
-    elif skip and l.strip().startswith("[") and l.strip() != "[timeouts]": skip = False
-    if not skip: out.append(l)
-# Убираем trailing newlines
-while out and not out[-1].strip(): out.pop()
-out.append("\n")
-open(path, "w").writelines(out)
+content = open(path).read()
+# Удаляем секцию [timeouts] целиком
+content = re.sub(r'\n*\[timeouts\][^\[]*', '\n', content, flags=re.DOTALL)
+# Удаляем строки tg_connect (откатывает к дефолту telemt = 10)
+content = re.sub(r'^\s*tg_connect\s*=.*\n', '', content, flags=re.MULTILINE)
+# Чистим тройные пустые строки
+content = re.sub(r'\n{3,}', '\n\n', content)
+if not content.endswith('\n'): content += '\n'
+open(path, 'w').write(content)
 PYEOF
-        # Также убираем tg_connect из [general] если там дублировался
-        ok "Инстанс $n — секция [timeouts] удалена"
+        ok "Инстанс $n — [timeouts] и tg_connect удалены"
     done
 
     echo ""
