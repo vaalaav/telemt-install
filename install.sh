@@ -7,7 +7,7 @@
 #  Repo:             https://github.com/vaalaav/telemt-install
 # =============================================================================
 
-set -euo pipefail
+set -uo pipefail
 
 # ─── Цвета ────────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
@@ -200,8 +200,17 @@ step_prepare() {
     confirm "Выполнить?" skip || return 0
 
     wait_apt
-    apt-get update -qq
-    apt-get install -y wget tar jq ufw python3 iptables > /dev/null
+    info "apt-get update..."
+    if ! apt-get update -qq 2>&1; then
+        warn "apt update вернул ошибку, продолжаем..."
+    fi
+    info "Установка пакетов..."
+    if ! apt-get install -y wget tar jq ufw python3 iptables 2>&1; then
+        err "Не удалось установить зависимости"
+        err "Попробуйте вручную: apt-get install -y wget tar jq ufw python3 iptables"
+        read -rp "  Продолжить скрипт несмотря на ошибку? [y/N]: " ans
+        [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && exit 1
+    fi
     ok "Зависимости установлены"
 
     info "Создание пользователя telemt и директорий"
@@ -218,7 +227,21 @@ step_install_binary() {
     confirm "Выполнить?" skip || return 0
 
     cd /tmp
-    wget -qO- "https://github.com/telemt/telemt/releases/latest/download/telemt-x86_64-linux-gnu.tar.gz" | tar -xz
+    info "Скачивание telemt..."
+    if ! wget -qO- "https://github.com/telemt/telemt/releases/latest/download/telemt-x86_64-linux-gnu.tar.gz" | tar -xz; then
+        err "Не удалось скачать telemt"
+        err "Проверьте интернет-соединение или скачайте вручную:"
+        err "https://github.com/telemt/telemt/releases/latest"
+        read -rp "  Продолжить? [y/N]: " ans
+        [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && exit 1
+        return 0
+    fi
+    if [[ ! -f /tmp/telemt ]]; then
+        err "Файл /tmp/telemt не найден после распаковки"
+        read -rp "  Продолжить? [y/N]: " ans
+        [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && exit 1
+        return 0
+    fi
     mv /tmp/telemt /bin/telemt
     chmod +x /bin/telemt
     ok "Установлен: ${BOLD}$(/bin/telemt --version 2>&1)${RESET}"
@@ -369,8 +392,11 @@ step_ufw() {
         ok "Порт $port открыт"
     done
 
-    ufw --force enable
-    ok "UFW включён"
+    if ufw --force enable; then
+        ok "UFW включён"
+    else
+        warn "ufw enable вернул ошибку, проверьте статус: ufw status"
+    fi
     ufw status
 }
 
@@ -541,7 +567,10 @@ step_nft_limiter() {
     if ! command -v nft &>/dev/null; then
         info "Установка nftables..."
         wait_apt
-        apt-get install -y nftables > /dev/null
+        if ! apt-get install -y nftables 2>&1; then
+            err "Не удалось установить nftables — пропуск nft limiter"
+            return 0
+        fi
         ok "nftables установлен"
     else
         ok "nftables уже установлен: $(nft --version 2>&1 | head -1)"
