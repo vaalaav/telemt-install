@@ -322,10 +322,13 @@ step_configs() {
         confirm "Создать /etc/telemt/telemt${n}.toml?" skip || continue
 
         # Базовый конфиг
+        local tg_line=""
+        [[ "${DO_TIMEOUTS:-false}" == true ]] && tg_line="tg_connect = ${TM_TG:-10}"
         cat > "/etc/telemt/telemt${n}.toml" << TOML
 [general]
 fast_mode = true
 use_middle_proxy = false
+${tg_line}
 
 [general.modes]
 classic = false
@@ -363,12 +366,9 @@ ignore_time_skew = false
 user${n} = "${secret}"
 TOML
 
-        # Опциональная секция [timeouts]
+        # Опциональная секция [timeouts] (tg_connect уже в [general] выше)
         if [[ "${DO_TIMEOUTS:-false}" == true ]]; then
             cat >> "/etc/telemt/telemt${n}.toml" << TOMLTIME
-
-[general]
-tg_connect = ${TM_TG:-10}
 
 [timeouts]
 client_handshake = ${TM_HS:-15}
