@@ -205,7 +205,24 @@ menu_proxy() {
         local insts; read -ra insts <<< "$(active_instances)"
         if [[ ${#insts[@]} -eq 0 ]]; then
             warn "Инстансы telemt не обнаружены (/etc/telemt/*.toml отсутствуют)"
-            pause; return
+            echo ""
+            # Проверяем что telemt вообще установлен
+            if [[ ! -x /bin/telemt ]]; then
+                err "Бинарник /bin/telemt не установлен — сначала запустите install.sh"
+                pause; return
+            fi
+            echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+            echo -e "  ${GREEN}${BOLD}1.${RESET} ${GREEN}Добавить новый инстанс${RESET}"
+            echo -e "  ${BOLD}0.${RESET} ← Назад"
+            echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+            echo ""
+            read -rp "  Выберите: " ch_empty
+            case "$ch_empty" in
+                1) proxy_add ;;
+                0|b|"") return ;;
+                *) warn "Неверный пункт"; sleep 1 ;;
+            esac
+            continue
         fi
 
         # Таблица состояния
