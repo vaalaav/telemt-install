@@ -16,10 +16,23 @@ err()  { echo -e "  ${RED}✗${RESET} $*"; }
 pause(){ echo ""; read -rp "  Нажмите Enter для продолжения..." _; }
 
 # ─── Хелперы инстансов ────────────────────────────────────────────────────────
-INSTANCE_PORTS=([1]=443   [2]=5223  [3]=8530)
-INSTANCE_DOMAINS=([1]="www.cloudflare.com" [2]="www.apple.com" [3]="www.microsoft.com")
-INSTANCE_APIS=([1]=9091   [2]=9092  [3]=9093)
-INSTANCES_ALL=(1 2 3)
+declare -A INSTANCE_PORTS=([1]=443 [2]=5223 [3]=8530 [4]=0)
+declare -A INSTANCE_DOMAINS=([1]="www.cloudflare.com" [2]="www.apple.com" [3]="www.microsoft.com" [4]="")
+declare -A INSTANCE_APIS=([1]=9091 [2]=9092 [3]=9093 [4]=9094)
+INSTANCES_ALL=(1 2 3 4)
+
+# Перечитываем реальные значения порта/SNI из существующих конфигов
+load_instance_config() {
+    for n in "${INSTANCES_ALL[@]}"; do
+        local f="/etc/telemt/telemt${n}.toml"
+        [[ ! -f "$f" ]] && continue
+        local p d
+        p=$(grep -m1 '^\s*port\s*=' "$f" 2>/dev/null | grep -oE '[0-9]+')
+        d=$(grep -m1 '^\s*tls_domain\s*=' "$f" 2>/dev/null | grep -oE '"[^"]+"' | tr -d '"')
+        [[ -n "$p" ]] && INSTANCE_PORTS[$n]="$p"
+        [[ -n "$d" ]] && INSTANCE_DOMAINS[$n]="$d"
+    done
+}
 
 active_instances() {
     local result=()
@@ -28,6 +41,9 @@ active_instances() {
     done
     echo "${result[@]}"
 }
+
+# Вызываем загрузку при старте
+load_instance_config
 
 svc_status() {
     # возвращает "active" / "inactive" / "не установлен"
@@ -280,7 +296,7 @@ proxy_single() {
     done
     echo ""
     read -rp "  Номер инстанса ($(IFS=/; echo "${insts[*]}")): " n
-    [[ ! "$n" =~ ^[1-3]$ ]] && { warn "Неверный номер"; sleep 1; return; }
+    [[ ! "$n" =~ ^[1-4]$ ]] && { warn "Неверный номер"; sleep 1; return; }
     [[ ! -f "/etc/telemt/telemt${n}.toml" ]] && { warn "Инстанс $n не установлен"; sleep 1; return; }
 
     while true; do
@@ -345,7 +361,7 @@ proxy_logs() {
             echo -e "\n${BOLD}${CYAN}── telemt${n} ──────────────────────────────${RESET}"
             journalctl -u "telemt${n}" -n 20 --no-pager
         done
-    elif [[ "$ch" =~ ^[1-3]$ ]] && [[ -f "/etc/systemd/system/telemt${ch}.service" ]]; then
+    elif [[ "$ch" =~ ^[1-4]$ ]] && [[ -f "/etc/systemd/system/telemt${ch}.service" ]]; then
         journalctl -u "telemt${ch}" -n 60 --no-pager
     else
         warn "Неверный выбор"
