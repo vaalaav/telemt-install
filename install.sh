@@ -40,6 +40,31 @@ confirm() {
     done
 }
 
+
+# ─── Ожидание освобождения apt lock ──────────────────────────────────────────
+wait_apt() {
+    local locks=("/var/lib/apt/lists/lock" "/var/lib/dpkg/lock" "/var/lib/dpkg/lock-frontend")
+    local waited=0
+    while fuser "${locks[@]}" >/dev/null 2>&1; do
+        if [[ $waited -eq 0 ]]; then
+            warn "apt занят другим процессом (автообновления?) — ожидаем..."
+        fi
+        printf "\r  ${CYAN}→${RESET} Ждём apt... ${waited}с"
+        sleep 3; waited=$((waited + 3))
+        if [[ $waited -ge 120 ]]; then
+            echo ""
+            warn "apt не освобождается 2 минуты. Снимаем lock принудительно..."
+            local pid
+            pid=$(fuser /var/lib/dpkg/lock-frontend 2>/dev/null | awk '{print $1}') || true
+            [[ -n "${pid:-}" ]] && kill "$pid" 2>/dev/null || true
+            rm -f /var/lib/apt/lists/lock /var/lib/dpkg/lock \
+                  /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock 2>/dev/null || true
+            break
+        fi
+    done
+    [[ $waited -gt 0 ]] && echo "" && ok "apt освободился (ждали ${waited}с)"
+}
+
 # ─── Проверка root ────────────────────────────────────────────────────────────
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -174,6 +199,7 @@ step_prepare() {
     info "Обновление пакетов и зависимости: wget tar jq ufw python3 iptables"
     confirm "Выполнить?" skip || return 0
 
+    wait_apt
     apt-get update -qq
     apt-get install -y wget tar jq ufw python3 iptables > /dev/null
     ok "Зависимости установлены"
@@ -514,6 +540,7 @@ step_nft_limiter() {
     # Устанавливаем nftables если нужно
     if ! command -v nft &>/dev/null; then
         info "Установка nftables..."
+        wait_apt
         apt-get install -y nftables > /dev/null
         ok "nftables установлен"
     else
