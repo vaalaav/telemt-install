@@ -85,11 +85,24 @@ get_public_ip() {
 }
 
 # ─── Получить ссылку из API ───────────────────────────────────────────────────
+# Кэш публичного IP — определяется один раз за сессию
+_PUBLIC_IP_CACHE=""
 get_link() {
     local api=$1
-    curl -s --max-time 3 "http://127.0.0.1:${api}/v1/users" 2>/dev/null \
-      | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['links']['tls'][0])" 2>/dev/null \
-      || echo ""
+    local link
+    link=$(curl -s --max-time 3 "http://127.0.0.1:${api}/v1/users" 2>/dev/null \
+      | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['links']['tls'][0])" 2>/dev/null) \
+      || link=""
+    [[ -z "$link" ]] && return
+
+    # Если в ссылке стоит 0.0.0.0 — заменяем на реальный IP
+    if [[ "$link" == *"server=0.0.0.0"* ]]; then
+        [[ -z "$_PUBLIC_IP_CACHE" ]] && _PUBLIC_IP_CACHE=$(get_public_ip)
+        if [[ -n "$_PUBLIC_IP_CACHE" ]]; then
+            link="${link/server=0.0.0.0/server=${_PUBLIC_IP_CACHE}}"
+        fi
+    fi
+    echo "$link"
 }
 
 # ─── Заголовок ────────────────────────────────────────────────────────────────
