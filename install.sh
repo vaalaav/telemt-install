@@ -109,75 +109,74 @@ detect_ssh_port() {
 select_components() {
     hdr "Шаг 0 — Выбор компонентов"
 
-    # --- Инстансы ---
+    # --- Инстансы + SNI/порт ---
     echo ""
     echo -e "  ${BOLD}Инстансы telemt:${RESET}"
-    echo -e "  ${GREEN}1${RESET} — порт ${BOLD}443${RESET}   | ${CYAN}www.cloudflare.com${RESET}  (HTTPS/CDN)"
-    echo -e "  ${GREEN}2${RESET} — порт ${BOLD}5223${RESET}  | ${CYAN}www.apple.com${RESET}       (Apple Push / Anti-DPI)"
-    echo -e "  ${GREEN}3${RESET} — порт ${BOLD}8530${RESET}  | ${CYAN}www.microsoft.com${RESET}   (Windows Update)"
-    echo ""
-    echo -e "  Введите номера через пробел или ${BOLD}all${RESET}:"
-    while true; do
-        read -rp "$(echo -e "${YELLOW}?${RESET} Инстансы [all]: ")" sel
-        sel="${sel:-all}"
-        if [[ "$sel" == "all" ]]; then INSTANCES=(1 2 3); break; fi
-        INSTANCES=(); valid=true
-        for n in $sel; do
-            [[ "$n" =~ ^[1-3]$ ]] && INSTANCES+=("$n") || { warn "Неверный номер: $n"; valid=false; break; }
-        done
-        [[ "$valid" == true && ${#INSTANCES[@]} -gt 0 ]] && break
-    done
-    ok "Инстансы: ${INSTANCES[*]}"
-
-    # --- Кастомизация SNI и портов ---
-    echo ""
-    echo -e "  ${BOLD}Настройка SNI и портов${RESET}"
-    echo -e "  Для каждого инстанса можно оставить дефолт или задать свои значения."
-    echo -e "  ${DIM}Популярные SNI для маскировки: www.cloudflare.com, www.apple.com,${RESET}"
-    echo -e "  ${DIM}www.microsoft.com, www.google.com, www.amazon.com, www.youtube.com${RESET}"
+    echo -e "  ${DIM}Enter — принять дефолт, или введите свой порт/SNI${RESET}"
+    echo -e "  ${DIM}Популярные SNI: cloudflare.com, apple.com, microsoft.com, google.com, amazon.com${RESET}"
     echo ""
 
-    for n in "${INSTANCES[@]}"; do
-        local def_port def_domain
+    INSTANCES=()
+    for n in 1 2 3; do
+        local def_port def_domain label
         def_port="${CUSTOM_PORTS[$n]}"
         def_domain="${CUSTOM_DOMAINS[$n]}"
-        echo -e "  ${BOLD}Инстанс $n${RESET} — дефолт: порт ${BOLD}${def_port}${RESET}, SNI ${CYAN}${def_domain}${RESET}"
-        read -rp "$(echo -e "  ${YELLOW}?${RESET} Изменить? [y/N]: ")" cust
-        if [[ "${cust,,}" =~ ^(y|yes|д|да)$ ]]; then
-            # Порт
-            while true; do
-                read -rp "$(echo -e "    ${YELLOW}→${RESET} Порт [${def_port}]: ")" inp_port
-                inp_port="${inp_port:-$def_port}"
-                if [[ "$inp_port" =~ ^[0-9]+$ ]] && (( inp_port >= 1 && inp_port <= 65535 )); then
-                    # Проверяем дублирование
-                    local dup=false
-                    for other in "${INSTANCES[@]}"; do
-                        [[ "$other" != "$n" && "${CUSTOM_PORTS[$other]}" == "$inp_port" ]] && dup=true && break
-                    done
-                    if [[ "$dup" == true ]]; then
-                        warn "Порт $inp_port уже занят другим инстансом"
+        case $n in
+            1) label="HTTPS/CDN" ;;
+            2) label="Apple Push / Anti-DPI" ;;
+            3) label="Windows Update" ;;
+        esac
+        echo -e "  ${BOLD}${GREEN}$n${RESET} — порт ${BOLD}${def_port}${RESET} | ${CYAN}${def_domain}${RESET}  ${DIM}(${label})${RESET}"
+        read -rp "$(echo -e "    ${YELLOW}?${RESET} Включить? [Y/n/custom]: ")" ans_inst
+        case "${ans_inst,,}" in
+            n|no|н|нет)
+                echo -e "    ${DIM}пропущен${RESET}"
+                ;;
+            custom|с|своё)
+                INSTANCES+=("$n")
+                # Порт
+                while true; do
+                    read -rp "$(echo -e "    ${YELLOW}→${RESET} Порт [${def_port}]: ")" inp_port
+                    inp_port="${inp_port:-$def_port}"
+                    if [[ "$inp_port" =~ ^[0-9]+$ ]] && (( inp_port >= 1 && inp_port <= 65535 )); then
+                        local dup=false
+                        for other in "${INSTANCES[@]}"; do
+                            [[ "$other" != "$n" && "${CUSTOM_PORTS[$other]}" == "$inp_port" ]] && dup=true && break
+                        done
+                        if [[ "$dup" == true ]]; then
+                            warn "Порт $inp_port уже занят другим инстансом"
+                        else
+                            CUSTOM_PORTS[$n]="$inp_port"; break
+                        fi
                     else
-                        CUSTOM_PORTS[$n]="$inp_port"; break
+                        warn "Порт: число от 1 до 65535"
                     fi
-                else
-                    warn "Порт должен быть числом от 1 до 65535"
-                fi
-            done
-            # SNI домен
-            while true; do
-                read -rp "$(echo -e "    ${YELLOW}→${RESET} SNI домен [${def_domain}]: ")" inp_domain
-                inp_domain="${inp_domain:-$def_domain}"
-                # Базовая валидация — не пустой, содержит точку
-                if [[ -n "$inp_domain" && "$inp_domain" == *.* ]]; then
-                    CUSTOM_DOMAINS[$n]="$inp_domain"; break
-                else
-                    warn "Введите корректный домен (например: www.google.com)"
-                fi
-            done
-            ok "Инстанс $n: порт=${BOLD}${CUSTOM_PORTS[$n]}${RESET} SNI=${CYAN}${CUSTOM_DOMAINS[$n]}${RESET}"
-        fi
+                done
+                # SNI
+                while true; do
+                    read -rp "$(echo -e "    ${YELLOW}→${RESET} SNI домен [${def_domain}]: ")" inp_domain
+                    inp_domain="${inp_domain:-$def_domain}"
+                    if [[ -n "$inp_domain" && "$inp_domain" == *.* ]]; then
+                        CUSTOM_DOMAINS[$n]="$inp_domain"; break
+                    else
+                        warn "Введите корректный домен (например: www.google.com)"
+                    fi
+                done
+                ok "Инстанс $n: порт=${BOLD}${CUSTOM_PORTS[$n]}${RESET}  SNI=${CYAN}${CUSTOM_DOMAINS[$n]}${RESET}"
+                ;;
+            *)
+                # Y / Enter — оставить дефолт
+                INSTANCES+=("$n")
+                ok "Инстанс $n: порт=${BOLD}${def_port}${RESET}  SNI=${CYAN}${def_domain}${RESET}"
+                ;;
+        esac
         echo ""
     done
+
+    if [[ ${#INSTANCES[@]} -eq 0 ]]; then
+        warn "Не выбран ни один инстанс. Выход."
+        exit 1
+    fi
 
     # --- UFW ---
     echo ""
