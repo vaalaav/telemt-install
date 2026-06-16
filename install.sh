@@ -309,6 +309,23 @@ step_gen_secrets() {
 step_configs() {
     hdr "Шаг 4 — Создание конфигов /etc/telemt/telemtN.toml"
 
+    # Определяем публичный IP для tg:// ссылок (без него telemt вернёт 0.0.0.0)
+    info "Определение публичного IP сервера..."
+    PUBLIC_IP=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null) || true
+    [[ -z "${PUBLIC_IP:-}" ]] && PUBLIC_IP=$(curl -s --max-time 3 https://ifconfig.me 2>/dev/null) || true
+    [[ -z "${PUBLIC_IP:-}" ]] && PUBLIC_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}')
+    [[ -z "${PUBLIC_IP:-}" ]] && PUBLIC_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+
+    if [[ -z "${PUBLIC_IP:-}" ]]; then
+        read -rp "$(echo -e "${YELLOW}?${RESET} Не удалось определить IP. Введите вручную: ")" PUBLIC_IP
+    else
+        info "Публичный IP: ${BOLD}${PUBLIC_IP}${RESET}"
+        read -rp "$(echo -e "${YELLOW}?${RESET} Подтвердите или введите свой [${PUBLIC_IP}]: ")" inp
+        PUBLIC_IP="${inp:-$PUBLIC_IP}"
+    fi
+    ok "IP для tg://ссылок: $PUBLIC_IP"
+    echo ""
+
     for n in "${INSTANCES[@]}"; do
         local port domain api secret
         port=$(instance_port "$n"); domain=$(instance_domain "$n"); api=$(instance_api "$n")
@@ -334,6 +351,10 @@ ${tg_line}
 classic = false
 secure = false
 tls = true
+
+[general.links]
+show = "*"
+public_host = "${PUBLIC_IP}"
 
 [network]
 ipv4 = true
