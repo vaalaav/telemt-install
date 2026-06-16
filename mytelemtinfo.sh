@@ -1,0 +1,1027 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  mytelemtinfo — интерактивный менеджер telemt
+#  Repo: https://github.com/vaalaav/telemt-install
+# =============================================================================
+
+# ─── Цвета ────────────────────────────────────────────────────────────────────
+RED='\033[0;31m';   YELLOW='\033[1;33m'; GREEN='\033[0;32m'
+CYAN='\033[0;36m';  BOLD='\033[1m';      DIM='\033[2m'
+MAGENTA='\033[0;35m'; RESET='\033[0m'
+
+ok()   { echo -e "  ${GREEN}✓${RESET} $*"; }
+info() { echo -e "  ${CYAN}→${RESET} $*"; }
+warn() { echo -e "  ${YELLOW}⚠${RESET} $*"; }
+err()  { echo -e "  ${RED}✗${RESET} $*"; }
+pause(){ echo ""; read -rp "  Нажмите Enter для продолжения..." _; }
+
+# ─── Хелперы инстансов ────────────────────────────────────────────────────────
+INSTANCE_PORTS=([1]=443   [2]=5223  [3]=8530)
+INSTANCE_DOMAINS=([1]="www.cloudflare.com" [2]="www.apple.com" [3]="www.microsoft.com")
+INSTANCE_APIS=([1]=9091   [2]=9092  [3]=9093)
+INSTANCES_ALL=(1 2 3)
+
+active_instances() {
+    local result=()
+    for n in "${INSTANCES_ALL[@]}"; do
+        [[ -f "/etc/telemt/telemt${n}.toml" ]] && result+=("$n")
+    done
+    echo "${result[@]}"
+}
+
+svc_status() {
+    # возвращает "active" / "inactive" / "не установлен"
+    local n=$1
+    if [[ ! -f "/etc/systemd/system/telemt${n}.service" ]]; then
+        echo "не установлен"
+    else
+        systemctl is-active "telemt${n}" 2>/dev/null || echo "inactive"
+    fi
+}
+
+svc_status_color() {
+    local st="$1"
+    case "$st" in
+        active)         echo -e "${GREEN}▶ active${RESET}" ;;
+        inactive)       echo -e "${RED}■ inactive${RESET}" ;;
+        "не установлен")echo -e "${DIM}— не установлен${RESET}" ;;
+        *)              echo -e "${YELLOW}? $st${RESET}" ;;
+    esac
+}
+
+# ─── Получить ссылку из API ───────────────────────────────────────────────────
+get_link() {
+    local api=$1
+    curl -s --max-time 3 "http://127.0.0.1:${api}/v1/users" 2>/dev/null \
+      | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['links']['tls'][0])" 2>/dev/null \
+      || echo ""
+}
+
+# ─── Заголовок ────────────────────────────────────────────────────────────────
+draw_header() {
+    clear
+    echo -e "${BOLD}${CYAN}"
+    echo "  ╔══════════════════════════════════════════════════╗"
+    echo "  ║          mytelemtinfo — telemt manager           ║"
+    echo "  ╚══════════════════════════════════════════════════╝"
+    echo -e "${RESET}"
+}
+
+# ─── Статус-строки для главного меню ─────────────────────────────────────────
+status_proxy() {
+    local insts; read -ra insts <<< "$(active_instances)"
+    if [[ ${#insts[@]} -eq 0 ]]; then
+        echo -e "${DIM}не установлен${RESET}"
+        return
+    fi
+    local parts=()
+    for n in "${insts[@]}"; do
+        local st; st=$(svc_status "$n")
+        local col; [[ "$st" == "active" ]] && col="$GREEN" || col="$RED"
+        parts+=("${col}${n}:${INSTANCE_PORTS[$n]}${RESET}")
+    done
+    (IFS='  '; echo -e "${parts[*]}")
+}
+
+status_keepalive() {
+    if [[ -f /etc/sysctl.d/99-tg-keepalive.conf ]]; then
+        local t i p
+        t=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)
+        i=$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null)
+        p=$(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null)
+        echo -e "${GREEN}включён${RESET}  time=${BOLD}${t}${RESET} intvl=${BOLD}${i}${RESET} probes=${BOLD}${p}${RESET}"
+    else
+        echo -e "${DIM}не настроен${RESET} (дефолты ядра)"
+    fi
+}
+
+status_nft() {
+    if nft list table inet telemt_limit &>/dev/null; then
+        local drops; drops=$(nft list chain inet telemt_limit input 2>/dev/null | grep -oE "packets [0-9]+" | awk '{s+=$2} END{print s+0}')
+        echo -e "${GREEN}активен${RESET}  дропов SYN: ${BOLD}${drops}${RESET}"
+    elif [[ -f /usr/local/sbin/telemt-nft-limit.sh ]]; then
+        echo -e "${YELLOW}скрипт есть, таблица не активна${RESET}"
+    else
+        echo -e "${DIM}не установлен${RESET}"
+    fi
+}
+
+status_timeouts() {
+    local found=0
+    for f in /etc/telemt/telemt*.toml; do
+        [[ -f "$f" ]] && grep -q '\[timeouts\]' "$f" 2>/dev/null && found=1 && break
+    done
+    if [[ $found -eq 1 ]]; then
+        local hs ka
+        hs=$(grep -h 'client_handshake' /etc/telemt/telemt*.toml 2>/dev/null | head -1 | grep -oE '[0-9]+')
+        ka=$(grep -h 'client_keepalive' /etc/telemt/telemt*.toml 2>/dev/null | head -1 | grep -oE '[0-9]+')
+        echo -e "${GREEN}настроены${RESET}  handshake=${BOLD}${hs:-?}${RESET} keepalive=${BOLD}${ka:-?}${RESET}"
+    else
+        echo -e "${DIM}дефолты telemt${RESET}"
+    fi
+}
+
+status_ufw() {
+    if ufw status 2>/dev/null | grep -q "Status: active"; then
+        local rl; rl=$(grep -c "MTProto rate-limit" /etc/ufw/before.rules 2>/dev/null || echo 0)
+        if [[ $rl -gt 0 ]]; then
+            echo -e "${GREEN}активен${RESET} + rate-limit (xt_recent)"
+        else
+            echo -e "${GREEN}активен${RESET}  rate-limit ${DIM}выключен${RESET}"
+        fi
+    else
+        echo -e "${YELLOW}выключен${RESET}"
+    fi
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  ГЛАВНОЕ МЕНЮ
+# ════════════════════════════════════════════════════════════════════════
+main_menu() {
+    while true; do
+        draw_header
+
+        echo -e "  ${BOLD}Состояние:${RESET}"
+        echo -e "  Прокси:    $(status_proxy)"
+        echo -e "  Keepalive: $(status_keepalive)"
+        echo -e "  nft SYN:   $(status_nft)"
+        echo -e "  Таймауты:  $(status_timeouts)"
+        echo -e "  UFW:       $(status_ufw)"
+        echo ""
+        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+        echo -e "  ${BOLD}1.${RESET} Управление прокси"
+        echo -e "  ${BOLD}2.${RESET} TCP Keepalive"
+        echo -e "  ${BOLD}3.${RESET} nft SYN Limiter"
+        echo -e "  ${BOLD}4.${RESET} Таймауты telemt"
+        echo -e "  ${BOLD}5.${RESET} UFW / Rate-limit"
+        echo -e "  ${BOLD}0.${RESET} Выход"
+        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+        echo ""
+        read -rp "  Выберите пункт: " choice
+        case "$choice" in
+            1) menu_proxy ;;
+            2) menu_keepalive ;;
+            3) menu_nft ;;
+            4) menu_timeouts ;;
+            5) menu_ufw ;;
+            0|q) echo ""; exit 0 ;;
+            *) warn "Неверный пункт" ; sleep 1 ;;
+        esac
+    done
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  1. УПРАВЛЕНИЕ ПРОКСИ
+# ════════════════════════════════════════════════════════════════════════
+menu_proxy() {
+    while true; do
+        draw_header
+        echo -e "  ${BOLD}Управление прокси${RESET}\n"
+
+        local insts; read -ra insts <<< "$(active_instances)"
+        if [[ ${#insts[@]} -eq 0 ]]; then
+            warn "Инстансы telemt не обнаружены (/etc/telemt/*.toml отсутствуют)"
+            pause; return
+        fi
+
+        # Таблица состояния
+        echo -e "  ${BOLD}  #   Порт    Домен                    Статус${RESET}"
+        echo -e "  ${CYAN}  ─────────────────────────────────────────────${RESET}"
+        for n in "${insts[@]}"; do
+            local st; st=$(svc_status "$n")
+            printf "  ${BOLD}  %-2s${RESET}  %-6s  %-24s  %b\n" \
+                "$n" "${INSTANCE_PORTS[$n]}" "${INSTANCE_DOMAINS[$n]}" "$(svc_status_color "$st")"
+        done
+        echo ""
+
+        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+        echo -e "  ${BOLD}1.${RESET} Показать ссылки для клиентов"
+        echo -e "  ${BOLD}2.${RESET} Перезапустить все инстансы"
+        echo -e "  ${BOLD}3.${RESET} Остановить все инстансы"
+        echo -e "  ${BOLD}4.${RESET} Запустить все инстансы"
+        echo -e "  ${BOLD}5.${RESET} Управление отдельным инстансом"
+        echo -e "  ${BOLD}6.${RESET} Обновить бинарник telemt"
+        echo -e "  ${BOLD}7.${RESET} Просмотр логов"
+        echo -e "  ${BOLD}8.${RESET} ${RED}Удалить telemt полностью${RESET}"
+        echo -e "  ${BOLD}0.${RESET} ← Назад"
+        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+        echo ""
+        read -rp "  Выберите: " ch
+        case "$ch" in
+            1) proxy_show_links ;;
+            2) proxy_restart_all ;;
+            3) proxy_stop_all ;;
+            4) proxy_start_all ;;
+            5) proxy_single ;;
+            6) proxy_update ;;
+            7) proxy_logs ;;
+            8) proxy_remove ;;
+            0|b) return ;;
+            *) warn "Неверный пункт"; sleep 1 ;;
+        esac
+    done
+}
+
+proxy_show_links() {
+    draw_header
+    echo -e "  ${BOLD}Ссылки для клиентов Telegram${RESET}\n"
+    local insts; read -ra insts <<< "$(active_instances)"
+    for n in "${insts[@]}"; do
+        local api="${INSTANCE_APIS[$n]}"
+        echo -e "  ${BOLD}Инстанс $n${RESET} (порт ${INSTANCE_PORTS[$n]} / ${INSTANCE_DOMAINS[$n]}):"
+        local link; link=$(get_link "$api")
+        if [[ -n "$link" ]]; then
+            echo -e "  ${GREEN}${link}${RESET}"
+        else
+            warn "API не ответил. telemt запущен? Попробуй через минуту."
+            echo -e "  ${DIM}curl -s http://127.0.0.1:${api}/v1/users | python3 -c \"import sys,json; print(json.load(sys.stdin)['data'][0]['links']['tls'][0])\"${RESET}"
+        fi
+        echo ""
+    done
+    pause
+}
+
+proxy_restart_all() {
+    draw_header
+    echo -e "  ${BOLD}Перезапуск всех инстансов...${RESET}\n"
+    local insts; read -ra insts <<< "$(active_instances)"
+    for n in "${insts[@]}"; do
+        systemctl restart "telemt${n}" && ok "telemt${n} перезапущен" || err "telemt${n} — ошибка"
+    done
+    pause
+}
+
+proxy_stop_all() {
+    draw_header
+    echo -e "  ${BOLD}Остановка всех инстансов...${RESET}\n"
+    local insts; read -ra insts <<< "$(active_instances)"
+    for n in "${insts[@]}"; do
+        systemctl stop "telemt${n}" && ok "telemt${n} остановлен" || err "telemt${n} — ошибка"
+    done
+    pause
+}
+
+proxy_start_all() {
+    draw_header
+    echo -e "  ${BOLD}Запуск всех инстансов...${RESET}\n"
+    local insts; read -ra insts <<< "$(active_instances)"
+    for n in "${insts[@]}"; do
+        systemctl start "telemt${n}" && ok "telemt${n} запущен" || err "telemt${n} — ошибка"
+    done
+    pause
+}
+
+proxy_single() {
+    draw_header
+    echo -e "  ${BOLD}Управление отдельным инстансом${RESET}\n"
+    local insts; read -ra insts <<< "$(active_instances)"
+    for n in "${insts[@]}"; do
+        echo -e "  ${BOLD}$n${RESET} — порт ${INSTANCE_PORTS[$n]}  $(svc_status_color "$(svc_status "$n")")"
+    done
+    echo ""
+    read -rp "  Номер инстанса ($(IFS=/; echo "${insts[*]}")): " n
+    [[ ! "$n" =~ ^[1-3]$ ]] && { warn "Неверный номер"; sleep 1; return; }
+    [[ ! -f "/etc/telemt/telemt${n}.toml" ]] && { warn "Инстанс $n не установлен"; sleep 1; return; }
+
+    while true; do
+        draw_header
+        local st; st=$(svc_status "$n")
+        echo -e "  ${BOLD}Инстанс $n${RESET} — порт ${INSTANCE_PORTS[$n]} — ${INSTANCE_DOMAINS[$n]}"
+        echo -e "  Статус: $(svc_status_color "$st")"
+        echo ""
+        echo -e "  ${BOLD}1.${RESET} Запустить      ${BOLD}2.${RESET} Остановить"
+        echo -e "  ${BOLD}3.${RESET} Перезапустить  ${BOLD}4.${RESET} Показать ссылку"
+        echo -e "  ${BOLD}5.${RESET} Логи           ${BOLD}6.${RESET} Просмотр конфига"
+        echo -e "  ${BOLD}0.${RESET} ← Назад"
+        echo ""
+        read -rp "  Выберите: " ch
+        case "$ch" in
+            1) systemctl start  "telemt${n}" && ok "Запущен" || err "Ошибка"; pause ;;
+            2) systemctl stop   "telemt${n}" && ok "Остановлен" || err "Ошибка"; pause ;;
+            3) systemctl restart "telemt${n}" && ok "Перезапущен" || err "Ошибка"; pause ;;
+            4) draw_header; link=$(get_link "${INSTANCE_APIS[$n]}"); \
+               [[ -n "$link" ]] && echo -e "\n  ${GREEN}$link${RESET}\n" || warn "API не ответил"; pause ;;
+            5) draw_header; journalctl -u "telemt${n}" -n 40 --no-pager; pause ;;
+            6) draw_header; echo ""; cat "/etc/telemt/telemt${n}.toml" 2>/dev/null || warn "Конфиг не найден"; pause ;;
+            0|b) return ;;
+        esac
+    done
+}
+
+proxy_update() {
+    draw_header
+    echo -e "  ${BOLD}Обновление бинарника telemt${RESET}\n"
+    local cur; cur=$(/bin/telemt --version 2>&1 || echo "неизвестна")
+    info "Текущая версия: ${BOLD}$cur${RESET}"
+    echo ""
+    read -rp "  Скачать и установить новую версию? [y/N]: " ans
+    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
+    echo ""
+    info "Скачивание..."
+    local insts; read -ra insts <<< "$(active_instances)"
+    for n in "${insts[@]}"; do systemctl stop "telemt${n}" 2>/dev/null || true; done
+    cd /tmp && wget -qO- \
+        "https://github.com/telemt/telemt/releases/latest/download/telemt-x86_64-linux-gnu.tar.gz" \
+        | tar -xz
+    mv /tmp/telemt /bin/telemt && chmod +x /bin/telemt
+    for n in "${insts[@]}"; do systemctl start "telemt${n}" 2>/dev/null || true; done
+    ok "Обновлено: $(/bin/telemt --version 2>&1)"
+    pause
+}
+
+proxy_logs() {
+    draw_header
+    echo -e "  ${BOLD}Просмотр логов${RESET}\n"
+    local insts; read -ra insts <<< "$(active_instances)"
+    for n in "${insts[@]}"; do
+        echo -e "  ${BOLD}$n${RESET}) telemt${n}  (порт ${INSTANCE_PORTS[$n]})"
+    done
+    echo -e "  ${BOLD}a${RESET}) Все инстансы"
+    echo ""
+    read -rp "  Выберите: " ch
+    draw_header
+    if [[ "$ch" == "a" ]]; then
+        for n in "${insts[@]}"; do
+            echo -e "\n${BOLD}${CYAN}── telemt${n} ──────────────────────────────${RESET}"
+            journalctl -u "telemt${n}" -n 20 --no-pager
+        done
+    elif [[ "$ch" =~ ^[1-3]$ ]] && [[ -f "/etc/systemd/system/telemt${ch}.service" ]]; then
+        journalctl -u "telemt${ch}" -n 60 --no-pager
+    else
+        warn "Неверный выбор"
+    fi
+    pause
+}
+
+proxy_remove() {
+    draw_header
+    echo -e "  ${BOLD}${RED}Полное удаление telemt${RESET}\n"
+    warn "Это остановит и удалит ВСЕ инстансы, конфиги и бинарник."
+    warn "UFW-правила, keepalive и nft-правила — опционально (спрошу отдельно)."
+    echo ""
+    read -rp "  Введите 'УДАЛИТЬ' для подтверждения: " ans
+    [[ "$ans" != "УДАЛИТЬ" ]] && { info "Отменено."; pause; return; }
+
+    # Сервисы
+    local insts; read -ra insts <<< "$(active_instances)"
+    for n in "${insts[@]}"; do
+        systemctl stop    "telemt${n}" 2>/dev/null || true
+        systemctl disable "telemt${n}" 2>/dev/null || true
+        rm -f "/etc/systemd/system/telemt${n}.service"
+        ok "telemt${n} удалён"
+    done
+    systemctl daemon-reload
+
+    # Конфиги и бинарник
+    rm -rf /etc/telemt /opt/telemt
+    rm -f  /bin/telemt
+    userdel telemt 2>/dev/null || true
+    ok "Файлы telemt удалены"
+
+    # nft-сервис
+    if [[ -f /etc/systemd/system/telemt-nft-limit.service ]]; then
+        echo ""
+        read -rp "  Удалить также nft SYN limiter? [Y/n]: " ans2
+        if [[ ! "${ans2,,}" =~ ^(n|no)$ ]]; then
+            systemctl stop    telemt-nft-limit.service 2>/dev/null || true
+            systemctl disable telemt-nft-limit.service 2>/dev/null || true
+            rm -f /etc/systemd/system/telemt-nft-limit.service
+            rm -f /usr/local/sbin/telemt-nft-limit.sh
+            nft delete table inet telemt_limit 2>/dev/null || true
+            ok "nft limiter удалён"
+        fi
+    fi
+
+    # keepalive
+    if [[ -f /etc/sysctl.d/99-tg-keepalive.conf ]]; then
+        echo ""
+        read -rp "  Откатить TCP keepalive к системным дефолтам? [Y/n]: " ans3
+        if [[ ! "${ans3,,}" =~ ^(n|no)$ ]]; then
+            rm -f /etc/sysctl.d/99-tg-keepalive.conf
+            sysctl -w net.ipv4.tcp_keepalive_time=7200 \
+                      net.ipv4.tcp_keepalive_intvl=75  \
+                      net.ipv4.tcp_keepalive_probes=9 > /dev/null
+            sysctl --system > /dev/null
+            ok "Keepalive сброшен к дефолтам"
+        fi
+    fi
+
+    # UFW
+    echo ""
+    read -rp "  Удалить UFW-правила портов telemt? [Y/n]: " ans4
+    if [[ ! "${ans4,,}" =~ ^(n|no)$ ]]; then
+        ufw delete allow 443/tcp  2>/dev/null || true
+        ufw delete allow 5223/tcp 2>/dev/null || true
+        ufw delete allow 8530/tcp 2>/dev/null || true
+        # Убираем rate-limit из before.rules
+        if grep -q "MTProto rate-limit" /etc/ufw/before.rules 2>/dev/null; then
+            python3 << 'PYEOF'
+path = "/etc/ufw/before.rules"
+lines = open(path).readlines()
+out, skip = [], False
+for l in lines:
+    if "MTProto rate-limit" in l and "===" in l and "конец" not in l: skip = True
+    if not skip: out.append(l)
+    if "конец MTProto rate-limit" in l: skip = False
+open(path,"w").writelines(out)
+print("  rate-limit убран из before.rules")
+PYEOF
+            ufw reload
+        fi
+        ok "UFW-правила telemt удалены"
+    fi
+
+    echo ""
+    ok "${BOLD}Удаление завершено.${RESET}"
+    echo ""
+    info "Команда mytelemtinfo больше не нужна. Удалить её:"
+    echo -e "  ${DIM}rm -f /usr/local/bin/mytelemtinfo${RESET}"
+    pause
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  2. TCP KEEPALIVE
+# ════════════════════════════════════════════════════════════════════════
+menu_keepalive() {
+    while true; do
+        draw_header
+        echo -e "  ${BOLD}TCP Keepalive${RESET}\n"
+        echo -e "  Статус: $(status_keepalive)"
+        echo ""
+
+        local t i p
+        t=$(sysctl -n net.ipv4.tcp_keepalive_time  2>/dev/null || echo "—")
+        i=$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null || echo "—")
+        p=$(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null || echo "—")
+
+        echo -e "  ${DIM}Текущие значения ядра:${RESET}"
+        echo -e "  tcp_keepalive_time   = ${BOLD}${t}${RESET}  (первая проба через Xс тишины)"
+        echo -e "  tcp_keepalive_intvl  = ${BOLD}${i}${RESET}  (интервал повторов)"
+        echo -e "  tcp_keepalive_probes = ${BOLD}${p}${RESET}  (кол-во проб до RST)"
+        echo ""
+        [[ -f /etc/sysctl.d/99-tg-keepalive.conf ]] && \
+            echo -e "  ${DIM}Конфиг: /etc/sysctl.d/99-tg-keepalive.conf${RESET}\n"
+
+        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+        echo -e "  ${BOLD}1.${RESET} Включить / применить рекомендуемые настройки"
+        echo -e "  ${BOLD}2.${RESET} Изменить значения вручную"
+        echo -e "  ${BOLD}3.${RESET} Диагностика активных соединений"
+        echo -e "  ${BOLD}4.${RESET} ${YELLOW}Откатить к дефолтам системы${RESET} (time=7200 intvl=75 probes=9)"
+        echo -e "  ${BOLD}0.${RESET} ← Назад"
+        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+        echo ""
+        read -rp "  Выберите: " ch
+        case "$ch" in
+            1) keepalive_apply 60 15 3 ;;
+            2) keepalive_custom ;;
+            3) keepalive_diag ;;
+            4) keepalive_reset ;;
+            0|b) return ;;
+            *) warn "Неверный пункт"; sleep 1 ;;
+        esac
+    done
+}
+
+keepalive_apply() {
+    local t=${1} i=${2} p=${3}
+    draw_header
+    echo -e "  ${BOLD}Применение настроек keepalive${RESET}\n"
+    echo -e "  time=${BOLD}$t${RESET}  intvl=${BOLD}$i${RESET}  probes=${BOLD}$p${RESET}"
+    echo -e "  Мёртвый коннект будет рваться за ~$((t + i * p))с"
+    echo ""
+    read -rp "  Применить? [Y/n]: " ans
+    [[ "${ans,,}" =~ ^(n|no)$ ]] && return
+
+    cat > /etc/sysctl.d/99-tg-keepalive.conf << SYSCTL
+# telemt — TCP keepalive
+net.ipv4.tcp_keepalive_time = $t
+net.ipv4.tcp_keepalive_intvl = $i
+net.ipv4.tcp_keepalive_probes = $p
+SYSCTL
+    sysctl --system > /dev/null
+    ok "Применено: time=$t intvl=$i probes=$p"
+    pause
+}
+
+keepalive_custom() {
+    draw_header
+    echo -e "  ${BOLD}Настройка TCP keepalive вручную${RESET}\n"
+    echo -e "  ${DIM}Рекомендуется: time=60 intvl=15 probes=3${RESET}"
+    echo -e "  ${DIM}Дефолты ядра:  time=7200 intvl=75 probes=9${RESET}\n"
+
+    local cur_t cur_i cur_p
+    cur_t=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null || echo 60)
+    cur_i=$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null || echo 15)
+    cur_p=$(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null || echo 3)
+
+    read -rp "  tcp_keepalive_time   [${cur_t}]: " t;   t="${t:-$cur_t}"
+    read -rp "  tcp_keepalive_intvl  [${cur_i}]: " i;   i="${i:-$cur_i}"
+    read -rp "  tcp_keepalive_probes [${cur_p}]: " p;   p="${p:-$cur_p}"
+
+    # Валидация
+    if ! [[ "$t" =~ ^[0-9]+$ && "$i" =~ ^[0-9]+$ && "$p" =~ ^[0-9]+$ ]]; then
+        err "Значения должны быть целыми числами"; pause; return
+    fi
+    keepalive_apply "$t" "$i" "$p"
+}
+
+keepalive_diag() {
+    draw_header
+    echo -e "  ${BOLD}Диагностика keepalive на активных соединениях${RESET}\n"
+    python3 << 'PYEOF'
+import subprocess, re, glob
+from collections import Counter
+
+ports = set()
+for f in glob.glob("/etc/telemt/*.toml"):
+    for line in open(f):
+        m = re.match(r'\s*port\s*=\s*(\d+)', line)
+        if m: ports.add(m.group(1))
+
+out = subprocess.run(["ss","-tinoH","state","established"],
+                     capture_output=True, text=True).stdout
+records, buf = [], ""
+for ln in out.split("\n"):
+    if not ln.strip(): continue
+    if ln[0].isspace(): buf += " " + ln.strip()
+    else:
+        if buf: records.append(buf)
+        buf = ln.strip()
+if buf: records.append(buf)
+
+timers, countdowns, total = Counter(), Counter(), 0
+for r in records:
+    f = r.split()
+    local = f[2] if len(f) > 2 else ""
+    if not any(local.endswith(":"+p) for p in ports): continue
+    total += 1
+    m = re.search(r'timer:\((\w+)', r)
+    timers[m.group(1) if m else "—"] += 1
+    m2 = re.search(r'timer:\(keepalive,([^,)]+)', r)
+    if m2: countdowns[m2.group(1)] += 1
+
+W = 46
+print("  ╭" + "─"*W + "╮")
+print("  │ " + "KEEPALIVE CHECK".ljust(W-1) + "│")
+print("  ├" + "─"*W + "┤")
+print("  │ " + f"Порты telemt:    {', '.join(sorted(ports)) or '—'}".ljust(W-1) + "│")
+print("  │ " + f"Соединений всего: {total}".ljust(W-1) + "│")
+print("  ├" + "─"*W + "┤")
+if total == 0:
+    print("  │ " + "Нет активных соединений".ljust(W-1) + "│")
+else:
+    for name, cnt in timers.most_common():
+        bar = "█" * min(cnt, 20)
+        print("  │ " + f"  {name:<12} {cnt:>4}  {bar}".ljust(W-1) + "│")
+    if countdowns:
+        print("  ├" + "─"*W + "┤")
+        print("  │ " + "Обратный отсчёт keepalive:".ljust(W-1) + "│")
+        def secs(v):
+            n = float(re.findall(r'[0-9.]+', v)[0])
+            if 'ms' in v: return n/1000
+            if 'min' in v: return n*60
+            return n
+        for val, cnt in sorted(countdowns.items(), key=lambda x: secs(x[0])):
+            bar = "█" * min(cnt, 20)
+            print("  │ " + f"  {val:<12} {cnt:>3}  {bar}".ljust(W-1) + "│")
+print("  ╰" + "─"*W + "╯")
+PYEOF
+    pause
+}
+
+keepalive_reset() {
+    draw_header
+    echo -e "  ${BOLD}Откат TCP keepalive к дефолтам системы${RESET}\n"
+    warn "Значения вернутся к: time=7200  intvl=75  probes=9"
+    echo ""
+    read -rp "  Подтвердить? [y/N]: " ans
+    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
+
+    rm -f /etc/sysctl.d/99-tg-keepalive.conf
+    sysctl -w net.ipv4.tcp_keepalive_time=7200 \
+              net.ipv4.tcp_keepalive_intvl=75  \
+              net.ipv4.tcp_keepalive_probes=9 > /dev/null
+    sysctl --system > /dev/null
+    ok "Keepalive сброшен к системным дефолтам (time=7200 intvl=75 probes=9)"
+    pause
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  3. nft SYN LIMITER
+# ════════════════════════════════════════════════════════════════════════
+menu_nft() {
+    while true; do
+        draw_header
+        echo -e "  ${BOLD}nft inbound SYN per-client Limiter${RESET}\n"
+        echo -e "  Статус: $(status_nft)"
+        echo ""
+
+        if nft list table inet telemt_limit &>/dev/null; then
+            echo -e "  ${DIM}Активные правила:${RESET}"
+            nft list chain inet telemt_limit input 2>/dev/null \
+              | grep -E "dport|counter" \
+              | sed 's/^/    /'
+            echo ""
+        fi
+
+        # Читаем текущие параметры из скрипта
+        local cur_rate cur_burst cur_timeout
+        cur_rate=$(grep -oP '(?<=RATE=")[^"]+' /usr/local/sbin/telemt-nft-limit.sh 2>/dev/null || echo "1/second")
+        cur_burst=$(grep -oP '(?<=BURST=")[^"]+' /usr/local/sbin/telemt-nft-limit.sh 2>/dev/null || echo "1")
+        cur_timeout=$(grep -oP '(?<=METER_TIMEOUT=")[^"]+' /usr/local/sbin/telemt-nft-limit.sh 2>/dev/null || echo "60s")
+
+        echo -e "  ${DIM}Параметры: rate=${BOLD}${cur_rate}${RESET}${DIM}  burst=${BOLD}${cur_burst}${RESET}${DIM}  timeout=${BOLD}${cur_timeout}${RESET}"
+        echo ""
+
+        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+        if [[ ! -f /usr/local/sbin/telemt-nft-limit.sh ]]; then
+            echo -e "  ${BOLD}1.${RESET} Установить nft SYN limiter"
+        else
+            echo -e "  ${BOLD}1.${RESET} Применить / перезапустить правила"
+            echo -e "  ${BOLD}2.${RESET} Изменить параметры (rate / burst / timeout)"
+            echo -e "  ${BOLD}3.${RESET} Показать счётчики дропов"
+            echo -e "  ${BOLD}4.${RESET} ${YELLOW}Временно отключить правила${RESET}"
+            echo -e "  ${BOLD}5.${RESET} ${RED}Удалить nft limiter полностью${RESET}"
+        fi
+        echo -e "  ${BOLD}0.${RESET} ← Назад"
+        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+        echo ""
+        read -rp "  Выберите: " ch
+        case "$ch" in
+            1) if [[ -f /usr/local/sbin/telemt-nft-limit.sh ]]; then
+                   nft_apply_rules
+               else
+                   nft_install
+               fi ;;
+            2) nft_change_params ;;
+            3) nft_show_counters ;;
+            4) nft_disable_temp ;;
+            5) nft_remove ;;
+            0|b) return ;;
+            *) warn "Неверный пункт"; sleep 1 ;;
+        esac
+    done
+}
+
+nft_apply_rules() {
+    draw_header
+    echo -e "  ${BOLD}Применение nft-правил...${RESET}\n"
+    if /usr/local/sbin/telemt-nft-limit.sh; then
+        ok "Правила применены"
+    else
+        err "Ошибка применения правил"
+    fi
+    pause
+}
+
+nft_install() {
+    draw_header
+    echo -e "  ${BOLD}Установка nft SYN Limiter${RESET}\n"
+    info "Запустите установщик для настройки nft limiter:"
+    echo -e "  ${CYAN}bash <(curl -fsSL https://raw.githubusercontent.com/vaalaav/telemt-install/main/install.sh)${RESET}"
+    echo -e "\n  Или установите nftables и создайте скрипт вручную по гайду:"
+    echo -e "  ${CYAN}https://h1de0x.github.io/telemt-tune/${RESET}"
+    pause
+}
+
+nft_change_params() {
+    draw_header
+    echo -e "  ${BOLD}Изменение параметров nft SYN limiter${RESET}\n"
+
+    local cur_rate cur_burst cur_timeout
+    cur_rate=$(grep -oP '(?<=RATE=")[^"]+' /usr/local/sbin/telemt-nft-limit.sh 2>/dev/null || echo "1/second")
+    cur_burst=$(grep -oP '(?<=BURST=")[^"]+' /usr/local/sbin/telemt-nft-limit.sh 2>/dev/null || echo "1")
+    cur_timeout=$(grep -oP '(?<=METER_TIMEOUT=")[^"]+' /usr/local/sbin/telemt-nft-limit.sh 2>/dev/null || echo "60s")
+
+    echo -e "  ${DIM}Варианты rate:    1/second (жёстко) | 2/second (мягче)${RESET}"
+    echo -e "  ${DIM}Варианты burst:   1 (строго) | 3 (мягче для многих клиентов)${RESET}"
+    echo -e "  ${DIM}Варианты timeout: 30s (быстрее) | 60s (дефолт) | 120s (дольше)${RESET}\n"
+
+    read -rp "  RATE        [${cur_rate}]: " new_rate;    new_rate="${new_rate:-$cur_rate}"
+    read -rp "  BURST       [${cur_burst}]: " new_burst;  new_burst="${new_burst:-$cur_burst}"
+    read -rp "  TIMEOUT     [${cur_timeout}]: " new_timeout; new_timeout="${new_timeout:-$cur_timeout}"
+    echo ""
+    read -rp "  Применить и перезапустить? [Y/n]: " ans
+    [[ "${ans,,}" =~ ^(n|no)$ ]] && return
+
+    # Обновляем скрипт
+    sed -i "s|^RATE=.*|RATE=\"${new_rate}\"|" /usr/local/sbin/telemt-nft-limit.sh
+    sed -i "s|^BURST=.*|BURST=\"${new_burst}\"|" /usr/local/sbin/telemt-nft-limit.sh
+    sed -i "s|^METER_TIMEOUT=.*|METER_TIMEOUT=\"${new_timeout}\"|" /usr/local/sbin/telemt-nft-limit.sh
+    ok "Параметры обновлены в скрипте"
+    /usr/local/sbin/telemt-nft-limit.sh && ok "Правила применены" || err "Ошибка"
+    pause
+}
+
+nft_show_counters() {
+    draw_header
+    echo -e "  ${BOLD}Счётчики nft SYN limiter${RESET}\n"
+    if nft list table inet telemt_limit &>/dev/null; then
+        nft list chain inet telemt_limit input 2>/dev/null | sed 's/^/  /'
+    else
+        warn "Таблица telemt_limit не активна"
+    fi
+    pause
+}
+
+nft_disable_temp() {
+    draw_header
+    echo -e "  ${BOLD}Временное отключение nft правил${RESET}\n"
+    warn "Правила будут удалены из памяти. После перезагрузки systemd их восстановит."
+    read -rp "  Отключить? [y/N]: " ans
+    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
+    nft delete table inet telemt_limit 2>/dev/null && ok "Таблица удалена" || warn "Таблица не существовала"
+    pause
+}
+
+nft_remove() {
+    draw_header
+    echo -e "  ${BOLD}${RED}Удаление nft limiter${RESET}\n"
+    read -rp "  Удалить скрипт, сервис и правила? [y/N]: " ans
+    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
+
+    systemctl stop    telemt-nft-limit.service 2>/dev/null || true
+    systemctl disable telemt-nft-limit.service 2>/dev/null || true
+    rm -f /etc/systemd/system/telemt-nft-limit.service
+    rm -f /usr/local/sbin/telemt-nft-limit.sh
+    nft delete table inet telemt_limit 2>/dev/null || true
+    systemctl daemon-reload
+    ok "nft limiter удалён"
+    pause
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  4. ТАЙМАУТЫ TELEMT
+# ════════════════════════════════════════════════════════════════════════
+menu_timeouts() {
+    while true; do
+        draw_header
+        echo -e "  ${BOLD}Таймауты telemt [timeouts]${RESET}\n"
+        echo -e "  Статус: $(status_timeouts)\n"
+
+        # Показываем текущие значения по инстансам
+        local insts; read -ra insts <<< "$(active_instances)"
+        if [[ ${#insts[@]} -gt 0 ]]; then
+            echo -e "  ${DIM}Значения по конфигам:${RESET}"
+            for n in "${insts[@]}"; do
+                local f="/etc/telemt/telemt${n}.toml"
+                if grep -q '\[timeouts\]' "$f" 2>/dev/null; then
+                    local hs ka
+                    hs=$(grep 'client_handshake' "$f" 2>/dev/null | grep -oE '[0-9]+' | head -1 || echo "15")
+                    ka=$(grep 'client_keepalive' "$f" 2>/dev/null | grep -oE '[0-9]+' | head -1 || echo "60")
+                    echo -e "  Инстанс ${BOLD}$n${RESET}: handshake=${BOLD}$hs${RESET}  keepalive=${BOLD}$ka${RESET}"
+                else
+                    echo -e "  Инстанс ${BOLD}$n${RESET}: ${DIM}дефолты telemt (handshake=15 keepalive=60)${RESET}"
+                fi
+            done
+            echo ""
+        fi
+
+        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+        echo -e "  ${BOLD}1.${RESET} Установить / изменить значения"
+        echo -e "  ${BOLD}2.${RESET} Сбросить к дефолтам (удалить секцию [timeouts])"
+        echo -e "  ${BOLD}0.${RESET} ← Назад"
+        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+        echo ""
+        read -rp "  Выберите: " ch
+        case "$ch" in
+            1) timeouts_set ;;
+            2) timeouts_reset ;;
+            0|b) return ;;
+            *) warn "Неверный пункт"; sleep 1 ;;
+        esac
+    done
+}
+
+timeouts_set() {
+    draw_header
+    echo -e "  ${BOLD}Настройка [timeouts]${RESET}\n"
+    echo -e "  ${DIM}tg_connect      — таймаут подключения к Telegram DC (сек)${RESET}"
+    echo -e "  ${DIM}client_handshake— ожидание хендшейка клиента (сек)${RESET}"
+    echo -e "  ${DIM}client_keepalive— ожидание активности клиента (сек)${RESET}"
+    echo -e "  ${DIM}Дефолты: tg_connect=10  handshake=15  keepalive=60${RESET}"
+    echo -e "  ${DIM}Для проблемных сетей: tg_connect=30  handshake=120  keepalive=90${RESET}\n"
+
+    read -rp "  tg_connect       [10]: " tg;  tg="${tg:-10}"
+    read -rp "  client_handshake [15]: " hs;  hs="${hs:-15}"
+    read -rp "  client_keepalive [60]: " ka;  ka="${ka:-60}"
+
+    if ! [[ "$tg" =~ ^[0-9]+$ && "$hs" =~ ^[0-9]+$ && "$ka" =~ ^[0-9]+$ ]]; then
+        err "Значения должны быть целыми числами"; pause; return
+    fi
+
+    echo ""
+    read -rp "  Применить к каким инстансам? [all]: " sel
+    local insts; read -ra insts <<< "$(active_instances)"
+    local targets=()
+    if [[ -z "$sel" || "$sel" == "all" ]]; then
+        targets=("${insts[@]}")
+    else
+        for n in $sel; do [[ -f "/etc/telemt/telemt${n}.toml" ]] && targets+=("$n"); done
+    fi
+
+    for n in "${targets[@]}"; do
+        local f="/etc/telemt/telemt${n}.toml"
+        # Удаляем старую секцию если есть
+        python3 - "$f" << 'PYEOF'
+import sys
+path = sys.argv[1]
+lines = open(path).readlines()
+out, skip = [], False
+for l in lines:
+    if l.strip() == "[timeouts]": skip = True
+    # следующая секция [xxx] — выходим из skip
+    elif skip and l.strip().startswith("[") and l.strip() != "[timeouts]": skip = False
+    if not skip: out.append(l)
+open(path, "w").writelines(out)
+PYEOF
+        # Добавляем новые значения
+        printf '\n[general]\ntg_connect = %s\n\n[timeouts]\nclient_handshake = %s\nclient_keepalive = %s\n' \
+            "$tg" "$hs" "$ka" >> "$f"
+        ok "Инстанс $n обновлён"
+    done
+
+    echo ""
+    read -rp "  Перезапустить инстансы для применения? [Y/n]: " ans
+    if [[ ! "${ans,,}" =~ ^(n|no)$ ]]; then
+        for n in "${targets[@]}"; do
+            systemctl restart "telemt${n}" 2>/dev/null && ok "telemt${n} перезапущен" || err "Ошибка"
+        done
+    fi
+    pause
+}
+
+timeouts_reset() {
+    draw_header
+    echo -e "  ${BOLD}Сброс [timeouts] к дефолтам${RESET}\n"
+    warn "Секция [timeouts] будет удалена из конфигов (telemt будет использовать дефолты)."
+    echo ""
+    read -rp "  Подтвердить? [y/N]: " ans
+    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
+
+    local insts; read -ra insts <<< "$(active_instances)"
+    for n in "${insts[@]}"; do
+        local f="/etc/telemt/telemt${n}.toml"
+        python3 - "$f" << 'PYEOF'
+import sys
+path = sys.argv[1]
+lines = open(path).readlines()
+out, skip = [], False
+for l in lines:
+    if l.strip() == "[timeouts]": skip = True
+    elif skip and l.strip().startswith("[") and l.strip() != "[timeouts]": skip = False
+    if not skip: out.append(l)
+# Убираем trailing newlines
+while out and not out[-1].strip(): out.pop()
+out.append("\n")
+open(path, "w").writelines(out)
+PYEOF
+        # Также убираем tg_connect из [general] если там дублировался
+        ok "Инстанс $n — секция [timeouts] удалена"
+    done
+
+    echo ""
+    read -rp "  Перезапустить инстансы? [Y/n]: " ans2
+    if [[ ! "${ans2,,}" =~ ^(n|no)$ ]]; then
+        for n in "${insts[@]}"; do
+            systemctl restart "telemt${n}" 2>/dev/null && ok "telemt${n} перезапущен" || err "Ошибка"
+        done
+    fi
+    pause
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  5. UFW / RATE-LIMIT
+# ════════════════════════════════════════════════════════════════════════
+menu_ufw() {
+    while true; do
+        draw_header
+        echo -e "  ${BOLD}UFW / Rate-limit${RESET}\n"
+        echo -e "  Статус: $(status_ufw)\n"
+
+        # Показываем правила портов telemt
+        echo -e "  ${DIM}Правила UFW для портов telemt:${RESET}"
+        ufw status 2>/dev/null | grep -E "443|5223|8530" | sed 's/^/    /' || echo "    (нет)"
+        echo ""
+
+        # Rate-limit
+        local rl_count; rl_count=$(grep -c "mtp" /etc/ufw/before.rules 2>/dev/null || echo 0)
+        echo -e "  ${DIM}rate-limit (xt_recent): ${BOLD}${rl_count}${RESET}${DIM} правил в before.rules${RESET}"
+        echo ""
+
+        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+        echo -e "  ${BOLD}1.${RESET} Показать полный статус UFW"
+        echo -e "  ${BOLD}2.${RESET} Включить UFW (если выключен)"
+        echo -e "  ${BOLD}3.${RESET} Добавить rate-limit (xt_recent) для портов"
+        echo -e "  ${BOLD}4.${RESET} ${YELLOW}Удалить rate-limit из before.rules${RESET}"
+        echo -e "  ${BOLD}0.${RESET} ← Назад"
+        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+        echo ""
+        read -rp "  Выберите: " ch
+        case "$ch" in
+            1) draw_header; ufw status verbose 2>/dev/null | sed 's/^/  /'; pause ;;
+            2) draw_header
+               read -rp "  Включить UFW (убедитесь что SSH-порт открыт)? [y/N]: " ans
+               [[ "${ans,,}" =~ ^(y|yes|д|да)$ ]] && ufw --force enable && ok "UFW включён" || info "Отменено"
+               pause ;;
+            3) ufw_add_ratelimit ;;
+            4) ufw_remove_ratelimit ;;
+            0|b) return ;;
+            *) warn "Неверный пункт"; sleep 1 ;;
+        esac
+    done
+}
+
+ufw_add_ratelimit() {
+    draw_header
+    echo -e "  ${BOLD}Добавить rate-limit (xt_recent)${RESET}\n"
+
+    if grep -q "MTProto rate-limit" /etc/ufw/before.rules 2>/dev/null; then
+        warn "Rate-limit уже добавлен в before.rules"
+        pause; return
+    fi
+
+    modprobe xt_recent 2>/dev/null || { err "Модуль xt_recent недоступен"; pause; return; }
+    if ! lsmod | grep -q xt_recent; then err "xt_recent не загружен"; pause; return; fi
+    echo xt_recent > /etc/modules-load.d/xt_recent.conf
+
+    # Определяем порты из активных конфигов
+    local ports=()
+    for f in /etc/telemt/telemt*.toml; do
+        local p; p=$(grep -m1 '^\s*port\s*=' "$f" 2>/dev/null | grep -oE '[0-9]+')
+        [[ -n "$p" ]] && ports+=("$p")
+    done
+
+    if [[ ${#ports[@]} -eq 0 ]]; then
+        warn "Порты telemt не найдены (конфиги отсутствуют)"
+        pause; return
+    fi
+
+    info "Порты для rate-limit: ${ports[*]}"
+    read -rp "  Продолжить? [Y/n]: " ans
+    [[ "${ans,,}" =~ ^(n|no)$ ]] && return
+
+    cp /etc/ufw/before.rules "/etc/ufw/before.rules.bak.$(date +%s)"
+    local port_list; port_list=$(IFS=,; echo "${ports[*]}")
+    python3 - "$port_list" << 'PYEOF'
+import sys
+PORTS = [int(p) for p in sys.argv[1].split(",")]
+path = "/etc/ufw/before.rules"
+lines = open(path).readlines()
+if any("MTProto rate-limit" in l for l in lines):
+    print("Уже есть"); raise SystemExit(0)
+idx = None
+for i, l in enumerate(lines):
+    if "ufw-before-input -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" in l:
+        idx = i + 1; break
+if idx is None:
+    print("Точка вставки не найдена"); raise SystemExit(1)
+block = ["\n# === MTProto rate-limit (1 SYN/сек на IP per-port) ===\n"]
+for p in PORTS:
+    block.append(f"-A ufw-before-input -p tcp --dport {p} --syn -m recent --name mtp{p} --rcheck --seconds 1 -j DROP\n")
+    block.append(f"-A ufw-before-input -p tcp --dport {p} --syn -m recent --name mtp{p} --set -j ACCEPT\n")
+block.append("# === конец MTProto rate-limit ===\n")
+lines[idx:idx] = block
+open(path, "w").writelines(lines)
+print(f"Вставлено {len(block)} строк")
+PYEOF
+    ufw reload && ok "UFW перезагружен с rate-limit" || err "Ошибка ufw reload"
+    pause
+}
+
+ufw_remove_ratelimit() {
+    draw_header
+    echo -e "  ${BOLD}Удалить rate-limit из before.rules${RESET}\n"
+    if ! grep -q "MTProto rate-limit" /etc/ufw/before.rules 2>/dev/null; then
+        warn "Rate-limit не найден в before.rules"
+        pause; return
+    fi
+    read -rp "  Удалить? [y/N]: " ans
+    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
+
+    python3 << 'PYEOF'
+path = "/etc/ufw/before.rules"
+lines = open(path).readlines()
+out, skip = [], False
+for l in lines:
+    if "MTProto rate-limit" in l and "===" in l and "конец" not in l: skip = True
+    if not skip: out.append(l)
+    if "конец MTProto rate-limit" in l: skip = False
+open(path,"w").writelines(out)
+print("  Правила удалены")
+PYEOF
+    ufw reload && ok "UFW перезагружен" || err "Ошибка"
+    rm -f /etc/modules-load.d/xt_recent.conf
+    ok "xt_recent убран из автозагрузки"
+    pause
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  ТОЧКА ВХОДА
+# ════════════════════════════════════════════════════════════════════════
+if [[ $EUID -ne 0 ]]; then
+    echo -e "${RED}Требуется root (sudo mytelemtinfo)${RESET}"
+    exit 1
+fi
+
+main_menu
