@@ -132,7 +132,9 @@ status_proxy() {
 }
 
 status_keepalive() {
-    if [[ -f /etc/sysctl.d/99-tg-keepalive.conf ]]; then
+    # Поддерживаем оба имени конфига (старый и новый)
+    if [[ -f /etc/sysctl.d/99-telemt-net.conf ]] && grep -q tcp_keepalive_time /etc/sysctl.d/99-telemt-net.conf 2>/dev/null \
+       || [[ -f /etc/sysctl.d/99-tg-keepalive.conf ]]; then
         local t i p
         t=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)
         i=$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null)
@@ -140,6 +142,19 @@ status_keepalive() {
         echo -e "${GREEN}включён${RESET}  time=${BOLD}${t}${RESET} intvl=${BOLD}${i}${RESET} probes=${BOLD}${p}${RESET}"
     else
         echo -e "${DIM}не настроен${RESET} (дефолты ядра)"
+    fi
+}
+
+status_bbr() {
+    local cc qdisc
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+    if [[ "$cc" == "bbr" && "$qdisc" == "fq" ]]; then
+        echo -e "${GREEN}активен${RESET}  congestion=${BOLD}bbr${RESET} qdisc=${BOLD}fq${RESET}"
+    elif [[ "$cc" == "bbr" ]]; then
+        echo -e "${YELLOW}частично${RESET}  bbr есть, qdisc=${cc}"
+    else
+        echo -e "${DIM}не настроен${RESET}  (cc=${cc})"
     fi
 }
 
@@ -192,13 +207,14 @@ main_menu() {
         echo -e "  ${BOLD}Состояние:${RESET}"
         echo -e "  Прокси:    $(status_proxy)"
         echo -e "  Keepalive: $(status_keepalive)"
+        echo -e "  BBR:       $(status_bbr)"
         echo -e "  nft SYN:   $(status_nft)"
         echo -e "  Таймауты:  $(status_timeouts)"
         echo -e "  UFW:       $(status_ufw)"
         echo ""
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
         echo -e "  ${BOLD}1.${RESET} Управление прокси"
-        echo -e "  ${BOLD}2.${RESET} TCP Keepalive"
+        echo -e "  ${BOLD}2.${RESET} Сетевой тюнинг (Keepalive + BBR)"
         echo -e "  ${BOLD}3.${RESET} nft SYN Limiter"
         echo -e "  ${BOLD}4.${RESET} Таймауты telemt"
         echo -e "  ${BOLD}5.${RESET} UFW / Rate-limit"
@@ -976,17 +992,19 @@ proxy_remove() {
         fi
     fi
 
-    # keepalive
-    if [[ -f /etc/sysctl.d/99-tg-keepalive.conf ]]; then
+    # keepalive + BBR
+    if [[ -f /etc/sysctl.d/99-telemt-net.conf || -f /etc/sysctl.d/99-tg-keepalive.conf ]]; then
         echo ""
-        read -rp "  Откатить TCP keepalive к системным дефолтам? [Y/n]: " ans3
+        read -rp "  Откатить сетевой тюнинг (keepalive + BBR) к дефолтам? [Y/n]: " ans3
         if [[ ! "${ans3,,}" =~ ^(n|no)$ ]]; then
-            rm -f /etc/sysctl.d/99-tg-keepalive.conf
+            rm -f /etc/sysctl.d/99-telemt-net.conf /etc/sysctl.d/99-tg-keepalive.conf
             sysctl -w net.ipv4.tcp_keepalive_time=7200 \
                       net.ipv4.tcp_keepalive_intvl=75  \
-                      net.ipv4.tcp_keepalive_probes=9 > /dev/null
+                      net.ipv4.tcp_keepalive_probes=9  \
+                      net.core.default_qdisc=fq_codel  \
+                      net.ipv4.tcp_congestion_control=cubic > /dev/null 2>&1 || true
             sysctl --system > /dev/null
-            ok "Keepalive сброшен к дефолтам"
+            ok "Keepalive + BBR сброшены к системным дефолтам"
         fi
     fi
 
@@ -1024,33 +1042,93 @@ PYEOF
 }
 
 # ════════════════════════════════════════════════════════════════════════
-#  2. TCP KEEPALIVE
+#  2. СЕТЕВОЙ ТЮНИНГ (Keepalive + BBR)
 # ════════════════════════════════════════════════════════════════════════
+
+# Запись объединённого sysctl-файла (атомарно, по флагам)
+# Параметры: $1=keepalive_enabled $2=bbr_enabled $3=t $4=i $5=p
+netconf_write() {
+    local ka="$1" bbr="$2" t="${3:-60}" i="${4:-15}" p="${5:-3}"
+    local file="/etc/sysctl.d/99-telemt-net.conf"
+
+    # Если оба выключены — удаляем файл и откатываем значения к дефолтам ядра
+    if [[ "$ka" != true && "$bbr" != true ]]; then
+        rm -f "$file" /etc/sysctl.d/99-tg-keepalive.conf
+        sysctl -w net.ipv4.tcp_keepalive_time=7200 \
+                  net.ipv4.tcp_keepalive_intvl=75  \
+                  net.ipv4.tcp_keepalive_probes=9 \
+                  net.core.default_qdisc=fq_codel  \
+                  net.ipv4.tcp_congestion_control=cubic > /dev/null 2>&1 || true
+        sysctl --system > /dev/null 2>&1
+        return 0
+    fi
+
+    {
+        echo "# telemt — сетевой тюнинг ядра"
+        echo ""
+        if [[ "$ka" == true ]]; then
+            echo "# --- TCP keepalive: фикс залипания iOS-клиентов после фона ---"
+            echo "net.ipv4.tcp_keepalive_time = $t"
+            echo "net.ipv4.tcp_keepalive_intvl = $i"
+            echo "net.ipv4.tcp_keepalive_probes = $p"
+            echo ""
+        fi
+        if [[ "$bbr" == true ]]; then
+            echo "# --- BBR + fq qdisc ---"
+            echo "net.core.default_qdisc = fq"
+            echo "net.ipv4.tcp_congestion_control = bbr"
+        fi
+    } > "$file"
+
+    # Если был старый файл — удаляем
+    [[ -f /etc/sysctl.d/99-tg-keepalive.conf ]] && rm -f /etc/sysctl.d/99-tg-keepalive.conf
+    sysctl --system > /dev/null 2>&1
+}
+
+# Прочитать текущее включено-ли что-то
+netconf_keepalive_on() {
+    grep -q "tcp_keepalive_time" /etc/sysctl.d/99-telemt-net.conf 2>/dev/null && return 0
+    [[ -f /etc/sysctl.d/99-tg-keepalive.conf ]] && return 0
+    return 1
+}
+netconf_bbr_on() {
+    [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]
+}
+
 menu_keepalive() {
     while true; do
         draw_header
-        echo -e "  ${BOLD}TCP Keepalive${RESET}\n"
-        echo -e "  Статус: $(status_keepalive)"
+        echo -e "  ${BOLD}Сетевой тюнинг ядра${RESET}\n"
+        echo -e "  Keepalive: $(status_keepalive)"
+        echo -e "  BBR + fq:  $(status_bbr)"
         echo ""
 
-        local t i p
+        local t i p cc qdisc bbr_avail
         t=$(sysctl -n net.ipv4.tcp_keepalive_time  2>/dev/null || echo "—")
         i=$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null || echo "—")
         p=$(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null || echo "—")
+        cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "—")
+        qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "—")
+        bbr_avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -o bbr || echo "")
 
         echo -e "  ${DIM}Текущие значения ядра:${RESET}"
-        echo -e "  tcp_keepalive_time   = ${BOLD}${t}${RESET}  (первая проба через Xс тишины)"
-        echo -e "  tcp_keepalive_intvl  = ${BOLD}${i}${RESET}  (интервал повторов)"
-        echo -e "  tcp_keepalive_probes = ${BOLD}${p}${RESET}  (кол-во проб до RST)"
+        echo -e "  tcp_keepalive_time/intvl/probes = ${BOLD}${t}${RESET} / ${BOLD}${i}${RESET} / ${BOLD}${p}${RESET}"
+        echo -e "  tcp_congestion_control           = ${BOLD}${cc}${RESET}"
+        echo -e "  default_qdisc                    = ${BOLD}${qdisc}${RESET}"
+        [[ -z "$bbr_avail" ]] && echo -e "  ${YELLOW}⚠ BBR недоступен в этом ядре${RESET}"
         echo ""
-        [[ -f /etc/sysctl.d/99-tg-keepalive.conf ]] && \
-            echo -e "  ${DIM}Конфиг: /etc/sysctl.d/99-tg-keepalive.conf${RESET}\n"
 
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
-        echo -e "  ${BOLD}1.${RESET} Включить / применить рекомендуемые настройки"
-        echo -e "  ${BOLD}2.${RESET} Изменить значения вручную"
-        echo -e "  ${BOLD}3.${RESET} Диагностика активных соединений"
-        echo -e "  ${BOLD}4.${RESET} ${YELLOW}Откатить к дефолтам системы${RESET} (time=7200 intvl=75 probes=9)"
+        echo -e "  ${BOLD}── Keepalive (фикс iOS-фона) ──${RESET}"
+        echo -e "  ${BOLD}1.${RESET} Применить рекомендуемые значения (60/15/3)"
+        echo -e "  ${BOLD}2.${RESET} Изменить значения keepalive вручную"
+        echo -e "  ${BOLD}3.${RESET} Диагностика keepalive на активных соединениях"
+        echo -e "  ${BOLD}4.${RESET} ${YELLOW}Отключить keepalive${RESET} (откат к дефолтам)"
+        echo ""
+        echo -e "  ${BOLD}── BBR + fq qdisc ──${RESET}"
+        echo -e "  ${BOLD}5.${RESET} Включить BBR + fq"
+        echo -e "  ${BOLD}6.${RESET} ${YELLOW}Отключить BBR${RESET} (вернуть cubic + fq_codel)"
+        echo ""
         echo -e "  ${BOLD}0.${RESET} ← Назад"
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
         echo ""
@@ -1059,7 +1137,9 @@ menu_keepalive() {
             1) keepalive_apply 60 15 3 ;;
             2) keepalive_custom ;;
             3) keepalive_diag ;;
-            4) keepalive_reset ;;
+            4) keepalive_off ;;
+            5) bbr_on ;;
+            6) bbr_off ;;
             0|b) return ;;
             *) warn "Неверный пункт"; sleep 1 ;;
         esac
@@ -1076,14 +1156,84 @@ keepalive_apply() {
     read -rp "  Применить? [Y/n]: " ans
     [[ "${ans,,}" =~ ^(n|no)$ ]] && return
 
-    cat > /etc/sysctl.d/99-tg-keepalive.conf << SYSCTL
-# telemt — TCP keepalive
-net.ipv4.tcp_keepalive_time = $t
-net.ipv4.tcp_keepalive_intvl = $i
-net.ipv4.tcp_keepalive_probes = $p
-SYSCTL
-    sysctl --system > /dev/null
-    ok "Применено: time=$t intvl=$i probes=$p"
+    # Сохраняем BBR-статус
+    local bbr=false
+    netconf_bbr_on && bbr=true
+
+    netconf_write true "$bbr" "$t" "$i" "$p"
+    ok "Применено: keepalive time=$t intvl=$i probes=$p"
+    pause
+}
+
+keepalive_off() {
+    draw_header
+    echo -e "  ${BOLD}Отключение TCP keepalive${RESET}\n"
+    warn "Значения вернутся к дефолтам ядра: time=7200 intvl=75 probes=9"
+    echo ""
+    read -rp "  Подтвердить? [y/N]: " ans
+    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
+
+    local bbr=false
+    netconf_bbr_on && bbr=true
+
+    # Если BBR был включён — оставляем только его в файле
+    netconf_write false "$bbr"
+    sysctl -w net.ipv4.tcp_keepalive_time=7200 \
+              net.ipv4.tcp_keepalive_intvl=75  \
+              net.ipv4.tcp_keepalive_probes=9 > /dev/null 2>&1
+    ok "Keepalive отключён (дефолты ядра)"
+    pause
+}
+
+bbr_on() {
+    draw_header
+    echo -e "  ${BOLD}Включение BBR + fq qdisc${RESET}\n"
+
+    # Проверяем доступность BBR
+    if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q bbr; then
+        info "Попытка загрузить модуль tcp_bbr..."
+        modprobe tcp_bbr 2>/dev/null || true
+        if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q bbr; then
+            err "BBR недоступен в этом ядре. Нужно обновить ядро (4.9+)."
+            pause; return
+        fi
+        ok "Модуль tcp_bbr загружен"
+    fi
+
+    echo -e "  Будет установлено:"
+    echo -e "    net.core.default_qdisc = ${BOLD}fq${RESET}"
+    echo -e "    net.ipv4.tcp_congestion_control = ${BOLD}bbr${RESET}"
+    echo ""
+    read -rp "  Применить? [Y/n]: " ans
+    [[ "${ans,,}" =~ ^(n|no)$ ]] && return
+
+    local ka=false
+    netconf_keepalive_on && ka=true
+    netconf_write "$ka" true
+
+    # Текущие значения для отображения
+    local cc qdisc
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control)
+    qdisc=$(sysctl -n net.core.default_qdisc)
+    ok "BBR включён: congestion=${BOLD}${cc}${RESET} qdisc=${BOLD}${qdisc}${RESET}"
+    pause
+}
+
+bbr_off() {
+    draw_header
+    echo -e "  ${BOLD}Отключение BBR${RESET}\n"
+    warn "Вернётся стандартный congestion control (cubic) и qdisc (fq_codel)"
+    echo ""
+    read -rp "  Подтвердить? [y/N]: " ans
+    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
+
+    local ka=false
+    netconf_keepalive_on && ka=true
+    netconf_write "$ka" false
+
+    sysctl -w net.core.default_qdisc=fq_codel \
+              net.ipv4.tcp_congestion_control=cubic > /dev/null 2>&1
+    ok "BBR отключён (cubic + fq_codel)"
     pause
 }
 
@@ -1174,20 +1324,8 @@ PYEOF
 }
 
 keepalive_reset() {
-    draw_header
-    echo -e "  ${BOLD}Откат TCP keepalive к дефолтам системы${RESET}\n"
-    warn "Значения вернутся к: time=7200  intvl=75  probes=9"
-    echo ""
-    read -rp "  Подтвердить? [y/N]: " ans
-    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
-
-    rm -f /etc/sysctl.d/99-tg-keepalive.conf
-    sysctl -w net.ipv4.tcp_keepalive_time=7200 \
-              net.ipv4.tcp_keepalive_intvl=75  \
-              net.ipv4.tcp_keepalive_probes=9 > /dev/null
-    sysctl --system > /dev/null
-    ok "Keepalive сброшен к системным дефолтам (time=7200 intvl=75 probes=9)"
-    pause
+    # Алиас для совместимости — вызывает новую keepalive_off
+    keepalive_off
 }
 
 # ════════════════════════════════════════════════════════════════════════
