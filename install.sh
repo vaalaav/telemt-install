@@ -776,6 +776,12 @@ step_links() {
     sleep 5
     echo ""
 
+    # Определяем публичный IP сервера для подмены 0.0.0.0 в ссылках
+    local pub_ip
+    pub_ip=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null) || true
+    [[ -z "$pub_ip" ]] && pub_ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}')
+    [[ -z "$pub_ip" ]] && pub_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+
     for n in "${INSTANCES[@]}"; do
         local api port domain
         api=$(instance_api "$n"); port=$(instance_port "$n"); domain=$(instance_domain "$n")
@@ -784,6 +790,8 @@ step_links() {
         link=$(curl -s --max-time 5 "http://127.0.0.1:${api}/v1/users" 2>/dev/null \
                | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['links']['tls'][0])" 2>/dev/null \
                || true)
+        # Подменяем 0.0.0.0 на реальный публичный IP
+        [[ -n "$link" && -n "$pub_ip" ]] && link="${link/server=0.0.0.0/server=${pub_ip}}"
         if [[ -n "$link" ]]; then
             echo -e "  ${GREEN}${link}${RESET}"
         else
