@@ -555,35 +555,71 @@ proxy_add() {
     done
 
     echo -e "  ${DIM}Уже заняты порты: ${used_ports[*]:-(нет)}${RESET}"
-    echo -e "  ${DIM}Популярные SNI: www.cloudflare.com, www.apple.com, www.microsoft.com,${RESET}"
-    echo -e "  ${DIM}                www.google.com, www.amazon.com, www.youtube.com${RESET}"
     echo ""
 
-    # Запрос порта
-    local new_port
-    while true; do
-        read -rp "  ? Порт (1-65535): " new_port
-        if ! [[ "$new_port" =~ ^[0-9]+$ ]] || (( new_port < 1 || new_port > 65535 )); then
-            warn "Порт должен быть числом от 1 до 65535"; continue
-        fi
-        local dup=false
-        for p in "${used_ports[@]}"; do [[ "$p" == "$new_port" ]] && dup=true && break; done
-        if [[ "$dup" == true ]]; then
-            warn "Порт $new_port уже занят другим инстансом"
-        else
-            break
-        fi
-    done
+    # ── Меню выбора пресета ──
+    echo -e "  ${BOLD}Выберите тип инстанса:${RESET}"
+    echo -e "  ${GREEN}1${RESET} — порт ${BOLD}443${RESET}   | ${CYAN}www.cloudflare.com${RESET}  (HTTPS/CDN)"
+    echo -e "  ${GREEN}2${RESET} — порт ${BOLD}5223${RESET}  | ${CYAN}www.apple.com${RESET}       (Apple Push / Anti-DPI)"
+    echo -e "  ${GREEN}3${RESET} — порт ${BOLD}8530${RESET}  | ${CYAN}www.microsoft.com${RESET}   (Windows Update)"
+    echo -e "  ${GREEN}4${RESET} — ${BOLD}свой инстанс${RESET} (вручную SNI и порт)"
+    echo -e "  ${BOLD}0${RESET} — отмена"
+    echo ""
 
-    # Запрос SNI
-    local new_sni
+    local new_port new_sni
+    local -A presets_port=([1]=443 [2]=5223 [3]=8530)
+    local -A presets_sni=([1]="www.cloudflare.com" [2]="www.apple.com" [3]="www.microsoft.com")
+
     while true; do
-        read -rp "  ? SNI домен: " new_sni
-        if [[ -n "$new_sni" && "$new_sni" == *.* ]]; then
-            break
-        else
-            warn "Введите корректный домен (например www.google.com)"
-        fi
+        read -rp "  ? Тип инстанса [1/2/3/4/0]: " preset
+        case "$preset" in
+            1|2|3)
+                new_port="${presets_port[$preset]}"
+                new_sni="${presets_sni[$preset]}"
+                # Проверяем что порт пресета не занят
+                local dup=false
+                for p in "${used_ports[@]}"; do [[ "$p" == "$new_port" ]] && dup=true && break; done
+                if [[ "$dup" == true ]]; then
+                    warn "Порт пресета ${new_port} уже занят. Выберите другой тип или используйте 'свой инстанс' (4)."
+                    continue
+                fi
+                ok "Выбрано: порт=${BOLD}${new_port}${RESET}  SNI=${CYAN}${new_sni}${RESET}"
+                break
+                ;;
+            4)
+                echo ""
+                echo -e "  ${DIM}Популярные SNI: www.cloudflare.com, www.apple.com, www.microsoft.com,${RESET}"
+                echo -e "  ${DIM}                www.google.com, www.amazon.com, www.youtube.com${RESET}"
+                # Сначала SNI
+                while true; do
+                    read -rp "  ? SNI домен: " new_sni
+                    if [[ -n "$new_sni" && "$new_sni" == *.* ]]; then
+                        break
+                    else
+                        warn "Введите корректный домен (например www.google.com)"
+                    fi
+                done
+                # Затем порт
+                while true; do
+                    read -rp "  ? Порт (1-65535): " new_port
+                    if ! [[ "$new_port" =~ ^[0-9]+$ ]] || (( new_port < 1 || new_port > 65535 )); then
+                        warn "Порт должен быть числом от 1 до 65535"; continue
+                    fi
+                    local dup=false
+                    for p in "${used_ports[@]}"; do [[ "$p" == "$new_port" ]] && dup=true && break; done
+                    if [[ "$dup" == true ]]; then
+                        warn "Порт $new_port уже занят другим инстансом"
+                    else
+                        break
+                    fi
+                done
+                break
+                ;;
+            0|q)
+                info "Отменено"; pause; return ;;
+            *)
+                warn "Введите 1, 2, 3, 4 или 0" ;;
+        esac
     done
 
     # Генерация секрета
