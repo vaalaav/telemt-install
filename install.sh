@@ -251,6 +251,61 @@ select_components() {
         TM_KA="${TM_KA:-60}"
         ok "Таймауты: tg_connect=$TM_TG client_handshake=$TM_HS client_keepalive=$TM_KA"
     fi
+
+    # --- Свой домен вместо IP в ссылке для клиента ---
+    echo ""
+    echo -e "  ${BOLD}Свой домен в ссылке для клиента${RESET}"
+    echo -e "  Вместо ${BOLD}server=РЕАЛЬНЫЙ_IP${RESET} в tg://proxy?... будет ${BOLD}server=твой.домен${RESET}"
+    echo -e "  ${DIM}Требование: A-запись твой.домен → IP этого сервера должна быть настроена в DNS.${RESET}"
+    echo -e "  ${DIM}Это чистая косметика — Telegram-клиент сам резолвит домен в IP перед коннектом.${RESET}"
+    USE_CUSTOM_DOMAIN=false
+    CUSTOM_LINK_DOMAIN=""
+    read -rp "$(echo -e "${YELLOW}?${RESET} Использовать свой домен? [y/N]: ")" ans
+    if [[ "${ans,,}" =~ ^(y|yes|д|да)$ ]]; then
+        while true; do
+            read -rp "$(echo -e "  ${YELLOW}→${RESET} Введите домен (например proxy.example.com): ")" inp_dom
+            if [[ -n "$inp_dom" && "$inp_dom" == *.* ]]; then
+                CUSTOM_LINK_DOMAIN="$inp_dom"
+                USE_CUSTOM_DOMAIN=true
+                # Проверяем что домен резолвится в IP этого сервера
+                local resolved_ip server_ip
+                resolved_ip=$(getent hosts "$inp_dom" 2>/dev/null | awk '{print $1}' | head -1)
+                server_ip=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null \
+                            || ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}')
+                if [[ -n "$resolved_ip" && -n "$server_ip" ]]; then
+                    if [[ "$resolved_ip" == "$server_ip" ]]; then
+                        ok "Домен резолвится в IP сервера ($server_ip) — всё верно"
+                    else
+                        warn "Внимание: домен резолвится в $resolved_ip, а IP сервера — $server_ip"
+                        warn "Возможно DNS ещё не обновился или A-запись указывает на другой хост"
+                        read -rp "  Продолжить с этим доменом? [Y/n]: " conf
+                        [[ "${conf,,}" =~ ^(n|no)$ ]] && { USE_CUSTOM_DOMAIN=false; CUSTOM_LINK_DOMAIN=""; continue; }
+                    fi
+                else
+                    warn "Не удалось проверить DNS — домен будет использован как есть"
+                fi
+                break
+            else
+                warn "Введите корректный домен (например proxy.example.com)"
+            fi
+        done
+        ok "В ссылках для клиентов будет: ${BOLD}${CUSTOM_LINK_DOMAIN}${RESET}"
+        # Сохраняем в файл состояния для mytelemtinfo
+        mkdir -p /etc/telemt
+        echo "$CUSTOM_LINK_DOMAIN" > /etc/telemt/.custom_domain
+        chmod 644 /etc/telemt/.custom_domain
+    fi
+
+    # --- WARP для трафика к Telegram DC ---
+    echo ""
+    echo -e "  ${BOLD}Cloudflare WARP для трафика к Telegram DC${RESET}"
+    echo -e "  Заворачивает трафик ${BOLD}telemt → Telegram DC${RESET} через Cloudflare WARP (SOCKS5)."
+    echo -e "  Клиенты подключаются к twoiy серверу ${BOLD}напрямую${RESET}, дальше идёт через WARP."
+    echo -e "  ${DIM}Помогает если Telegram DC блокируется на исходящем (например с некоторых хостеров).${RESET}"
+    echo -e "  ${DIM}WARP ставится в режиме \"proxy\" (SOCKS5 на 127.0.0.1:40000).${RESET}"
+    DO_WARP=false
+    read -rp "$(echo -e "${YELLOW}?${RESET} Завернуть Telegram-трафик в WARP? [y/N]: ")" ans
+    [[ "${ans,,}" =~ ^(y|yes|д|да)$ ]] && DO_WARP=true
 }
 
 # ─── Вспомогательные функции инстансов ───────────────────────────────────────
@@ -416,6 +471,19 @@ client_handshake = ${TM_HS:-15}
 client_keepalive = ${TM_KA:-60}
 TOMLTIME
             info "Добавлена секция [timeouts]: tg_connect=${TM_TG} handshake=${TM_HS} keepalive=${TM_KA}"
+        fi
+
+        # Опциональный upstream через WARP (SOCKS5 на 127.0.0.1:40000)
+        if [[ "${DO_WARP:-false}" == true ]]; then
+            cat >> "/etc/telemt/telemt${n}.toml" << TOMLWARP
+
+[[upstreams]]
+type = "socks5"
+address = "127.0.0.1:40000"
+weight = 1
+enabled = true
+TOMLWARP
+            info "Добавлен upstream через WARP (SOCKS5 127.0.0.1:40000)"
         fi
 
         ok "Создан /etc/telemt/telemt${n}.toml"
@@ -730,6 +798,105 @@ SERVICE
 }
 
 
+# ─── ШАГ: Установка Cloudflare WARP ──────────────────────────────────────────
+step_warp() {
+    [[ "${DO_WARP:-false}" != true ]] && return 0
+    hdr "Установка Cloudflare WARP (SOCKS5 upstream)"
+
+    info "Будет установлен cloudflare-warp в режиме proxy (SOCKS5 на 127.0.0.1:40000)"
+    confirm "Установить?" skip || return 0
+
+    # Установка cloudflare-warp из официального репозитория
+    if ! command -v warp-cli &>/dev/null; then
+        info "Добавление официального репозитория Cloudflare..."
+
+        # GPG ключ
+        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+            | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg 2>/dev/null
+
+        # APT источник для текущей версии Ubuntu
+        local codename
+        codename=$(lsb_release -cs 2>/dev/null || echo "jammy")
+        echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${codename} main" \
+            > /etc/apt/sources.list.d/cloudflare-client.list
+
+        wait_apt
+        info "Установка cloudflare-warp..."
+        if ! apt-get update -qq 2>&1; then
+            warn "apt update вернул предупреждение, продолжаем..."
+        fi
+        if ! apt-get install -y cloudflare-warp 2>&1; then
+            err "Не удалось установить cloudflare-warp"
+            err "WARP пропущен. После установки можно настроить вручную:"
+            err "  https://pkg.cloudflareclient.com/"
+            DO_WARP=false
+            return 0
+        fi
+        ok "cloudflare-warp установлен: $(warp-cli --version 2>&1 | head -1)"
+    else
+        ok "cloudflare-warp уже установлен: $(warp-cli --version 2>&1 | head -1)"
+    fi
+
+    # Проверяем что демон запущен
+    if ! systemctl is-active --quiet warp-svc 2>/dev/null; then
+        info "Запуск warp-svc..."
+        systemctl enable --now warp-svc 2>/dev/null || true
+        sleep 3
+    fi
+    if ! systemctl is-active --quiet warp-svc 2>/dev/null; then
+        err "warp-svc не запустился — пропуск WARP"
+        DO_WARP=false
+        return 0
+    fi
+    ok "warp-svc активен"
+
+    # Регистрация (если ещё не зарегистрирован)
+    info "Регистрация клиента..."
+    if ! warp-cli --accept-tos registration show &>/dev/null; then
+        warp-cli --accept-tos registration new >/dev/null 2>&1 || true
+        sleep 2
+    fi
+
+    # Переключение в режим proxy (SOCKS5 на 127.0.0.1:40000)
+    info "Переключение в режим proxy (SOCKS5)..."
+    warp-cli --accept-tos mode proxy >/dev/null 2>&1 || true
+    sleep 1
+
+    # Подключение
+    info "Подключение к WARP..."
+    warp-cli --accept-tos connect >/dev/null 2>&1 || true
+    sleep 4
+
+    # Проверка статуса
+    local warp_status
+    warp_status=$(warp-cli --accept-tos status 2>&1 | grep -oE "Connected|Disconnected|Connecting" | head -1)
+    if [[ "$warp_status" == "Connected" ]]; then
+        ok "WARP подключён в режиме proxy"
+    else
+        warn "Статус WARP: $warp_status"
+        warn "Возможно, нужно подождать и проверить позже: warp-cli status"
+    fi
+
+    # Проверка SOCKS5 порта
+    info "Проверка SOCKS5 порта 40000..."
+    if ss -tlnp 2>/dev/null | grep -q ":40000"; then
+        ok "SOCKS5 слушает на 127.0.0.1:40000"
+    else
+        warn "Порт 40000 ещё не слушается. Подождите минуту и проверьте: ss -tlnp | grep 40000"
+    fi
+
+    # Контрольный тест через curl (опционально)
+    info "Тест через SOCKS5: проверка какой IP видит интернет..."
+    local warp_ip
+    warp_ip=$(curl -s --max-time 10 --socks5 127.0.0.1:40000 https://api.ipify.org 2>/dev/null)
+    if [[ -n "$warp_ip" ]]; then
+        ok "Через WARP виден IP: ${BOLD}${warp_ip}${RESET} (Cloudflare)"
+    else
+        warn "Тестовый запрос через WARP не прошёл — проверьте позже"
+    fi
+}
+
+
 # ─── ШАГ: Установка mytelemtinfo ─────────────────────────────────────────────
 step_install_mytelemtinfo() {
     hdr "Установка команды mytelemtinfo"
@@ -845,8 +1012,15 @@ print_summary() {
         link=$(curl -s --max-time 5 "http://127.0.0.1:${api}/v1/users" 2>/dev/null \
                | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['links']['tls'][0])" 2>/dev/null \
                || true)
-        # Подмена 0.0.0.0 на реальный IP
-        [[ -n "$link" && -n "$pub_ip" ]] && link="${link/server=0.0.0.0/server=${pub_ip}}"
+        # Подмена 0.0.0.0 на реальный IP или на свой домен
+        if [[ -n "$link" ]]; then
+            if [[ "${USE_CUSTOM_DOMAIN:-false}" == true && -n "${CUSTOM_LINK_DOMAIN:-}" ]]; then
+                link="${link/server=0.0.0.0/server=${CUSTOM_LINK_DOMAIN}}"
+                [[ -n "$pub_ip" ]] && link="${link/server=${pub_ip}/server=${CUSTOM_LINK_DOMAIN}}"
+            elif [[ -n "$pub_ip" ]]; then
+                link="${link/server=0.0.0.0/server=${pub_ip}}"
+            fi
+        fi
 
         echo -e "  ${BOLD}Инстанс ${n}${RESET} — порт ${BOLD}${port}${RESET} | ${CYAN}${domain}${RESET}"
         if [[ -n "$link" ]]; then
@@ -866,6 +1040,8 @@ print_summary() {
     [[ "${DO_BBR:-false}"       == true ]] && echo -e "  ${GREEN}✓${RESET} BBR + fq qdisc                            ${DIM}— скорость на плохих сетях${RESET}"
     [[ "${DO_NFT:-false}"      == true ]] && echo -e "  ${GREEN}✓${RESET} nft SYN limiter (${NFT_RATE} burst ${NFT_BURST})"
     [[ "${DO_TIMEOUTS:-false}" == true ]] && echo -e "  ${GREEN}✓${RESET} [timeouts]: tg_connect=${TM_TG} handshake=${TM_HS} keepalive=${TM_KA}"
+    [[ "${USE_CUSTOM_DOMAIN:-false}" == true ]] && echo -e "  ${GREEN}✓${RESET} Свой домен в ссылках: ${BOLD}${CUSTOM_LINK_DOMAIN}${RESET}"
+    [[ "${DO_WARP:-false}"     == true ]] && echo -e "  ${GREEN}✓${RESET} Cloudflare WARP upstream (трафик к Telegram DC через WARP)"
 
     echo ""
     echo -e "  ${BOLD}Управление:${RESET} ${CYAN}sudo mytelemtinfo${RESET}"
@@ -904,12 +1080,14 @@ main() {
 
     echo ""
     echo -e "${BOLD}Итоговый план:${RESET}"
-    echo -e "  Инстансы:   ${INSTANCES[*]}"
-    echo -e "  UFW:        $DO_UFW | rate-limit: $DO_RATELIMIT"
-    echo -e "  Keepalive:  ${DO_KEEPALIVE:-false}"
-    echo -e "  BBR + fq:   ${DO_BBR:-false}"
-    echo -e "  nft limiter:${DO_NFT:-false}"
-    echo -e "  Таймауты:   ${DO_TIMEOUTS:-false}"
+    echo -e "  Инстансы:        ${INSTANCES[*]}"
+    echo -e "  UFW:             $DO_UFW | rate-limit: $DO_RATELIMIT"
+    echo -e "  Keepalive:       ${DO_KEEPALIVE:-false}"
+    echo -e "  BBR + fq:        ${DO_BBR:-false}"
+    echo -e "  nft limiter:     ${DO_NFT:-false}"
+    echo -e "  Таймауты:        ${DO_TIMEOUTS:-false}"
+    echo -e "  Свой домен:      ${USE_CUSTOM_DOMAIN:-false}${USE_CUSTOM_DOMAIN:+ (${CUSTOM_LINK_DOMAIN})}"
+    echo -e "  WARP upstream:   ${DO_WARP:-false}"
     echo ""
     confirm "Всё верно — поехали?" exit
 
@@ -920,6 +1098,7 @@ main() {
 
     step_prepare
     step_install_binary
+    step_warp
     step_gen_secrets
     step_configs
     step_systemd
