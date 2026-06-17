@@ -251,63 +251,6 @@ select_components() {
         TM_KA="${TM_KA:-60}"
         ok "Таймауты: tg_connect=$TM_TG client_handshake=$TM_HS client_keepalive=$TM_KA"
     fi
-
-    # --- Свой домен вместо IP в ссылке для клиента ---
-    echo ""
-    echo -e "  ${BOLD}Свой домен в ссылке для клиента${RESET}"
-    echo -e "  Вместо ${BOLD}server=РЕАЛЬНЫЙ_IP${RESET} в tg://proxy?... будет ${BOLD}server=твой.домен${RESET}"
-    echo -e "  ${DIM}Требование: A-запись твой.домен → IP этого сервера должна быть настроена в DNS.${RESET}"
-    echo -e "  ${DIM}Это чистая косметика — Telegram-клиент сам резолвит домен в IP перед коннектом.${RESET}"
-    USE_CUSTOM_DOMAIN=false
-    CUSTOM_LINK_DOMAIN=""
-    read -rp "$(echo -e "${YELLOW}?${RESET} Использовать свой домен? [y/N]: ")" ans
-    if [[ "${ans,,}" =~ ^(y|yes|д|да)$ ]]; then
-        while true; do
-            read -rp "$(echo -e "  ${YELLOW}→${RESET} Введите домен (например proxy.example.com): ")" inp_dom
-            if [[ -n "$inp_dom" && "$inp_dom" == *.* ]]; then
-                CUSTOM_LINK_DOMAIN="$inp_dom"
-                USE_CUSTOM_DOMAIN=true
-                # Проверяем что домен резолвится в IP этого сервера
-                local resolved_ip server_ip
-                resolved_ip=$(getent hosts "$inp_dom" 2>/dev/null | awk '{print $1}' | head -1)
-                server_ip=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null \
-                            || ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}')
-                if [[ -n "$resolved_ip" && -n "$server_ip" ]]; then
-                    if [[ "$resolved_ip" == "$server_ip" ]]; then
-                        ok "Домен резолвится в IP сервера ($server_ip) — всё верно"
-                    else
-                        warn "Внимание: домен резолвится в $resolved_ip, а IP сервера — $server_ip"
-                        warn "Возможно DNS ещё не обновился или A-запись указывает на другой хост"
-                        read -rp "  Продолжить с этим доменом? [Y/n]: " conf
-                        [[ "${conf,,}" =~ ^(n|no)$ ]] && { USE_CUSTOM_DOMAIN=false; CUSTOM_LINK_DOMAIN=""; continue; }
-                    fi
-                else
-                    warn "Не удалось проверить DNS — домен будет использован как есть"
-                fi
-                break
-            else
-                warn "Введите корректный домен (например proxy.example.com)"
-            fi
-        done
-        ok "В ссылках для клиентов будет: ${BOLD}${CUSTOM_LINK_DOMAIN}${RESET}"
-        # Сохраняем в файл состояния для mytelemtinfo
-        mkdir -p /etc/telemt
-        echo "$CUSTOM_LINK_DOMAIN" > /etc/telemt/.custom_domain
-        chmod 644 /etc/telemt/.custom_domain
-    fi
-
-    # --- WARP для трафика к Telegram DC ---
-    echo ""
-    echo -e "  ${BOLD}WARP для трафика к Telegram DC${RESET} ${DIM}(native WireGuard + policy routing)${RESET}"
-    echo -e "  Заворачивает трафик ${BOLD}telemt → Telegram DC${RESET} через Cloudflare WARP."
-    echo -e "  Клиенты подключаются к серверу ${BOLD}напрямую${RESET}, дальше идёт через WARP."
-    echo -e "  ${DIM}Помогает если Telegram DC блокируется на исходящем (некоторые хостеры).${RESET}"
-    echo -e "  ${DIM}Реализация: wgcf создаёт WireGuard-интерфейс 'warp' (Table=off).${RESET}"
-    echo -e "  ${DIM}ip rule + отдельная таблица маршрутизации форсят 14 подсетей Telegram через warp.${RESET}"
-    echo -e "  ${DIM}Никаких SOCKS5 промежуточных демонов — ядро всё делает само.${RESET}"
-    DO_WARP=false
-    read -rp "$(echo -e "${YELLOW}?${RESET} Завернуть Telegram-трафик в WARP? [y/N]: ")" ans
-    [[ "${ans,,}" =~ ^(y|yes|д|да)$ ]] && DO_WARP=true
 }
 
 # ─── Вспомогательные функции инстансов ───────────────────────────────────────
@@ -474,9 +417,6 @@ client_keepalive = ${TM_KA:-60}
 TOMLTIME
             info "Добавлена секция [timeouts]: tg_connect=${TM_TG} handshake=${TM_HS} keepalive=${TM_KA}"
         fi
-
-        # При WARP через policy routing никаких изменений в конфигах не нужно —
-        # ядро автоматически маршрутизирует пакеты к подсетям Telegram через интерфейс warp.
 
         ok "Создан /etc/telemt/telemt${n}.toml"
         SECRETS[$n]="$secret"
@@ -790,257 +730,6 @@ SERVICE
 }
 
 
-# ─── ШАГ: Установка WARP (native WireGuard + policy routing) ─────────────────
-# Подсети Telegram DC — статичные публичные диапазоны
-# Источник: docs.telegram.org/cli/configuration#datacenters и публичные whois
-TELEGRAM_SUBNETS_V4=(
-    "91.108.4.0/22"
-    "91.108.8.0/22"
-    "91.108.12.0/22"
-    "91.108.16.0/22"
-    "91.108.20.0/22"
-    "91.108.56.0/22"
-    "91.105.192.0/23"
-    "149.154.160.0/20"
-    "185.76.151.0/24"
-)
-TELEGRAM_SUBNETS_V6=(
-    "2001:b28:f23c::/48"
-    "2001:b28:f23d::/48"
-    "2001:b28:f23f::/48"
-    "2001:67c:4e8::/48"
-    "2a0a:f280::/32"
-)
-WARP_RT_TABLE="200"   # Номер таблицы маршрутизации для policy routing
-WARP_FWMARK="0x42"    # Метка не нужна — оставим для будущего, маркируем по dst
-
-step_warp() {
-    [[ "${DO_WARP:-false}" != true ]] && return 0
-    hdr "Установка WARP (native WireGuard + policy routing)"
-
-    echo ""
-    info "Архитектура: wgcf создаёт WireGuard-интерфейс 'warp' (Table=off)."
-    info "ip rule + отдельная таблица маршрутизации форсят пакеты к подсетям Telegram через warp."
-    info "Никаких SOCKS5 промежуточных демонов — telemt идёт напрямую, ядро маршрутизирует."
-    echo ""
-    confirm "Установить?" skip || return 0
-
-    # ── 1) WireGuard ──────────────────────────────────────────────────────────
-    info "Установка wireguard..."
-    wait_apt
-    if ! apt-get install -y wireguard curl 2>&1; then
-        err "Не удалось установить wireguard — пропуск WARP"
-        DO_WARP=false
-        return 0
-    fi
-    ok "wireguard установлен"
-
-    # ── 2) wgcf — Go-бинарник ─────────────────────────────────────────────────
-    if ! command -v wgcf &>/dev/null; then
-        info "Скачивание wgcf..."
-        local arch wgcf_arch wgcf_version wgcf_url
-
-        arch=$(uname -m)
-        case "$arch" in
-            x86_64) wgcf_arch="amd64" ;;
-            aarch64|arm64) wgcf_arch="arm64" ;;
-            armv7l) wgcf_arch="armv7" ;;
-            *) wgcf_arch="amd64" ;;
-        esac
-
-        wgcf_version=$(curl -s --max-time 10 "https://api.github.com/repos/ViRb3/wgcf/releases/latest" \
-                       | grep tag_name | cut -d \" -f 4)
-        if [[ -z "$wgcf_version" ]]; then
-            err "Не удалось определить последнюю версию wgcf — пропуск WARP"
-            DO_WARP=false
-            return 0
-        fi
-
-        wgcf_url="https://github.com/ViRb3/wgcf/releases/download/${wgcf_version}/wgcf_${wgcf_version#v}_linux_${wgcf_arch}"
-        info "Версия wgcf: ${BOLD}${wgcf_version}${RESET} (${wgcf_arch})"
-
-        if ! curl -fsSL --max-time 60 -o /usr/local/bin/wgcf "$wgcf_url"; then
-            err "Не удалось скачать wgcf — пропуск WARP"
-            DO_WARP=false
-            return 0
-        fi
-        chmod +x /usr/local/bin/wgcf
-        ok "wgcf установлен"
-    else
-        ok "wgcf уже установлен"
-    fi
-
-    # ── 3) Регистрация WARP-аккаунта ─────────────────────────────────────────
-    info "Регистрация free WARP-аккаунта..."
-    mkdir -p /etc/wireguard
-    cd /etc/wireguard
-
-    if [[ ! -f /etc/wireguard/wgcf-account.toml ]]; then
-        # Бэкап DNS на время регистрации
-        local restore_dns=false
-        if ! getent hosts api.cloudflareclient.com &>/dev/null; then
-            cp /etc/resolv.conf /etc/resolv.conf.warp-backup 2>/dev/null || true
-            printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf
-            restore_dns=true
-        fi
-
-        if ! timeout 60 bash -c 'yes | wgcf register' >/dev/null 2>&1; then
-            sleep 3
-            yes | wgcf register >/dev/null 2>&1 || true
-        fi
-
-        if [[ "$restore_dns" == true && -f /etc/resolv.conf.warp-backup ]]; then
-            cp /etc/resolv.conf.warp-backup /etc/resolv.conf
-            rm -f /etc/resolv.conf.warp-backup
-        fi
-
-        if [[ ! -f /etc/wireguard/wgcf-account.toml ]]; then
-            err "Регистрация wgcf не удалась — пропуск WARP"
-            DO_WARP=false
-            cd - >/dev/null 2>&1 || true
-            return 0
-        fi
-        ok "WARP-аккаунт зарегистрирован"
-    else
-        ok "WARP-аккаунт уже зарегистрирован"
-    fi
-
-    # ── 4) Генерация конфига ─────────────────────────────────────────────────
-    info "Генерация WireGuard-профиля..."
-    if ! wgcf generate >/dev/null 2>&1; then
-        err "Не удалось сгенерировать wgcf-profile.conf"
-        DO_WARP=false
-        cd - >/dev/null 2>&1 || true
-        return 0
-    fi
-
-    # ── 5) Правка конфига + добавление PostUp/PreDown для policy routing ─────
-    local conf=/etc/wireguard/wgcf-profile.conf
-    sed -i '/^DNS =/d' "$conf"
-    grep -q "Table = off" "$conf" || sed -i '/^MTU =/a Table = off' "$conf"
-    grep -q "PersistentKeepalive" "$conf" || sed -i '/^Endpoint =/a PersistentKeepalive = 25' "$conf"
-
-    # IPv6 — если на сервере выключен, убираем из конфига
-    local has_ipv6=true
-    if ! sysctl net.ipv6.conf.all.disable_ipv6 2>/dev/null | grep -q ' = 0'; then
-        sed -i 's/,\s*[0-9a-fA-F:]\+\/128//' "$conf"
-        sed -i '/Address = [0-9a-fA-F:]\+\/128/d' "$conf"
-        has_ipv6=false
-        info "IPv6 отключён в системе — убран из WARP-конфига"
-    fi
-
-    # Добавляем PostUp/PreDown для policy routing к Telegram DC
-    # Удаляем старые PostUp/PreDown если они уже есть (на случай переустановки)
-    sed -i '/^PostUp /d' "$conf"
-    sed -i '/^PreDown /d' "$conf"
-
-    # Формируем команды PostUp (запускаются после подъёма интерфейса)
-    # 1. Добавляем default route в нашу таблицу через warp
-    # 2. Для каждой подсети Telegram — ip rule "to <subnet> lookup 200"
-    {
-        echo ""
-        echo "# Policy routing: трафик к Telegram DC идёт через warp"
-        echo "PostUp = ip route add default dev %i table ${WARP_RT_TABLE}"
-        for sn in "${TELEGRAM_SUBNETS_V4[@]}"; do
-            echo "PostUp = ip rule add to ${sn} lookup ${WARP_RT_TABLE}"
-        done
-        if [[ "$has_ipv6" == true ]]; then
-            echo "PostUp = ip -6 route add default dev %i table ${WARP_RT_TABLE}"
-            for sn in "${TELEGRAM_SUBNETS_V6[@]}"; do
-                echo "PostUp = ip -6 rule add to ${sn} lookup ${WARP_RT_TABLE}"
-            done
-        fi
-
-        # PreDown — удаляем правила в обратном порядке
-        for sn in "${TELEGRAM_SUBNETS_V4[@]}"; do
-            echo "PreDown = ip rule del to ${sn} lookup ${WARP_RT_TABLE} 2>/dev/null || true"
-        done
-        echo "PreDown = ip route flush table ${WARP_RT_TABLE} 2>/dev/null || true"
-        if [[ "$has_ipv6" == true ]]; then
-            for sn in "${TELEGRAM_SUBNETS_V6[@]}"; do
-                echo "PreDown = ip -6 rule del to ${sn} lookup ${WARP_RT_TABLE} 2>/dev/null || true"
-            done
-            echo "PreDown = ip -6 route flush table ${WARP_RT_TABLE} 2>/dev/null || true"
-        fi
-    } >> "$conf"
-
-    # Перемещаем в стандартное место
-    mv "$conf" /etc/wireguard/warp.conf
-    chmod 600 /etc/wireguard/warp.conf
-    ok "Конфиг сохранён: /etc/wireguard/warp.conf"
-    info "Policy routing настроен на ${#TELEGRAM_SUBNETS_V4[@]} IPv4 + ${#TELEGRAM_SUBNETS_V6[@]} IPv6 подсетей"
-
-    # ── 6) Запуск интерфейса warp ────────────────────────────────────────────
-    info "Поднятие интерфейса warp (wg-quick применит правила автоматически)..."
-    if ! systemctl enable --now wg-quick@warp 2>&1 | grep -v "Created symlink"; then
-        sleep 2
-        systemctl start wg-quick@warp 2>/dev/null || true
-    fi
-    sleep 3
-
-    if ! wg show warp &>/dev/null; then
-        err "Интерфейс warp не поднялся"
-        warn "Логи: journalctl -u wg-quick@warp -n 30"
-        DO_WARP=false
-        cd - >/dev/null 2>&1 || true
-        return 0
-    fi
-
-    # Проверка handshake
-    local handshake=""
-    for i in {1..10}; do
-        handshake=$(wg show warp | grep "latest handshake" | awk -F': ' '{print $2}')
-        [[ "$handshake" == *"second"* || "$handshake" == *"minute"* ]] && break
-        sleep 1
-    done
-    if [[ -n "$handshake" && "$handshake" != "0 seconds ago" ]]; then
-        ok "WARP handshake: ${handshake}"
-    else
-        warn "Handshake не получен за 10с (может появиться позже)"
-    fi
-
-    # Проверка правил
-    local rule_count
-    rule_count=$(ip rule | grep -c "lookup ${WARP_RT_TABLE}" 2>/dev/null || echo 0)
-    if [[ "$rule_count" -gt 0 ]]; then
-        ok "Применено ip rule правил: ${rule_count}"
-    else
-        warn "ip rule правил не найдено — что-то пошло не так"
-    fi
-
-    # ── 7) Проверка маршрутизации ────────────────────────────────────────────
-    info "Тест: какой IP виден при подключении к Telegram-подсетям?"
-
-    # Прямой IP сервера (любая не-Telegram точка) — должен быть твой IP
-    local direct_ip
-    direct_ip=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null)
-    if [[ -n "$direct_ip" ]]; then
-        info "Прямой IP сервера (через обычный маршрут): ${BOLD}${direct_ip}${RESET}"
-    fi
-
-    # Trace через warp интерфейс — должен видеть Cloudflare
-    local warp_visible
-    warp_visible=$(curl -s --max-time 5 --interface warp https://api.ipify.org 2>/dev/null)
-    if [[ -n "$warp_visible" ]]; then
-        ok "IP при выходе через warp: ${BOLD}${warp_visible}${RESET} (Cloudflare)"
-        if [[ "$direct_ip" == "$warp_visible" ]]; then
-            warn "Странно — оба IP одинаковые. Возможно warp не работает"
-        fi
-    fi
-
-    # Проверка маршрута для конкретного Telegram IP
-    local tg_route
-    tg_route=$(ip route get 149.154.167.51 2>/dev/null | head -1)
-    if echo "$tg_route" | grep -q "warp"; then
-        ok "Маршрут к Telegram (149.154.167.51) идёт через ${BOLD}warp${RESET}"
-    else
-        warn "Маршрут к Telegram НЕ через warp:"
-        echo -e "    ${DIM}${tg_route}${RESET}"
-    fi
-
-    cd - >/dev/null 2>&1 || true
-}
-
 # ─── ШАГ: Установка mytelemtinfo ─────────────────────────────────────────────
 step_install_mytelemtinfo() {
     hdr "Установка команды mytelemtinfo"
@@ -1156,15 +845,8 @@ print_summary() {
         link=$(curl -s --max-time 5 "http://127.0.0.1:${api}/v1/users" 2>/dev/null \
                | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['links']['tls'][0])" 2>/dev/null \
                || true)
-        # Подмена 0.0.0.0 на реальный IP или на свой домен
-        if [[ -n "$link" ]]; then
-            if [[ "${USE_CUSTOM_DOMAIN:-false}" == true && -n "${CUSTOM_LINK_DOMAIN:-}" ]]; then
-                link="${link/server=0.0.0.0/server=${CUSTOM_LINK_DOMAIN}}"
-                [[ -n "$pub_ip" ]] && link="${link/server=${pub_ip}/server=${CUSTOM_LINK_DOMAIN}}"
-            elif [[ -n "$pub_ip" ]]; then
-                link="${link/server=0.0.0.0/server=${pub_ip}}"
-            fi
-        fi
+        # Подмена 0.0.0.0 на реальный IP
+        [[ -n "$link" && -n "$pub_ip" ]] && link="${link/server=0.0.0.0/server=${pub_ip}}"
 
         echo -e "  ${BOLD}Инстанс ${n}${RESET} — порт ${BOLD}${port}${RESET} | ${CYAN}${domain}${RESET}"
         if [[ -n "$link" ]]; then
@@ -1184,8 +866,6 @@ print_summary() {
     [[ "${DO_BBR:-false}"       == true ]] && echo -e "  ${GREEN}✓${RESET} BBR + fq qdisc                            ${DIM}— скорость на плохих сетях${RESET}"
     [[ "${DO_NFT:-false}"      == true ]] && echo -e "  ${GREEN}✓${RESET} nft SYN limiter (${NFT_RATE} burst ${NFT_BURST})"
     [[ "${DO_TIMEOUTS:-false}" == true ]] && echo -e "  ${GREEN}✓${RESET} [timeouts]: tg_connect=${TM_TG} handshake=${TM_HS} keepalive=${TM_KA}"
-    [[ "${USE_CUSTOM_DOMAIN:-false}" == true ]] && echo -e "  ${GREEN}✓${RESET} Свой домен в ссылках: ${BOLD}${CUSTOM_LINK_DOMAIN}${RESET}"
-    [[ "${DO_WARP:-false}"     == true ]] && echo -e "  ${GREEN}✓${RESET} WARP policy routing (14 подсетей Telegram через warp интерфейс)"
 
     echo ""
     echo -e "  ${BOLD}Управление:${RESET} ${CYAN}sudo mytelemtinfo${RESET}"
@@ -1207,219 +887,14 @@ do_update() {
     exit 0
 }
 
-# ─── Полная очистка системы от всех компонентов установщика ─────────────────
-# Используется в режиме --purge (только очистка) и в режиме --clean (очистка + установка)
-do_purge_all() {
-    hdr "Полная очистка системы от компонентов telemt-install"
-
-    echo ""
-    echo -e "  ${YELLOW}Будут удалены:${RESET}"
-    echo -e "  • Все инстансы telemt (сервисы, конфиги, бинарник, пользователь)"
-    echo -e "  • mytelemtinfo команда"
-    echo -e "  • WARP компоненты: интерфейс wg-quick@warp, microsocks-мост, wgcf"
-    echo -e "  • nft SYN limiter (сервис и правила)"
-    echo -e "  • TCP keepalive + BBR sysctl (откат к дефолтам ядра)"
-    echo -e "  • UFW правила портов и rate-limit (xt_recent)"
-    echo -e "  • Сохранённый кастомный домен"
-    echo ""
-    echo -e "  ${DIM}НЕ удаляются: системные пакеты (wireguard, microsocks, jq, ufw)${RESET}"
-    echo -e "  ${DIM}Это сохраняет их для других сервисов которые могут их использовать.${RESET}"
-    echo ""
-    confirm "Подтвердить полную очистку?" exit || return 1
-
-    # ── 1) Останавливаем все инстансы telemt ──
-    info "Остановка инстансов telemt..."
-    for n in 1 2 3 4 5 6 7 8 9 10; do
-        if [[ -f "/etc/systemd/system/telemt${n}.service" ]]; then
-            systemctl stop    "telemt${n}" 2>/dev/null || true
-            systemctl disable "telemt${n}" 2>/dev/null || true
-            rm -f "/etc/systemd/system/telemt${n}.service"
-        fi
-    done
-    ok "telemt-инстансы остановлены"
-
-    # ── 2) Удаляем конфиги и бинарник telemt ──
-    info "Удаление файлов telemt..."
-    rm -rf /etc/telemt /opt/telemt
-    rm -f  /bin/telemt
-    userdel telemt 2>/dev/null || true
-    ok "Файлы telemt удалены"
-
-    # ── 3) Удаляем mytelemtinfo ──
-    if [[ -f /usr/local/bin/mytelemtinfo ]]; then
-        rm -f /usr/local/bin/mytelemtinfo
-        ok "mytelemtinfo удалён"
-    fi
-
-    # ── 4) Удаляем WARP (native WireGuard + policy routing) ──
-    if [[ -f /etc/wireguard/warp.conf ]] || systemctl list-unit-files 2>/dev/null | grep -q "wg-quick@warp\|telemt-warp-socks"; then
-        info "Удаление WARP..."
-        # Старый микрососкс-мост (для совместимости с предыдущими версиями)
-        systemctl stop telemt-warp-socks 2>/dev/null || true
-        systemctl disable telemt-warp-socks 2>/dev/null || true
-        rm -f /etc/systemd/system/telemt-warp-socks.service
-
-        # Основное: WireGuard интерфейс
-        systemctl stop wg-quick@warp 2>/dev/null || true
-        systemctl disable wg-quick@warp 2>/dev/null || true
-        rm -f /etc/wireguard/warp.conf /etc/wireguard/wgcf-account.toml /etc/wireguard/wgcf-profile.conf
-        rm -f /usr/local/bin/wgcf
-
-        # Чистим policy routing на случай если что-то осталось в памяти ядра
-        while ip rule 2>/dev/null | grep -q "lookup 200"; do
-            ip rule del lookup 200 2>/dev/null || break
-        done
-        ip route flush table 200 2>/dev/null || true
-
-        # Старый cloudflare-warp если был
-        if command -v warp-cli &>/dev/null; then
-            warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
-            systemctl disable --now warp-svc 2>/dev/null || true
-            apt-get purge -y cloudflare-warp 2>&1 | tail -2 || true
-            rm -f /etc/apt/sources.list.d/cloudflare-client.list
-            rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-        fi
-        ok "WARP компоненты удалены"
-    fi
-
-    # ── 5) nft SYN limiter ──
-    if [[ -f /etc/systemd/system/telemt-nft-limit.service ]] || nft list table inet telemt_limit &>/dev/null; then
-        info "Удаление nft SYN limiter..."
-        systemctl stop    telemt-nft-limit.service 2>/dev/null || true
-        systemctl disable telemt-nft-limit.service 2>/dev/null || true
-        rm -f /etc/systemd/system/telemt-nft-limit.service
-        rm -f /usr/local/sbin/telemt-nft-limit.sh
-        nft delete table inet telemt_limit 2>/dev/null || true
-        ok "nft limiter удалён"
-    fi
-
-    # ── 6) TCP keepalive + BBR sysctl ──
-    if [[ -f /etc/sysctl.d/99-telemt-net.conf || -f /etc/sysctl.d/99-tg-keepalive.conf ]]; then
-        info "Откат TCP keepalive и BBR..."
-        rm -f /etc/sysctl.d/99-telemt-net.conf /etc/sysctl.d/99-tg-keepalive.conf
-        sysctl -w net.ipv4.tcp_keepalive_time=7200  >/dev/null 2>&1 || true
-        sysctl -w net.ipv4.tcp_keepalive_intvl=75   >/dev/null 2>&1 || true
-        sysctl -w net.ipv4.tcp_keepalive_probes=9   >/dev/null 2>&1 || true
-        sysctl -w net.core.default_qdisc=fq_codel   >/dev/null 2>&1 || true
-        sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
-        sysctl --system >/dev/null 2>&1 || true
-        ok "Keepalive + BBR откачены к дефолтам"
-    fi
-
-    # ── 7) UFW: rate-limit и порты ──
-    if grep -q "MTProto rate-limit" /etc/ufw/before.rules 2>/dev/null; then
-        info "Удаление UFW rate-limit правил..."
-        python3 << 'PYEOF'
-path = "/etc/ufw/before.rules"
-lines = open(path).readlines()
-out, skip = [], False
-for l in lines:
-    if "MTProto rate-limit" in l and "конец" not in l: skip = True
-    if not skip: out.append(l)
-    if "конец MTProto rate-limit" in l: skip = False
-open(path,"w").writelines(out)
-PYEOF
-        rm -f /etc/modules-load.d/xt_recent.conf
-        ufw reload >/dev/null 2>&1 || true
-        ok "UFW rate-limit убран"
-    fi
-
-    # Порты telemt (стандартные + кастомные из конфигов если бы они ещё были)
-    if ufw status 2>/dev/null | grep -q "Status: active"; then
-        info "Закрытие UFW портов telemt..."
-        for port in 443 5223 8530; do
-            ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
-        done
-        ok "UFW порты закрыты"
-    fi
-
-    # ── 8) Бэкапы и временные файлы ──
-    rm -f /etc/ufw/before.rules.bak.* 2>/dev/null || true
-    rm -f /etc/telemt/.custom_domain 2>/dev/null || true
-
-    echo ""
-    ok "${BOLD}Очистка завершена.${RESET}"
-    echo ""
-    info "Состояние системы после очистки:"
-    echo -e "  ${DIM}• telemt: $(command -v /bin/telemt &>/dev/null && echo 'ещё есть' || echo 'удалён')${RESET}"
-    echo -e "  ${DIM}• mytelemtinfo: $(command -v mytelemtinfo &>/dev/null && echo 'ещё есть' || echo 'удалён')${RESET}"
-    echo -e "  ${DIM}• warp интерфейс: $(wg show warp &>/dev/null && echo 'активен' || echo 'нет')${RESET}"
-    echo -e "  ${DIM}• nft telemt_limit: $(nft list table inet telemt_limit &>/dev/null && echo 'активна' || echo 'нет')${RESET}"
-    echo ""
-    return 0
-}
-
-# ─── Режим --purge (только очистка, без установки) ──────────────────────────
-do_purge_only() {
-    check_root
-    print_banner
-    echo -e "  ${BOLD}${RED}РЕЖИМ ПОЛНОЙ ОЧИСТКИ${RESET}"
-    echo -e "  ${DIM}Будут удалены все компоненты telemt-install без последующей установки.${RESET}"
-    echo ""
-    if do_purge_all; then
-        echo -e "  Чтобы установить заново позже:"
-        echo -e "  ${CYAN}sudo bash <(curl -fsSL https://raw.githubusercontent.com/vaalaav/telemt-install/main/install.sh)${RESET}"
-        echo ""
-    fi
-    exit 0
-}
-
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 main() {
     check_root
     print_banner
 
-    # Флаги командной строки
     [[ "${1:-}" == "--update" ]] && do_update
-    [[ "${1:-}" == "--purge"  ]] && do_purge_only
 
     echo -e "  Установка ${BOLD}telemt${RESET} — Telegram MTProxy на Rust."
-    echo ""
-
-    # Определяем что уже установлено
-    local existing_install=false
-    if [[ -f /bin/telemt ]] || [[ -d /etc/telemt ]] || [[ -f /usr/local/bin/mytelemtinfo ]]; then
-        existing_install=true
-    fi
-
-    # Если что-то уже установлено или передан флаг --clean — предлагаем меню режимов
-    if [[ "$existing_install" == true || "${1:-}" == "--clean" ]]; then
-        if [[ "$existing_install" == true ]]; then
-            warn "Обнаружена существующая установка telemt-install."
-            echo ""
-        fi
-        echo -e "  ${BOLD}Выберите режим:${RESET}"
-        echo -e "  ${BOLD}1.${RESET} Установка поверх ${DIM}(обычная, существующие конфиги сохраняются)${RESET}"
-        echo -e "  ${BOLD}2.${RESET} ${YELLOW}Чистая установка${RESET} ${DIM}(полная очистка + новая установка)${RESET}"
-        echo -e "  ${BOLD}3.${RESET} ${RED}Только очистка${RESET} ${DIM}(удалить всё без новой установки)${RESET}"
-        echo -e "  ${BOLD}0.${RESET} Отмена"
-        echo ""
-        local mode
-        # Если передан --clean — сразу режим 2
-        if [[ "${1:-}" == "--clean" ]]; then
-            mode=2
-            info "Режим --clean: чистая установка"
-        else
-            read -rp "  Режим [1/2/3/0]: " mode
-        fi
-        case "$mode" in
-            1) info "Режим: установка поверх существующей" ;;
-            2)
-                info "Режим: чистая установка (сначала очистка)"
-                if ! do_purge_all; then
-                    echo -e "${RED}Очистка отменена.${RESET}"
-                    exit 1
-                fi
-                echo ""
-                info "Очистка завершена. Переходим к установке..."
-                sleep 2
-                ;;
-            3) do_purge_only ;;
-            0|q|"") echo -e "${YELLOW}Отменено.${RESET}"; exit 0 ;;
-            *) err "Неверный пункт"; exit 1 ;;
-        esac
-    fi
-
     echo -e "  На каждом шаге: ${GREEN}y${RESET} (выполнить), Enter/n (пропустить), ${RED}q${RESET} (выход)."
     echo ""
     confirm "Начать установку?" exit
@@ -1429,14 +904,12 @@ main() {
 
     echo ""
     echo -e "${BOLD}Итоговый план:${RESET}"
-    echo -e "  Инстансы:        ${INSTANCES[*]}"
-    echo -e "  UFW:             $DO_UFW | rate-limit: $DO_RATELIMIT"
-    echo -e "  Keepalive:       ${DO_KEEPALIVE:-false}"
-    echo -e "  BBR + fq:        ${DO_BBR:-false}"
-    echo -e "  nft limiter:     ${DO_NFT:-false}"
-    echo -e "  Таймауты:        ${DO_TIMEOUTS:-false}"
-    echo -e "  Свой домен:      ${USE_CUSTOM_DOMAIN:-false}${USE_CUSTOM_DOMAIN:+ (${CUSTOM_LINK_DOMAIN})}"
-    echo -e "  WARP upstream:   ${DO_WARP:-false}"
+    echo -e "  Инстансы:   ${INSTANCES[*]}"
+    echo -e "  UFW:        $DO_UFW | rate-limit: $DO_RATELIMIT"
+    echo -e "  Keepalive:  ${DO_KEEPALIVE:-false}"
+    echo -e "  BBR + fq:   ${DO_BBR:-false}"
+    echo -e "  nft limiter:${DO_NFT:-false}"
+    echo -e "  Таймауты:   ${DO_TIMEOUTS:-false}"
     echo ""
     confirm "Всё верно — поехали?" exit
 
@@ -1447,7 +920,6 @@ main() {
 
     step_prepare
     step_install_binary
-    step_warp
     step_gen_secrets
     step_configs
     step_systemd
