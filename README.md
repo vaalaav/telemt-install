@@ -12,7 +12,11 @@
 ## Установка
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/vaalaav/telemt-install/main/install.sh)
+curl -fsSL -o install.sh https://raw.githubusercontent.com/vaalaav/telemt-install/main/install.sh
+
+chmod +x install.sh
+
+sudo bash install.sh
 ```
 
 > Требуется root. Поддержка: Ubuntu 20.04 / 22.04 / 24.04, архитектура x86_64.
