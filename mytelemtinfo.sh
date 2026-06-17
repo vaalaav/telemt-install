@@ -220,15 +220,16 @@ status_custom_domain() {
     fi
 }
 
-# ─── WARP ────────────────────────────────────────────────────────────────────
+# ─── WARP (native WireGuard + microsocks bridge) ─────────────────────────────
 status_warp() {
-    if ! command -v warp-cli &>/dev/null; then
-        echo -e "${DIM}не установлен${RESET}"
-        return
+    local wg_up=false bridge_up=false
+    if wg show warp &>/dev/null; then
+        wg_up=true
     fi
-    local warp_status mode
-    warp_status=$(warp-cli --accept-tos status 2>/dev/null | grep -oE "Connected|Disconnected|Connecting" | head -1)
-    mode=$(warp-cli --accept-tos settings 2>/dev/null | grep -i "mode" | grep -oE "(warp|proxy|warp\+doh)" | head -1)
+    if systemctl is-active --quiet telemt-warp-socks 2>/dev/null \
+       && ss -tlnp 2>/dev/null | grep -q "127.0.0.1:40000"; then
+        bridge_up=true
+    fi
 
     # Проверяем что upstream подключён в конфигах telemt
     local has_upstream=false
@@ -236,14 +237,20 @@ status_warp() {
         [[ -f "$f" ]] && grep -q "127.0.0.1:40000" "$f" 2>/dev/null && has_upstream=true && break
     done
 
-    if [[ "$warp_status" == "Connected" && "$mode" == "proxy" && "$has_upstream" == true ]]; then
-        echo -e "${GREEN}активен${RESET}  (proxy mode, telemt → WARP)"
-    elif [[ "$warp_status" == "Connected" && "$mode" == "proxy" ]]; then
-        echo -e "${YELLOW}WARP работает, но не подключён к telemt${RESET}"
-    elif [[ "$warp_status" == "Connected" ]]; then
-        echo -e "${YELLOW}подключён в режиме ${mode}${RESET} (нужен proxy)"
+    if [[ ! -f /etc/wireguard/warp.conf ]] && ! command -v wgcf &>/dev/null; then
+        echo -e "${DIM}не установлен${RESET}"
+        return
+    fi
+
+    if [[ "$wg_up" == true && "$bridge_up" == true && "$has_upstream" == true ]]; then
+        local hs; hs=$(wg show warp 2>/dev/null | grep "latest handshake" | awk -F': ' '{print $2}')
+        echo -e "${GREEN}активен${RESET}  (wg+bridge+telemt) ${DIM}handshake: ${hs:-—}${RESET}"
+    elif [[ "$wg_up" == true && "$bridge_up" == true ]]; then
+        echo -e "${YELLOW}работает, но не прицеплен к telemt${RESET}"
+    elif [[ "$wg_up" == true ]]; then
+        echo -e "${YELLOW}WireGuard up, мост не активен${RESET}"
     else
-        echo -e "${DIM}установлен, но не подключён${RESET}"
+        echo -e "${DIM}установлен, не запущен${RESET}"
     fi
 }
 
@@ -1979,35 +1986,41 @@ custom_domain_remove() {
 }
 
 # ════════════════════════════════════════════════════════════════════════
-#  7. WARP UPSTREAM
+#  7. WARP UPSTREAM (native WireGuard + microsocks bridge)
 # ════════════════════════════════════════════════════════════════════════
 menu_warp() {
     while true; do
         draw_header
-        echo -e "  ${BOLD}Cloudflare WARP upstream${RESET}\n"
+        echo -e "  ${BOLD}WARP upstream${RESET}  ${DIM}(WireGuard + SOCKS5 bridge)${RESET}\n"
         echo -e "  Статус: $(status_warp)"
         echo ""
 
         # Подробности
-        if command -v warp-cli &>/dev/null; then
-            echo -e "  ${DIM}warp-cli status:${RESET}"
-            warp-cli --accept-tos status 2>/dev/null | head -3 | sed 's/^/    /'
-            echo ""
-            echo -e "  ${DIM}Режим:${RESET} $(warp-cli --accept-tos settings 2>/dev/null | grep -i mode | head -1 | sed 's/^/    /')"
-            if ss -tlnp 2>/dev/null | grep -q ":40000"; then
-                echo -e "  ${DIM}SOCKS5:${RESET} ${GREEN}слушает 127.0.0.1:40000${RESET}"
-            else
-                echo -e "  ${DIM}SOCKS5:${RESET} ${RED}порт 40000 не слушается${RESET}"
-            fi
+        local wg_status="не установлен" bridge_status="не активен" upstream_status="нет"
+        if wg show warp &>/dev/null; then
+            local hs; hs=$(wg show warp 2>/dev/null | grep "latest handshake" | awk -F': ' '{print $2}')
+            wg_status="${GREEN}up${RESET}, handshake: ${hs:-—}"
+        elif [[ -f /etc/wireguard/warp.conf ]]; then
+            wg_status="${YELLOW}конфиг есть, интерфейс не запущен${RESET}"
         fi
+        if systemctl is-active --quiet telemt-warp-socks 2>/dev/null && ss -tlnp 2>/dev/null | grep -q "127.0.0.1:40000"; then
+            bridge_status="${GREEN}слушает 127.0.0.1:40000${RESET}"
+        fi
+        for f in /etc/telemt/telemt*.toml; do
+            [[ -f "$f" ]] && grep -q "127.0.0.1:40000" "$f" 2>/dev/null && upstream_status="${GREEN}прицеплен${RESET}" && break
+        done
+
+        echo -e "  ${DIM}WireGuard 'warp':${RESET} ${wg_status}"
+        echo -e "  ${DIM}SOCKS5-мост:${RESET}     ${bridge_status}"
+        echo -e "  ${DIM}В конфигах telemt:${RESET} ${upstream_status}"
         echo ""
 
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
-        if ! command -v warp-cli &>/dev/null; then
-            echo -e "  ${BOLD}1.${RESET} Установить и настроить WARP"
+        if [[ ! -f /etc/wireguard/warp.conf ]] && ! command -v wgcf &>/dev/null; then
+            echo -e "  ${BOLD}1.${RESET} Установить WARP (wgcf + WireGuard + microsocks)"
         else
-            echo -e "  ${BOLD}1.${RESET} Подключить WARP (если выключен)"
-            echo -e "  ${BOLD}2.${RESET} Отключить WARP временно (без удаления)"
+            echo -e "  ${BOLD}1.${RESET} Запустить WARP (поднять интерфейс + мост)"
+            echo -e "  ${BOLD}2.${RESET} Остановить WARP (без удаления)"
             echo -e "  ${BOLD}3.${RESET} Прицепить WARP к telemt (добавить upstream в конфиги)"
             echo -e "  ${BOLD}4.${RESET} ${YELLOW}Отцепить WARP от telemt${RESET} (telemt пойдёт напрямую)"
             echo -e "  ${BOLD}5.${RESET} Тест: какой IP виден через WARP"
@@ -2018,7 +2031,7 @@ menu_warp() {
         echo ""
         read -rp "  Выберите: " ch
 
-        if ! command -v warp-cli &>/dev/null; then
+        if [[ ! -f /etc/wireguard/warp.conf ]] && ! command -v wgcf &>/dev/null; then
             case "$ch" in
                 1) warp_install ;;
                 0|b) return ;;
@@ -2026,8 +2039,8 @@ menu_warp() {
             esac
         else
             case "$ch" in
-                1) warp_connect ;;
-                2) warp_disconnect ;;
+                1) warp_start ;;
+                2) warp_stop ;;
                 3) warp_attach ;;
                 4) warp_detach ;;
                 5) warp_test ;;
@@ -2041,100 +2054,169 @@ menu_warp() {
 
 warp_install() {
     draw_header
-    echo -e "  ${BOLD}Установка Cloudflare WARP${RESET}\n"
-    read -rp "  Установить cloudflare-warp + настроить proxy режим? [Y/n]: " ans
+    echo -e "  ${BOLD}Установка WARP (native WireGuard + SOCKS5 bridge)${RESET}\n"
+    echo -e "  ${DIM}Будут установлены: wireguard, microsocks, wgcf (бинарник).${RESET}"
+    echo -e "  ${DIM}Зарегистрируется free WARP-аккаунт, поднимется интерфейс warp${RESET}"
+    echo -e "  ${DIM}с флагом Table=off, и SOCKS5-мост на 127.0.0.1:40000 через него.${RESET}"
+    echo ""
+    read -rp "  Установить? [Y/n]: " ans
     [[ "${ans,,}" =~ ^(n|no)$ ]] && return
 
-    info "Добавление официального репозитория..."
-    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
-        | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg 2>/dev/null
-    local codename; codename=$(lsb_release -cs 2>/dev/null || echo "jammy")
-    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${codename} main" \
-        > /etc/apt/sources.list.d/cloudflare-client.list
-
-    info "Установка пакета cloudflare-warp..."
-    apt-get update -qq 2>&1 || warn "apt update вернул предупреждение"
-    if ! apt-get install -y cloudflare-warp 2>&1; then
-        err "Не удалось установить cloudflare-warp"
+    # 1) WireGuard + microsocks
+    info "Установка wireguard + microsocks..."
+    apt-get update -qq 2>&1 | tail -1 || true
+    if ! apt-get install -y wireguard microsocks curl 2>&1; then
+        err "Не удалось установить пакеты"
         pause; return
     fi
-    ok "cloudflare-warp установлен"
+    ok "wireguard + microsocks установлены"
 
-    systemctl enable --now warp-svc 2>/dev/null
-    sleep 3
-
-    info "Регистрация..."
-    warp-cli --accept-tos registration new >/dev/null 2>&1 || true
-    sleep 2
-
-    info "Установка режима proxy..."
-    warp-cli --accept-tos mode proxy >/dev/null 2>&1
-
-    info "Подключение..."
-    warp-cli --accept-tos connect >/dev/null 2>&1
-    sleep 4
-
-    if ss -tlnp 2>/dev/null | grep -q ":40000"; then
-        ok "WARP установлен и слушает на 127.0.0.1:40000"
-    else
-        warn "Порт 40000 ещё не открыт, подождите минуту"
+    # 2) wgcf
+    if ! command -v wgcf &>/dev/null; then
+        info "Скачивание wgcf..."
+        local arch wgcf_arch wgcf_version wgcf_url
+        arch=$(uname -m)
+        case "$arch" in
+            x86_64) wgcf_arch="amd64" ;;
+            aarch64|arm64) wgcf_arch="arm64" ;;
+            armv7l) wgcf_arch="armv7" ;;
+            *) wgcf_arch="amd64" ;;
+        esac
+        wgcf_version=$(curl -s --max-time 10 "https://api.github.com/repos/ViRb3/wgcf/releases/latest" \
+                       | grep tag_name | cut -d \" -f 4)
+        if [[ -z "$wgcf_version" ]]; then
+            err "Не удалось получить версию wgcf"; pause; return
+        fi
+        wgcf_url="https://github.com/ViRb3/wgcf/releases/download/${wgcf_version}/wgcf_${wgcf_version#v}_linux_${wgcf_arch}"
+        if ! curl -fsSL --max-time 60 -o /usr/local/bin/wgcf "$wgcf_url"; then
+            err "Не удалось скачать wgcf"; pause; return
+        fi
+        chmod +x /usr/local/bin/wgcf
+        ok "wgcf $wgcf_version установлен"
     fi
 
-    # Спрашиваем сразу прицепить к telemt
+    # 3) Регистрация
+    info "Регистрация free WARP-аккаунта..."
+    mkdir -p /etc/wireguard
+    cd /etc/wireguard
+    if [[ ! -f /etc/wireguard/wgcf-account.toml ]]; then
+        if ! timeout 60 bash -c 'yes | wgcf register' >/dev/null 2>&1; then
+            sleep 3
+            yes | wgcf register >/dev/null 2>&1 || true
+        fi
+        if [[ ! -f /etc/wireguard/wgcf-account.toml ]]; then
+            err "Регистрация не удалась"; pause; return
+        fi
+    fi
+    ok "WARP-аккаунт готов"
+
+    # 4) Конфиг
+    wgcf generate >/dev/null 2>&1 || { err "Не удалось сгенерировать конфиг"; pause; return; }
+    local conf=/etc/wireguard/wgcf-profile.conf
+    sed -i '/^DNS =/d' "$conf"
+    grep -q "Table = off" "$conf" || sed -i '/^MTU =/a Table = off' "$conf"
+    grep -q "PersistentKeepalive" "$conf" || sed -i '/^Endpoint =/a PersistentKeepalive = 25' "$conf"
+    if ! sysctl net.ipv6.conf.all.disable_ipv6 2>/dev/null | grep -q ' = 0'; then
+        sed -i 's/,\s*[0-9a-fA-F:]\+\/128//' "$conf"
+        sed -i '/Address = [0-9a-fA-F:]\+\/128/d' "$conf"
+    fi
+    mv "$conf" /etc/wireguard/warp.conf
+    chmod 600 /etc/wireguard/warp.conf
+    ok "Конфиг сохранён: /etc/wireguard/warp.conf"
+
+    # 5) Запуск
+    systemctl enable --now wg-quick@warp 2>&1 | grep -v "Created symlink" || true
+    sleep 3
+    if ! wg show warp &>/dev/null; then
+        err "Интерфейс warp не поднялся (см. journalctl -u wg-quick@warp)"
+        pause; return
+    fi
+    ok "Интерфейс warp поднят"
+
+    # 6) microsocks мост
+    local warp_ip
+    warp_ip=$(ip -4 -o addr show warp 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+    cat > /etc/systemd/system/telemt-warp-socks.service << UNIT
+[Unit]
+Description=microsocks SOCKS5 bridge to WARP (for telemt upstream)
+After=network-online.target wg-quick@warp.service
+Wants=network-online.target
+Requires=wg-quick@warp.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/microsocks -i 127.0.0.1 -p 40000 -b ${warp_ip}
+Restart=on-failure
+RestartSec=5
+User=nobody
+Group=nogroup
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable --now telemt-warp-socks 2>&1 | grep -v "Created symlink" || true
+    sleep 2
+
+    if systemctl is-active --quiet telemt-warp-socks; then
+        ok "SOCKS5-мост запущен на 127.0.0.1:40000"
+    else
+        err "telemt-warp-socks не запустился"
+        pause; return
+    fi
+
+    # 7) Прицепить к telemt
     echo ""
     read -rp "  Прицепить WARP к telemt (добавить upstream в конфиги)? [Y/n]: " ans
     [[ ! "${ans,,}" =~ ^(n|no)$ ]] && warp_attach_silent
     pause
 }
 
-warp_connect() {
+warp_start() {
     draw_header
-    info "Подключение WARP..."
-    warp-cli --accept-tos mode proxy >/dev/null 2>&1
-    warp-cli --accept-tos connect >/dev/null 2>&1
-    sleep 4
-    local st; st=$(warp-cli --accept-tos status 2>/dev/null | grep -oE "Connected|Disconnected" | head -1)
-    if [[ "$st" == "Connected" ]]; then
-        ok "WARP подключён"
-    else
-        err "WARP не подключился: $st"
-    fi
+    info "Запуск WireGuard интерфейса warp..."
+    systemctl start wg-quick@warp 2>&1 || true
+    sleep 2
+    if wg show warp &>/dev/null; then ok "warp интерфейс активен"; else err "Не удалось запустить wg-quick@warp"; fi
+
+    info "Запуск SOCKS5-моста..."
+    systemctl start telemt-warp-socks 2>&1 || true
+    sleep 1
+    if systemctl is-active --quiet telemt-warp-socks; then ok "Мост активен"; else err "Не удалось запустить мост"; fi
     pause
 }
 
-warp_disconnect() {
+warp_stop() {
     draw_header
-    warn "WARP будет отключён. Если он прицеплен к telemt — telemt не сможет коннектиться к Telegram!"
+    warn "WARP будет остановлен. Если он прицеплен к telemt — инстансы не смогут коннектиться к Telegram!"
     read -rp "  Подтвердить? [y/N]: " ans
     [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
-    warp-cli --accept-tos disconnect >/dev/null 2>&1
-    ok "WARP отключён"
+    systemctl stop telemt-warp-socks 2>/dev/null
+    systemctl stop wg-quick@warp 2>/dev/null
+    ok "WARP остановлен"
     pause
 }
 
-# Внутренний хелпер — добавить upstream в конфиги без вопросов
+# Прицепить — без вопросов (используется в warp_install)
 warp_attach_silent() {
     local count=0
     for f in /etc/telemt/telemt*.toml; do
         [[ ! -f "$f" ]] && continue
         if grep -q "127.0.0.1:40000" "$f" 2>/dev/null; then
-            continue  # уже прицеплен
+            continue
         fi
-        # Удаляем все старые [[upstreams]] чтобы не дублировать
-        python3 - "$f" << 'PYEOF'
+        python3 - "$f" << 'PYEOF2'
 import sys, re
 path = sys.argv[1]
 content = open(path).read()
-# Удаляем все [[upstreams]] блоки (всё от [[upstreams]] до следующего [ или EOF)
 content = re.sub(r'\n*\[\[upstreams\]\][^\[]*', '\n', content, flags=re.DOTALL)
 content = re.sub(r'\n{3,}', '\n\n', content)
 if not content.endswith('\n'): content += '\n'
 content += '\n[[upstreams]]\ntype = "socks5"\naddress = "127.0.0.1:40000"\nweight = 1\nenabled = true\n'
 open(path, 'w').write(content)
-PYEOF
+PYEOF2
         count=$((count + 1))
     done
-    # Перезапускаем все инстансы
     local insts; read -ra insts <<< "$(active_instances)"
     for n in "${insts[@]}"; do
         systemctl restart "telemt${n}" 2>/dev/null
@@ -2146,7 +2228,7 @@ warp_attach() {
     draw_header
     echo -e "  ${BOLD}Прицепить WARP к telemt${RESET}\n"
     echo -e "  В конфиги всех инстансов будет добавлен ${BOLD}[[upstreams]]${RESET} → 127.0.0.1:40000"
-    echo -e "  ${DIM}После этого telemt пойдёт к Telegram DC через WARP-туннель.${RESET}"
+    echo -e "  ${DIM}telemt пойдёт к Telegram DC через WARP-туннель.${RESET}"
     echo ""
     read -rp "  Применить и перезапустить инстансы? [Y/n]: " ans
     [[ "${ans,,}" =~ ^(n|no)$ ]] && return
@@ -2169,7 +2251,7 @@ warp_detach() {
         if ! grep -q "127.0.0.1:40000" "$f" 2>/dev/null; then
             continue
         fi
-        python3 - "$f" << 'PYEOF'
+        python3 - "$f" << 'PYEOF3'
 import sys, re
 path = sys.argv[1]
 content = open(path).read()
@@ -2177,7 +2259,7 @@ content = re.sub(r'\n*\[\[upstreams\]\][^\[]*', '\n', content, flags=re.DOTALL)
 content = re.sub(r'\n{3,}', '\n\n', content)
 if not content.endswith('\n'): content += '\n'
 open(path, 'w').write(content)
-PYEOF
+PYEOF3
         count=$((count + 1))
     done
     local insts; read -ra insts <<< "$(active_instances)"
@@ -2191,11 +2273,9 @@ PYEOF
 warp_test() {
     draw_header
     echo -e "  ${BOLD}Тест: какой IP виден через WARP${RESET}\n"
-
     info "Прямое соединение (ваш IP):"
     local direct_ip; direct_ip=$(curl -s --max-time 10 https://api.ipify.org 2>/dev/null)
     echo -e "  ${BOLD}${direct_ip:-(не удалось)}${RESET}"
-
     echo ""
     info "Через WARP SOCKS5 (Cloudflare IP):"
     local warp_ip; warp_ip=$(curl -s --max-time 10 --socks5 127.0.0.1:40000 https://api.ipify.org 2>/dev/null)
@@ -2204,18 +2284,24 @@ warp_test() {
         if [[ "$direct_ip" != "$warp_ip" ]]; then
             ok "WARP работает: исходящий трафик идёт через Cloudflare"
         else
-            warn "Странно — оба IP одинаковые. Проверьте режим WARP"
+            warn "Оба IP одинаковые — WARP может не работать"
         fi
     else
-        err "Запрос через WARP не прошёл — проверьте подключение"
+        err "Запрос через WARP не прошёл"
     fi
+
+    # Cloudflare trace
+    echo ""
+    info "cdn-cgi/trace через WARP-интерфейс:"
+    curl -s --max-time 5 --interface warp https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+        | grep -E "warp=|ip=" | sed 's/^/  /'
     pause
 }
 
 warp_remove() {
     draw_header
     echo -e "  ${BOLD}${RED}Полное удаление WARP${RESET}\n"
-    warn "Будут удалены: пакет cloudflare-warp, репозиторий, ключи."
+    warn "Будут удалены: интерфейс warp, мост microsocks, конфиги wgcf, бинарник wgcf."
     warn "Также из конфигов telemt будут убраны upstream-секции."
     echo ""
     read -rp "  Подтвердить? [y/N]: " ans
@@ -2224,27 +2310,28 @@ warp_remove() {
     # 1. Отцепить от telemt
     for f in /etc/telemt/telemt*.toml; do
         [[ ! -f "$f" ]] && continue
-        python3 - "$f" << 'PYEOF'
+        python3 - "$f" << 'PYEOF4'
 import sys, re
 path = sys.argv[1]
 content = open(path).read()
 content = re.sub(r'\n*\[\[upstreams\]\][^\[]*', '\n', content, flags=re.DOTALL)
 content = re.sub(r'\n{3,}', '\n\n', content)
 open(path, 'w').write(content)
-PYEOF
+PYEOF4
     done
     ok "Upstream-секции удалены из конфигов"
 
-    # 2. Остановить WARP
-    warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
-    systemctl disable --now warp-svc 2>/dev/null || true
-    ok "warp-svc остановлен"
+    # 2. Остановить и удалить сервисы
+    systemctl disable --now telemt-warp-socks 2>/dev/null || true
+    systemctl disable --now wg-quick@warp 2>/dev/null || true
+    rm -f /etc/systemd/system/telemt-warp-socks.service
+    systemctl daemon-reload
+    ok "Сервисы остановлены"
 
-    # 3. Удалить пакет
-    apt-get purge -y cloudflare-warp 2>&1 | tail -2 || true
-    rm -f /etc/apt/sources.list.d/cloudflare-client.list
-    rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-    ok "Пакет удалён"
+    # 3. Удалить конфиги и бинарники
+    rm -f /etc/wireguard/warp.conf /etc/wireguard/wgcf-account.toml /etc/wireguard/wgcf-profile.conf
+    rm -f /usr/local/bin/wgcf
+    ok "Конфиги и wgcf удалены"
 
     # 4. Перезапустить telemt
     local insts; read -ra insts <<< "$(active_instances)"
@@ -2252,6 +2339,9 @@ PYEOF
         systemctl restart "telemt${n}" 2>/dev/null
     done
     ok "Инстансы telemt перезапущены"
+
+    info "Пакеты wireguard и microsocks остаются установлены (могут пригодиться)."
+    info "Если нужно удалить и их: apt-get purge -y wireguard microsocks"
     pause
 }
 
