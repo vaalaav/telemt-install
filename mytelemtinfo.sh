@@ -95,8 +95,15 @@ get_link() {
       || link=""
     [[ -z "$link" ]] && return
 
-    # Если в ссылке стоит 0.0.0.0 — заменяем на реальный IP
-    if [[ "$link" == *"server=0.0.0.0"* ]]; then
+    # Приоритет: сохранённый кастомный домен → реальный публичный IP
+    local custom_dom
+    custom_dom=$(get_custom_domain)
+    if [[ -n "$custom_dom" ]]; then
+        link="${link/server=0.0.0.0/server=${custom_dom}}"
+        # Также подменяем если там IP (из предыдущей установки)
+        [[ -z "$_PUBLIC_IP_CACHE" ]] && _PUBLIC_IP_CACHE=$(get_public_ip)
+        [[ -n "$_PUBLIC_IP_CACHE" ]] && link="${link/server=${_PUBLIC_IP_CACHE}/server=${custom_dom}}"
+    elif [[ "$link" == *"server=0.0.0.0"* ]]; then
         [[ -z "$_PUBLIC_IP_CACHE" ]] && _PUBLIC_IP_CACHE=$(get_public_ip)
         if [[ -n "$_PUBLIC_IP_CACHE" ]]; then
             link="${link/server=0.0.0.0/server=${_PUBLIC_IP_CACHE}}"
@@ -197,6 +204,49 @@ status_ufw() {
     fi
 }
 
+# ─── Свой домен ──────────────────────────────────────────────────────────────
+CUSTOM_DOMAIN_FILE="/etc/telemt/.custom_domain"
+
+get_custom_domain() {
+    [[ -f "$CUSTOM_DOMAIN_FILE" ]] && cat "$CUSTOM_DOMAIN_FILE" 2>/dev/null || echo ""
+}
+
+status_custom_domain() {
+    local d; d=$(get_custom_domain)
+    if [[ -n "$d" ]]; then
+        echo -e "${GREEN}${d}${RESET}"
+    else
+        echo -e "${DIM}не задан${RESET} (используется IP)"
+    fi
+}
+
+# ─── WARP ────────────────────────────────────────────────────────────────────
+status_warp() {
+    if ! command -v warp-cli &>/dev/null; then
+        echo -e "${DIM}не установлен${RESET}"
+        return
+    fi
+    local warp_status mode
+    warp_status=$(warp-cli --accept-tos status 2>/dev/null | grep -oE "Connected|Disconnected|Connecting" | head -1)
+    mode=$(warp-cli --accept-tos settings 2>/dev/null | grep -i "mode" | grep -oE "(warp|proxy|warp\+doh)" | head -1)
+
+    # Проверяем что upstream подключён в конфигах telemt
+    local has_upstream=false
+    for f in /etc/telemt/telemt*.toml; do
+        [[ -f "$f" ]] && grep -q "127.0.0.1:40000" "$f" 2>/dev/null && has_upstream=true && break
+    done
+
+    if [[ "$warp_status" == "Connected" && "$mode" == "proxy" && "$has_upstream" == true ]]; then
+        echo -e "${GREEN}активен${RESET}  (proxy mode, telemt → WARP)"
+    elif [[ "$warp_status" == "Connected" && "$mode" == "proxy" ]]; then
+        echo -e "${YELLOW}WARP работает, но не подключён к telemt${RESET}"
+    elif [[ "$warp_status" == "Connected" ]]; then
+        echo -e "${YELLOW}подключён в режиме ${mode}${RESET} (нужен proxy)"
+    else
+        echo -e "${DIM}установлен, но не подключён${RESET}"
+    fi
+}
+
 # ════════════════════════════════════════════════════════════════════════
 #  ГЛАВНОЕ МЕНЮ
 # ════════════════════════════════════════════════════════════════════════
@@ -211,6 +261,8 @@ main_menu() {
         echo -e "  nft SYN:   $(status_nft)"
         echo -e "  Таймауты:  $(status_timeouts)"
         echo -e "  UFW:       $(status_ufw)"
+        echo -e "  Свой домен: $(status_custom_domain)"
+        echo -e "  WARP:       $(status_warp)"
         echo ""
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
         echo -e "  ${BOLD}1.${RESET} Управление прокси"
@@ -218,6 +270,8 @@ main_menu() {
         echo -e "  ${BOLD}3.${RESET} nft SYN Limiter"
         echo -e "  ${BOLD}4.${RESET} Таймауты telemt"
         echo -e "  ${BOLD}5.${RESET} UFW / Rate-limit"
+        echo -e "  ${BOLD}6.${RESET} Свой домен в ссылках"
+        echo -e "  ${BOLD}7.${RESET} WARP upstream"
         echo -e "  ${BOLD}0.${RESET} Выход"
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
         echo ""
@@ -228,6 +282,8 @@ main_menu() {
             3) menu_nft ;;
             4) menu_timeouts ;;
             5) menu_ufw ;;
+            6) menu_custom_domain ;;
+            7) menu_warp ;;
             0|q) echo ""; exit 0 ;;
             *) warn "Неверный пункт" ; sleep 1 ;;
         esac
@@ -1757,6 +1813,445 @@ PYEOF
     ufw reload && ok "UFW перезагружен" || err "Ошибка"
     rm -f /etc/modules-load.d/xt_recent.conf
     ok "xt_recent убран из автозагрузки"
+    pause
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  6. СВОЙ ДОМЕН В ССЫЛКАХ
+# ════════════════════════════════════════════════════════════════════════
+menu_custom_domain() {
+    while true; do
+        draw_header
+        echo -e "  ${BOLD}Свой домен в ссылках для клиентов${RESET}\n"
+        local cur; cur=$(get_custom_domain)
+        if [[ -n "$cur" ]]; then
+            echo -e "  Текущий домен: ${BOLD}${GREEN}${cur}${RESET}"
+            # Проверяем DNS
+            local resolved server_ip
+            resolved=$(getent hosts "$cur" 2>/dev/null | awk '{print $1}' | head -1)
+            server_ip=$(get_public_ip)
+            if [[ -n "$resolved" && -n "$server_ip" ]]; then
+                if [[ "$resolved" == "$server_ip" ]]; then
+                    ok "DNS резолвится корректно: ${cur} → ${resolved} (IP сервера)"
+                else
+                    warn "DNS не совпадает: ${cur} → ${resolved}, IP сервера: ${server_ip}"
+                fi
+            fi
+        else
+            echo -e "  Текущий: ${DIM}не задан${RESET} — в ссылках используется реальный IP сервера"
+        fi
+        echo ""
+
+        # Превью одной ссылки
+        local insts; read -ra insts <<< "$(active_instances)"
+        if [[ ${#insts[@]} -gt 0 ]]; then
+            local first="${insts[0]}"
+            local link; link=$(get_link "${INSTANCE_APIS[$first]}")
+            if [[ -n "$link" ]]; then
+                echo -e "  ${DIM}Пример ссылки сейчас:${RESET}"
+                echo -e "  ${GREEN}${link}${RESET}"
+                echo ""
+            fi
+        fi
+
+        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+        echo -e "  ${BOLD}1.${RESET} Установить / изменить домен"
+        echo -e "  ${BOLD}2.${RESET} Проверить DNS"
+        echo -e "  ${BOLD}3.${RESET} ${YELLOW}Удалить домен${RESET} (вернуть IP в ссылках)"
+        echo -e "  ${BOLD}0.${RESET} ← Назад"
+        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+        echo ""
+        read -rp "  Выберите: " ch
+        case "$ch" in
+            1) custom_domain_set ;;
+            2) custom_domain_check ;;
+            3) custom_domain_remove ;;
+            0|b) return ;;
+            *) warn "Неверный пункт"; sleep 1 ;;
+        esac
+    done
+}
+
+custom_domain_set() {
+    draw_header
+    echo -e "  ${BOLD}Установка собственного домена${RESET}\n"
+    echo -e "  Этот домен будет использоваться в tg://proxy ссылках вместо IP."
+    echo -e "  ${DIM}Требование: A-запись домен → IP сервера должна быть настроена.${RESET}"
+    echo -e "  ${DIM}Telegram-клиент сам делает DNS-резолв при подключении.${RESET}"
+    echo ""
+
+    local server_ip; server_ip=$(get_public_ip)
+    [[ -n "$server_ip" ]] && info "IP вашего сервера: ${BOLD}${server_ip}${RESET}"
+    echo ""
+
+    local inp_dom
+    while true; do
+        read -rp "  Введите домен (или 'q' для отмены): " inp_dom
+        [[ "$inp_dom" == "q" || -z "$inp_dom" ]] && { info "Отменено"; pause; return; }
+        if [[ "$inp_dom" == *.* ]]; then
+            break
+        else
+            warn "Введите корректный домен (например proxy.example.com)"
+        fi
+    done
+
+    # DNS проверка
+    local resolved
+    resolved=$(getent hosts "$inp_dom" 2>/dev/null | awk '{print $1}' | head -1)
+    if [[ -n "$resolved" && -n "$server_ip" ]]; then
+        if [[ "$resolved" == "$server_ip" ]]; then
+            ok "DNS проверка пройдена: ${inp_dom} → ${resolved}"
+        else
+            warn "DNS не совпадает: ${inp_dom} → ${resolved}, IP сервера: ${server_ip}"
+            warn "Возможные причины: A-запись не настроена / TTL ещё держит старое / CDN перед сервером"
+            read -rp "  Сохранить домен несмотря на это? [y/N]: " ans
+            [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && { info "Отменено"; pause; return; }
+        fi
+    else
+        warn "Не удалось проверить DNS (нет соединения или DNS не настроен)"
+        read -rp "  Сохранить домен? [Y/n]: " ans
+        [[ "${ans,,}" =~ ^(n|no)$ ]] && { info "Отменено"; pause; return; }
+    fi
+
+    # Сохраняем
+    mkdir -p /etc/telemt
+    echo "$inp_dom" > "$CUSTOM_DOMAIN_FILE"
+    chmod 644 "$CUSTOM_DOMAIN_FILE"
+    ok "Сохранён домен: ${BOLD}${inp_dom}${RESET}"
+    info "Теперь в ссылках tg://proxy будет использоваться этот домен."
+    pause
+}
+
+custom_domain_check() {
+    draw_header
+    echo -e "  ${BOLD}Проверка DNS${RESET}\n"
+    local dom; dom=$(get_custom_domain)
+    if [[ -z "$dom" ]]; then
+        warn "Домен не задан"; pause; return
+    fi
+    info "Проверка резолва для ${BOLD}${dom}${RESET}..."
+
+    # Несколько проверок
+    echo ""
+    echo -e "  ${BOLD}1) Системный getent (использует /etc/resolv.conf):${RESET}"
+    local sys_ip; sys_ip=$(getent hosts "$dom" 2>/dev/null | awk '{print $1}' | head -1)
+    [[ -n "$sys_ip" ]] && echo "    → $sys_ip" || warn "    не резолвится"
+
+    if command -v dig &>/dev/null; then
+        echo ""
+        echo -e "  ${BOLD}2) Через публичный DNS Cloudflare (1.1.1.1):${RESET}"
+        local cf_ip; cf_ip=$(dig +short @1.1.1.1 "$dom" A 2>/dev/null | grep -E '^[0-9]+\.' | head -1)
+        [[ -n "$cf_ip" ]] && echo "    → $cf_ip" || warn "    не резолвится"
+
+        echo ""
+        echo -e "  ${BOLD}3) Через публичный DNS Google (8.8.8.8):${RESET}"
+        local g_ip; g_ip=$(dig +short @8.8.8.8 "$dom" A 2>/dev/null | grep -E '^[0-9]+\.' | head -1)
+        [[ -n "$g_ip" ]] && echo "    → $g_ip" || warn "    не резолвится"
+    fi
+
+    echo ""
+    local server_ip; server_ip=$(get_public_ip)
+    echo -e "  ${BOLD}IP сервера:${RESET} ${BOLD}${server_ip}${RESET}"
+
+    if [[ -n "$sys_ip" && "$sys_ip" == "$server_ip" ]]; then
+        echo ""
+        ok "Всё работает: домен правильно указывает на сервер"
+    fi
+    pause
+}
+
+custom_domain_remove() {
+    draw_header
+    echo -e "  ${BOLD}Удаление кастомного домена${RESET}\n"
+    local dom; dom=$(get_custom_domain)
+    if [[ -z "$dom" ]]; then
+        warn "Домен не задан — нечего удалять"; pause; return
+    fi
+    warn "Текущий домен: ${dom}"
+    warn "После удаления в ссылках будет реальный IP сервера"
+    echo ""
+    read -rp "  Подтвердить? [y/N]: " ans
+    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
+
+    rm -f "$CUSTOM_DOMAIN_FILE"
+    ok "Кастомный домен удалён"
+    pause
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  7. WARP UPSTREAM
+# ════════════════════════════════════════════════════════════════════════
+menu_warp() {
+    while true; do
+        draw_header
+        echo -e "  ${BOLD}Cloudflare WARP upstream${RESET}\n"
+        echo -e "  Статус: $(status_warp)"
+        echo ""
+
+        # Подробности
+        if command -v warp-cli &>/dev/null; then
+            echo -e "  ${DIM}warp-cli status:${RESET}"
+            warp-cli --accept-tos status 2>/dev/null | head -3 | sed 's/^/    /'
+            echo ""
+            echo -e "  ${DIM}Режим:${RESET} $(warp-cli --accept-tos settings 2>/dev/null | grep -i mode | head -1 | sed 's/^/    /')"
+            if ss -tlnp 2>/dev/null | grep -q ":40000"; then
+                echo -e "  ${DIM}SOCKS5:${RESET} ${GREEN}слушает 127.0.0.1:40000${RESET}"
+            else
+                echo -e "  ${DIM}SOCKS5:${RESET} ${RED}порт 40000 не слушается${RESET}"
+            fi
+        fi
+        echo ""
+
+        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+        if ! command -v warp-cli &>/dev/null; then
+            echo -e "  ${BOLD}1.${RESET} Установить и настроить WARP"
+        else
+            echo -e "  ${BOLD}1.${RESET} Подключить WARP (если выключен)"
+            echo -e "  ${BOLD}2.${RESET} Отключить WARP временно (без удаления)"
+            echo -e "  ${BOLD}3.${RESET} Прицепить WARP к telemt (добавить upstream в конфиги)"
+            echo -e "  ${BOLD}4.${RESET} ${YELLOW}Отцепить WARP от telemt${RESET} (telemt пойдёт напрямую)"
+            echo -e "  ${BOLD}5.${RESET} Тест: какой IP виден через WARP"
+            echo -e "  ${BOLD}6.${RESET} ${RED}Удалить WARP полностью${RESET}"
+        fi
+        echo -e "  ${BOLD}0.${RESET} ← Назад"
+        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+        echo ""
+        read -rp "  Выберите: " ch
+
+        if ! command -v warp-cli &>/dev/null; then
+            case "$ch" in
+                1) warp_install ;;
+                0|b) return ;;
+                *) warn "Неверный пункт"; sleep 1 ;;
+            esac
+        else
+            case "$ch" in
+                1) warp_connect ;;
+                2) warp_disconnect ;;
+                3) warp_attach ;;
+                4) warp_detach ;;
+                5) warp_test ;;
+                6) warp_remove ;;
+                0|b) return ;;
+                *) warn "Неверный пункт"; sleep 1 ;;
+            esac
+        fi
+    done
+}
+
+warp_install() {
+    draw_header
+    echo -e "  ${BOLD}Установка Cloudflare WARP${RESET}\n"
+    read -rp "  Установить cloudflare-warp + настроить proxy режим? [Y/n]: " ans
+    [[ "${ans,,}" =~ ^(n|no)$ ]] && return
+
+    info "Добавление официального репозитория..."
+    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+        | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg 2>/dev/null
+    local codename; codename=$(lsb_release -cs 2>/dev/null || echo "jammy")
+    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${codename} main" \
+        > /etc/apt/sources.list.d/cloudflare-client.list
+
+    info "Установка пакета cloudflare-warp..."
+    apt-get update -qq 2>&1 || warn "apt update вернул предупреждение"
+    if ! apt-get install -y cloudflare-warp 2>&1; then
+        err "Не удалось установить cloudflare-warp"
+        pause; return
+    fi
+    ok "cloudflare-warp установлен"
+
+    systemctl enable --now warp-svc 2>/dev/null
+    sleep 3
+
+    info "Регистрация..."
+    warp-cli --accept-tos registration new >/dev/null 2>&1 || true
+    sleep 2
+
+    info "Установка режима proxy..."
+    warp-cli --accept-tos mode proxy >/dev/null 2>&1
+
+    info "Подключение..."
+    warp-cli --accept-tos connect >/dev/null 2>&1
+    sleep 4
+
+    if ss -tlnp 2>/dev/null | grep -q ":40000"; then
+        ok "WARP установлен и слушает на 127.0.0.1:40000"
+    else
+        warn "Порт 40000 ещё не открыт, подождите минуту"
+    fi
+
+    # Спрашиваем сразу прицепить к telemt
+    echo ""
+    read -rp "  Прицепить WARP к telemt (добавить upstream в конфиги)? [Y/n]: " ans
+    [[ ! "${ans,,}" =~ ^(n|no)$ ]] && warp_attach_silent
+    pause
+}
+
+warp_connect() {
+    draw_header
+    info "Подключение WARP..."
+    warp-cli --accept-tos mode proxy >/dev/null 2>&1
+    warp-cli --accept-tos connect >/dev/null 2>&1
+    sleep 4
+    local st; st=$(warp-cli --accept-tos status 2>/dev/null | grep -oE "Connected|Disconnected" | head -1)
+    if [[ "$st" == "Connected" ]]; then
+        ok "WARP подключён"
+    else
+        err "WARP не подключился: $st"
+    fi
+    pause
+}
+
+warp_disconnect() {
+    draw_header
+    warn "WARP будет отключён. Если он прицеплен к telemt — telemt не сможет коннектиться к Telegram!"
+    read -rp "  Подтвердить? [y/N]: " ans
+    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
+    warp-cli --accept-tos disconnect >/dev/null 2>&1
+    ok "WARP отключён"
+    pause
+}
+
+# Внутренний хелпер — добавить upstream в конфиги без вопросов
+warp_attach_silent() {
+    local count=0
+    for f in /etc/telemt/telemt*.toml; do
+        [[ ! -f "$f" ]] && continue
+        if grep -q "127.0.0.1:40000" "$f" 2>/dev/null; then
+            continue  # уже прицеплен
+        fi
+        # Удаляем все старые [[upstreams]] чтобы не дублировать
+        python3 - "$f" << 'PYEOF'
+import sys, re
+path = sys.argv[1]
+content = open(path).read()
+# Удаляем все [[upstreams]] блоки (всё от [[upstreams]] до следующего [ или EOF)
+content = re.sub(r'\n*\[\[upstreams\]\][^\[]*', '\n', content, flags=re.DOTALL)
+content = re.sub(r'\n{3,}', '\n\n', content)
+if not content.endswith('\n'): content += '\n'
+content += '\n[[upstreams]]\ntype = "socks5"\naddress = "127.0.0.1:40000"\nweight = 1\nenabled = true\n'
+open(path, 'w').write(content)
+PYEOF
+        count=$((count + 1))
+    done
+    # Перезапускаем все инстансы
+    local insts; read -ra insts <<< "$(active_instances)"
+    for n in "${insts[@]}"; do
+        systemctl restart "telemt${n}" 2>/dev/null
+    done
+    ok "Прицеплено к ${count} конфигам, инстансы перезапущены"
+}
+
+warp_attach() {
+    draw_header
+    echo -e "  ${BOLD}Прицепить WARP к telemt${RESET}\n"
+    echo -e "  В конфиги всех инстансов будет добавлен ${BOLD}[[upstreams]]${RESET} → 127.0.0.1:40000"
+    echo -e "  ${DIM}После этого telemt пойдёт к Telegram DC через WARP-туннель.${RESET}"
+    echo ""
+    read -rp "  Применить и перезапустить инстансы? [Y/n]: " ans
+    [[ "${ans,,}" =~ ^(n|no)$ ]] && return
+    warp_attach_silent
+    pause
+}
+
+warp_detach() {
+    draw_header
+    echo -e "  ${BOLD}Отцепить WARP от telemt${RESET}\n"
+    warn "Из конфигов будут удалены секции [[upstreams]]"
+    warn "telemt пойдёт к Telegram DC напрямую"
+    echo ""
+    read -rp "  Применить? [y/N]: " ans
+    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
+
+    local count=0
+    for f in /etc/telemt/telemt*.toml; do
+        [[ ! -f "$f" ]] && continue
+        if ! grep -q "127.0.0.1:40000" "$f" 2>/dev/null; then
+            continue
+        fi
+        python3 - "$f" << 'PYEOF'
+import sys, re
+path = sys.argv[1]
+content = open(path).read()
+content = re.sub(r'\n*\[\[upstreams\]\][^\[]*', '\n', content, flags=re.DOTALL)
+content = re.sub(r'\n{3,}', '\n\n', content)
+if not content.endswith('\n'): content += '\n'
+open(path, 'w').write(content)
+PYEOF
+        count=$((count + 1))
+    done
+    local insts; read -ra insts <<< "$(active_instances)"
+    for n in "${insts[@]}"; do
+        systemctl restart "telemt${n}" 2>/dev/null
+    done
+    ok "Отцеплено от ${count} конфигов, инстансы перезапущены"
+    pause
+}
+
+warp_test() {
+    draw_header
+    echo -e "  ${BOLD}Тест: какой IP виден через WARP${RESET}\n"
+
+    info "Прямое соединение (ваш IP):"
+    local direct_ip; direct_ip=$(curl -s --max-time 10 https://api.ipify.org 2>/dev/null)
+    echo -e "  ${BOLD}${direct_ip:-(не удалось)}${RESET}"
+
+    echo ""
+    info "Через WARP SOCKS5 (Cloudflare IP):"
+    local warp_ip; warp_ip=$(curl -s --max-time 10 --socks5 127.0.0.1:40000 https://api.ipify.org 2>/dev/null)
+    if [[ -n "$warp_ip" ]]; then
+        echo -e "  ${BOLD}${warp_ip}${RESET}"
+        if [[ "$direct_ip" != "$warp_ip" ]]; then
+            ok "WARP работает: исходящий трафик идёт через Cloudflare"
+        else
+            warn "Странно — оба IP одинаковые. Проверьте режим WARP"
+        fi
+    else
+        err "Запрос через WARP не прошёл — проверьте подключение"
+    fi
+    pause
+}
+
+warp_remove() {
+    draw_header
+    echo -e "  ${BOLD}${RED}Полное удаление WARP${RESET}\n"
+    warn "Будут удалены: пакет cloudflare-warp, репозиторий, ключи."
+    warn "Также из конфигов telemt будут убраны upstream-секции."
+    echo ""
+    read -rp "  Подтвердить? [y/N]: " ans
+    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
+
+    # 1. Отцепить от telemt
+    for f in /etc/telemt/telemt*.toml; do
+        [[ ! -f "$f" ]] && continue
+        python3 - "$f" << 'PYEOF'
+import sys, re
+path = sys.argv[1]
+content = open(path).read()
+content = re.sub(r'\n*\[\[upstreams\]\][^\[]*', '\n', content, flags=re.DOTALL)
+content = re.sub(r'\n{3,}', '\n\n', content)
+open(path, 'w').write(content)
+PYEOF
+    done
+    ok "Upstream-секции удалены из конфигов"
+
+    # 2. Остановить WARP
+    warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+    systemctl disable --now warp-svc 2>/dev/null || true
+    ok "warp-svc остановлен"
+
+    # 3. Удалить пакет
+    apt-get purge -y cloudflare-warp 2>&1 | tail -2 || true
+    rm -f /etc/apt/sources.list.d/cloudflare-client.list
+    rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+    ok "Пакет удалён"
+
+    # 4. Перезапустить telemt
+    local insts; read -ra insts <<< "$(active_instances)"
+    for n in "${insts[@]}"; do
+        systemctl restart "telemt${n}" 2>/dev/null
+    done
+    ok "Инстансы telemt перезапущены"
     pause
 }
 
