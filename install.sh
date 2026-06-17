@@ -298,11 +298,13 @@ select_components() {
 
     # --- WARP для трафика к Telegram DC ---
     echo ""
-    echo -e "  ${BOLD}Cloudflare WARP для трафика к Telegram DC${RESET}"
-    echo -e "  Заворачивает трафик ${BOLD}telemt → Telegram DC${RESET} через Cloudflare WARP (SOCKS5)."
-    echo -e "  Клиенты подключаются к twoiy серверу ${BOLD}напрямую${RESET}, дальше идёт через WARP."
+    echo -e "  ${BOLD}WARP для трафика к Telegram DC${RESET} ${DIM}(native WireGuard + SOCKS5 bridge)${RESET}"
+    echo -e "  Заворачивает трафик ${BOLD}telemt → Telegram DC${RESET} через Cloudflare WARP."
+    echo -e "  Клиенты подключаются к серверу ${BOLD}напрямую${RESET}, дальше идёт через WARP."
     echo -e "  ${DIM}Помогает если Telegram DC блокируется на исходящем (например с некоторых хостеров).${RESET}"
-    echo -e "  ${DIM}WARP ставится в режиме \"proxy\" (SOCKS5 на 127.0.0.1:40000).${RESET}"
+    echo -e "  ${DIM}Реализация: wgcf создаёт WireGuard-интерфейс 'warp' (Table=off),${RESET}"
+    echo -e "  ${DIM}microsocks поднимает SOCKS5 на 127.0.0.1:40000 через этот интерфейс.${RESET}"
+    echo -e "  ${DIM}НЕ использует громоздкий cloudflare-warp пакет (77 MB).${RESET}"
     DO_WARP=false
     read -rp "$(echo -e "${YELLOW}?${RESET} Завернуть Telegram-трафик в WARP? [y/N]: ")" ans
     [[ "${ans,,}" =~ ^(y|yes|д|да)$ ]] && DO_WARP=true
@@ -801,99 +803,225 @@ SERVICE
 # ─── ШАГ: Установка Cloudflare WARP ──────────────────────────────────────────
 step_warp() {
     [[ "${DO_WARP:-false}" != true ]] && return 0
-    hdr "Установка Cloudflare WARP (SOCKS5 upstream)"
+    hdr "Установка WARP (native WireGuard + SOCKS5-мост)"
 
-    info "Будет установлен cloudflare-warp в режиме proxy (SOCKS5 на 127.0.0.1:40000)"
+    echo ""
+    info "Архитектура: wgcf создаёт WireGuard-интерфейс 'warp' (Table=off — не перехватывает весь трафик)."
+    info "microsocks поднимает SOCKS5 на 127.0.0.1:40000 с привязкой к интерфейсу warp."
+    info "telemt идёт в SOCKS5 → microsocks → WARP-туннель → Telegram DC."
+    echo ""
     confirm "Установить?" skip || return 0
 
-    # Установка cloudflare-warp из официального репозитория
-    if ! command -v warp-cli &>/dev/null; then
-        info "Добавление официального репозитория Cloudflare..."
-
-        # GPG ключ
-        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
-            | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg 2>/dev/null
-
-        # APT источник для текущей версии Ubuntu
-        local codename
-        codename=$(lsb_release -cs 2>/dev/null || echo "jammy")
-        echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${codename} main" \
-            > /etc/apt/sources.list.d/cloudflare-client.list
-
-        wait_apt
-        info "Установка cloudflare-warp..."
-        if ! apt-get update -qq 2>&1; then
-            warn "apt update вернул предупреждение, продолжаем..."
-        fi
-        if ! apt-get install -y cloudflare-warp 2>&1; then
-            err "Не удалось установить cloudflare-warp"
-            err "WARP пропущен. После установки можно настроить вручную:"
-            err "  https://pkg.cloudflareclient.com/"
-            DO_WARP=false
-            return 0
-        fi
-        ok "cloudflare-warp установлен: $(warp-cli --version 2>&1 | head -1)"
-    else
-        ok "cloudflare-warp уже установлен: $(warp-cli --version 2>&1 | head -1)"
-    fi
-
-    # Проверяем что демон запущен
-    if ! systemctl is-active --quiet warp-svc 2>/dev/null; then
-        info "Запуск warp-svc..."
-        systemctl enable --now warp-svc 2>/dev/null || true
-        sleep 3
-    fi
-    if ! systemctl is-active --quiet warp-svc 2>/dev/null; then
-        err "warp-svc не запустился — пропуск WARP"
+    # ── 1) WireGuard + зависимости ────────────────────────────────────────────
+    info "Установка WireGuard и microsocks..."
+    wait_apt
+    if ! apt-get install -y wireguard microsocks curl 2>&1; then
+        err "Не удалось установить wireguard/microsocks — пропуск WARP"
         DO_WARP=false
         return 0
     fi
-    ok "warp-svc активен"
+    ok "wireguard + microsocks установлены"
 
-    # Регистрация (если ещё не зарегистрирован)
-    info "Регистрация клиента..."
-    if ! warp-cli --accept-tos registration show &>/dev/null; then
-        warp-cli --accept-tos registration new >/dev/null 2>&1 || true
+    # ── 2) wgcf — Go-бинарник, регистрация free WARP аккаунта ─────────────────
+    if ! command -v wgcf &>/dev/null; then
+        info "Скачивание wgcf..."
+        local arch wgcf_arch wgcf_version wgcf_url
+
+        arch=$(uname -m)
+        case "$arch" in
+            x86_64) wgcf_arch="amd64" ;;
+            aarch64|arm64) wgcf_arch="arm64" ;;
+            armv7l) wgcf_arch="armv7" ;;
+            *) wgcf_arch="amd64" ;;
+        esac
+
+        wgcf_version=$(curl -s --max-time 10 "https://api.github.com/repos/ViRb3/wgcf/releases/latest" \
+                       | grep tag_name | cut -d '"' -f 4)
+        if [[ -z "$wgcf_version" ]]; then
+            err "Не удалось определить последнюю версию wgcf — пропуск WARP"
+            DO_WARP=false
+            return 0
+        fi
+
+        wgcf_url="https://github.com/ViRb3/wgcf/releases/download/${wgcf_version}/wgcf_${wgcf_version#v}_linux_${wgcf_arch}"
+        info "Версия wgcf: ${BOLD}${wgcf_version}${RESET} (${wgcf_arch})"
+
+        if ! curl -fsSL --max-time 60 -o /usr/local/bin/wgcf "$wgcf_url"; then
+            err "Не удалось скачать wgcf — пропуск WARP"
+            DO_WARP=false
+            return 0
+        fi
+        chmod +x /usr/local/bin/wgcf
+        ok "wgcf установлен"
+    else
+        ok "wgcf уже установлен"
+    fi
+
+    # ── 3) Регистрация WARP-аккаунта ─────────────────────────────────────────
+    info "Регистрация free WARP-аккаунта..."
+    mkdir -p /etc/wireguard
+    cd /etc/wireguard
+
+    if [[ ! -f /etc/wireguard/wgcf-account.toml ]]; then
+        # Бэкап DNS на время регистрации (если /etc/resolv.conf битый)
+        local restore_dns=false
+        if ! getent hosts api.cloudflareclient.com &>/dev/null; then
+            cp /etc/resolv.conf /etc/resolv.conf.warp-backup 2>/dev/null || true
+            printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf
+            restore_dns=true
+        fi
+
+        # yes для авто-подтверждения TOS
+        if ! timeout 60 bash -c 'yes | wgcf register' >/dev/null 2>&1; then
+            # Иногда первый раз падает на 500 от Cloudflare — пробуем ещё раз
+            sleep 3
+            yes | wgcf register >/dev/null 2>&1 || true
+        fi
+
+        # Восстановить DNS
+        if [[ "$restore_dns" == true && -f /etc/resolv.conf.warp-backup ]]; then
+            cp /etc/resolv.conf.warp-backup /etc/resolv.conf
+            rm -f /etc/resolv.conf.warp-backup
+        fi
+
+        if [[ ! -f /etc/wireguard/wgcf-account.toml ]]; then
+            err "Регистрация wgcf не удалась — пропуск WARP"
+            err "Можно попробовать позже через mytelemtinfo → 7"
+            DO_WARP=false
+            cd - >/dev/null 2>&1 || true
+            return 0
+        fi
+        ok "WARP-аккаунт зарегистрирован"
+    else
+        ok "WARP-аккаунт уже зарегистрирован"
+    fi
+
+    # ── 4) Генерация конфига WireGuard ───────────────────────────────────────
+    info "Генерация WireGuard-профиля..."
+    if ! wgcf generate >/dev/null 2>&1; then
+        err "Не удалось сгенерировать wgcf-profile.conf"
+        DO_WARP=false
+        cd - >/dev/null 2>&1 || true
+        return 0
+    fi
+
+    # ── 5) Правка конфига: критично! ─────────────────────────────────────────
+    # - Убираем DNS (мы не хотим чтобы WARP-интерфейс заменял системный DNS)
+    # - Table = off — НЕ создаём маршрутов автоматически (не перехватываем весь трафик)
+    # - PersistentKeepalive для держания соединения
+    # - Убираем IPv6 если он отключён
+    local conf=/etc/wireguard/wgcf-profile.conf
+    sed -i '/^DNS =/d' "$conf"
+    grep -q "Table = off" "$conf" || sed -i '/^MTU =/a Table = off' "$conf"
+    grep -q "PersistentKeepalive" "$conf" || sed -i '/^Endpoint =/a PersistentKeepalive = 25' "$conf"
+
+    # IPv6 — если на сервере выключен, убираем из конфига чтобы не было ошибки
+    if ! sysctl net.ipv6.conf.all.disable_ipv6 2>/dev/null | grep -q ' = 0'; then
+        sed -i 's/,\s*[0-9a-fA-F:]\+\/128//' "$conf"
+        sed -i '/Address = [0-9a-fA-F:]\+\/128/d' "$conf"
+        info "IPv6 отключён в системе — убран из WARP-конфига"
+    fi
+
+    # Перемещаем в стандартное место для wg-quick
+    mv "$conf" /etc/wireguard/warp.conf
+    chmod 600 /etc/wireguard/warp.conf
+    ok "Конфиг сохранён: /etc/wireguard/warp.conf"
+
+    # ── 6) Запуск интерфейса warp ────────────────────────────────────────────
+    info "Поднятие интерфейса warp..."
+    if ! systemctl enable --now wg-quick@warp 2>&1 | grep -v "Created symlink"; then
+        # Иногда нужна вторая попытка
         sleep 2
+        systemctl start wg-quick@warp 2>/dev/null || true
+    fi
+    sleep 3
+
+    if ! wg show warp &>/dev/null; then
+        err "Интерфейс warp не поднялся"
+        warn "Логи: journalctl -u wg-quick@warp -n 30"
+        DO_WARP=false
+        cd - >/dev/null 2>&1 || true
+        return 0
     fi
 
-    # Переключение в режим proxy (SOCKS5 на 127.0.0.1:40000)
-    info "Переключение в режим proxy (SOCKS5)..."
-    warp-cli --accept-tos mode proxy >/dev/null 2>&1 || true
-    sleep 1
-
-    # Подключение
-    info "Подключение к WARP..."
-    warp-cli --accept-tos connect >/dev/null 2>&1 || true
-    sleep 4
-
-    # Проверка статуса
-    local warp_status
-    warp_status=$(warp-cli --accept-tos status 2>&1 | grep -oE "Connected|Disconnected|Connecting" | head -1)
-    if [[ "$warp_status" == "Connected" ]]; then
-        ok "WARP подключён в режиме proxy"
+    # Проверка handshake (до 10 секунд)
+    local handshake=""
+    for i in {1..10}; do
+        handshake=$(wg show warp | grep "latest handshake" | awk -F': ' '{print $2}')
+        [[ "$handshake" == *"second"* || "$handshake" == *"minute"* ]] && break
+        sleep 1
+    done
+    if [[ -n "$handshake" && "$handshake" != "0 seconds ago" ]]; then
+        ok "WARP handshake: ${handshake}"
     else
-        warn "Статус WARP: $warp_status"
-        warn "Возможно, нужно подождать и проверить позже: warp-cli status"
+        warn "Handshake не получен за 10с (но интерфейс может ожить позже)"
     fi
 
-    # Проверка SOCKS5 порта
-    info "Проверка SOCKS5 порта 40000..."
-    if ss -tlnp 2>/dev/null | grep -q ":40000"; then
-        ok "SOCKS5 слушает на 127.0.0.1:40000"
-    else
-        warn "Порт 40000 ещё не слушается. Подождите минуту и проверьте: ss -tlnp | grep 40000"
-    fi
+    # ── 7) microsocks bridge: SOCKS5 на 127.0.0.1:40000 через warp ───────────
+    info "Запуск SOCKS5-моста (microsocks через warp интерфейс)..."
 
-    # Контрольный тест через curl (опционально)
-    info "Тест через SOCKS5: проверка какой IP видит интернет..."
+    # Получаем IP интерфейса warp (что-то типа 172.16.0.2)
     local warp_ip
-    warp_ip=$(curl -s --max-time 10 --socks5 127.0.0.1:40000 https://api.ipify.org 2>/dev/null)
-    if [[ -n "$warp_ip" ]]; then
-        ok "Через WARP виден IP: ${BOLD}${warp_ip}${RESET} (Cloudflare)"
-    else
-        warn "Тестовый запрос через WARP не прошёл — проверьте позже"
+    warp_ip=$(ip -4 -o addr show warp 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+    if [[ -z "$warp_ip" ]]; then
+        err "Не удалось определить IP интерфейса warp"
+        DO_WARP=false
+        cd - >/dev/null 2>&1 || true
+        return 0
     fi
+    info "IP интерфейса warp: ${BOLD}${warp_ip}${RESET}"
+
+    # Создаём systemd-сервис для microsocks
+    # Используем -b 127.0.0.1 (listen) + -i $warp_ip (outbound через warp)
+    cat > /etc/systemd/system/telemt-warp-socks.service << UNIT
+[Unit]
+Description=microsocks SOCKS5 bridge to WARP (for telemt upstream)
+After=network-online.target wg-quick@warp.service
+Wants=network-online.target
+Requires=wg-quick@warp.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/microsocks -i 127.0.0.1 -p 40000 -b ${warp_ip}
+Restart=on-failure
+RestartSec=5
+User=nobody
+Group=nogroup
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+    systemctl daemon-reload
+    systemctl enable --now telemt-warp-socks.service 2>&1 | grep -v "Created symlink" || true
+    sleep 2
+
+    if systemctl is-active --quiet telemt-warp-socks; then
+        ok "SOCKS5-мост запущен (127.0.0.1:40000 → warp → Telegram)"
+    else
+        warn "telemt-warp-socks не запустился"
+        warn "Логи: journalctl -u telemt-warp-socks -n 20"
+    fi
+
+    # ── 8) Проверка ──────────────────────────────────────────────────────────
+    info "Тест: какой IP виден через WARP-мост?"
+    local direct_ip warp_visible_ip
+    direct_ip=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null)
+    warp_visible_ip=$(curl -s --max-time 10 --socks5 127.0.0.1:40000 https://api.ipify.org 2>/dev/null)
+    if [[ -n "$direct_ip" ]]; then
+        info "Прямой IP сервера: ${BOLD}${direct_ip}${RESET}"
+    fi
+    if [[ -n "$warp_visible_ip" ]]; then
+        ok "Через WARP виден IP: ${BOLD}${warp_visible_ip}${RESET} (Cloudflare)"
+        if [[ "$direct_ip" == "$warp_visible_ip" ]]; then
+            warn "Странно — оба IP одинаковые. Возможно WARP не работает"
+        fi
+    else
+        warn "Тест через SOCKS5 не прошёл — проверьте позже:"
+        warn "  curl --socks5 127.0.0.1:40000 https://api.ipify.org"
+    fi
+
+    cd - >/dev/null 2>&1 || true
 }
 
 
