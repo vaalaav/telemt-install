@@ -1191,14 +1191,211 @@ do_update() {
     exit 0
 }
 
+# ─── Полная очистка системы от всех компонентов установщика ─────────────────
+# Используется в режиме --purge (только очистка) и в режиме --clean (очистка + установка)
+do_purge_all() {
+    hdr "Полная очистка системы от компонентов telemt-install"
+
+    echo ""
+    echo -e "  ${YELLOW}Будут удалены:${RESET}"
+    echo -e "  • Все инстансы telemt (сервисы, конфиги, бинарник, пользователь)"
+    echo -e "  • mytelemtinfo команда"
+    echo -e "  • WARP компоненты: интерфейс wg-quick@warp, microsocks-мост, wgcf"
+    echo -e "  • nft SYN limiter (сервис и правила)"
+    echo -e "  • TCP keepalive + BBR sysctl (откат к дефолтам ядра)"
+    echo -e "  • UFW правила портов и rate-limit (xt_recent)"
+    echo -e "  • Сохранённый кастомный домен"
+    echo ""
+    echo -e "  ${DIM}НЕ удаляются: системные пакеты (wireguard, microsocks, jq, ufw)${RESET}"
+    echo -e "  ${DIM}Это сохраняет их для других сервисов которые могут их использовать.${RESET}"
+    echo ""
+    confirm "Подтвердить полную очистку?" exit || return 1
+
+    # ── 1) Останавливаем все инстансы telemt ──
+    info "Остановка инстансов telemt..."
+    for n in 1 2 3 4 5 6 7 8 9 10; do
+        if [[ -f "/etc/systemd/system/telemt${n}.service" ]]; then
+            systemctl stop    "telemt${n}" 2>/dev/null || true
+            systemctl disable "telemt${n}" 2>/dev/null || true
+            rm -f "/etc/systemd/system/telemt${n}.service"
+        fi
+    done
+    ok "telemt-инстансы остановлены"
+
+    # ── 2) Удаляем конфиги и бинарник telemt ──
+    info "Удаление файлов telemt..."
+    rm -rf /etc/telemt /opt/telemt
+    rm -f  /bin/telemt
+    userdel telemt 2>/dev/null || true
+    ok "Файлы telemt удалены"
+
+    # ── 3) Удаляем mytelemtinfo ──
+    if [[ -f /usr/local/bin/mytelemtinfo ]]; then
+        rm -f /usr/local/bin/mytelemtinfo
+        ok "mytelemtinfo удалён"
+    fi
+
+    # ── 4) Удаляем WARP (native WireGuard + microsocks) ──
+    if [[ -f /etc/wireguard/warp.conf ]] || systemctl list-unit-files 2>/dev/null | grep -q "wg-quick@warp\|telemt-warp-socks"; then
+        info "Удаление WARP..."
+        systemctl stop telemt-warp-socks 2>/dev/null || true
+        systemctl disable telemt-warp-socks 2>/dev/null || true
+        rm -f /etc/systemd/system/telemt-warp-socks.service
+
+        systemctl stop wg-quick@warp 2>/dev/null || true
+        systemctl disable wg-quick@warp 2>/dev/null || true
+        rm -f /etc/wireguard/warp.conf /etc/wireguard/wgcf-account.toml /etc/wireguard/wgcf-profile.conf
+        rm -f /usr/local/bin/wgcf
+
+        # Старый cloudflare-warp если был
+        if command -v warp-cli &>/dev/null; then
+            warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+            systemctl disable --now warp-svc 2>/dev/null || true
+            apt-get purge -y cloudflare-warp 2>&1 | tail -2 || true
+            rm -f /etc/apt/sources.list.d/cloudflare-client.list
+            rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+        fi
+        ok "WARP компоненты удалены"
+    fi
+
+    # ── 5) nft SYN limiter ──
+    if [[ -f /etc/systemd/system/telemt-nft-limit.service ]] || nft list table inet telemt_limit &>/dev/null; then
+        info "Удаление nft SYN limiter..."
+        systemctl stop    telemt-nft-limit.service 2>/dev/null || true
+        systemctl disable telemt-nft-limit.service 2>/dev/null || true
+        rm -f /etc/systemd/system/telemt-nft-limit.service
+        rm -f /usr/local/sbin/telemt-nft-limit.sh
+        nft delete table inet telemt_limit 2>/dev/null || true
+        ok "nft limiter удалён"
+    fi
+
+    # ── 6) TCP keepalive + BBR sysctl ──
+    if [[ -f /etc/sysctl.d/99-telemt-net.conf || -f /etc/sysctl.d/99-tg-keepalive.conf ]]; then
+        info "Откат TCP keepalive и BBR..."
+        rm -f /etc/sysctl.d/99-telemt-net.conf /etc/sysctl.d/99-tg-keepalive.conf
+        sysctl -w net.ipv4.tcp_keepalive_time=7200  >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.tcp_keepalive_intvl=75   >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.tcp_keepalive_probes=9   >/dev/null 2>&1 || true
+        sysctl -w net.core.default_qdisc=fq_codel   >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
+        sysctl --system >/dev/null 2>&1 || true
+        ok "Keepalive + BBR откачены к дефолтам"
+    fi
+
+    # ── 7) UFW: rate-limit и порты ──
+    if grep -q "MTProto rate-limit" /etc/ufw/before.rules 2>/dev/null; then
+        info "Удаление UFW rate-limit правил..."
+        python3 << 'PYEOF'
+path = "/etc/ufw/before.rules"
+lines = open(path).readlines()
+out, skip = [], False
+for l in lines:
+    if "MTProto rate-limit" in l and "конец" not in l: skip = True
+    if not skip: out.append(l)
+    if "конец MTProto rate-limit" in l: skip = False
+open(path,"w").writelines(out)
+PYEOF
+        rm -f /etc/modules-load.d/xt_recent.conf
+        ufw reload >/dev/null 2>&1 || true
+        ok "UFW rate-limit убран"
+    fi
+
+    # Порты telemt (стандартные + кастомные из конфигов если бы они ещё были)
+    if ufw status 2>/dev/null | grep -q "Status: active"; then
+        info "Закрытие UFW портов telemt..."
+        for port in 443 5223 8530; do
+            ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
+        done
+        ok "UFW порты закрыты"
+    fi
+
+    # ── 8) Бэкапы и временные файлы ──
+    rm -f /etc/ufw/before.rules.bak.* 2>/dev/null || true
+    rm -f /etc/telemt/.custom_domain 2>/dev/null || true
+
+    echo ""
+    ok "${BOLD}Очистка завершена.${RESET}"
+    echo ""
+    info "Состояние системы после очистки:"
+    echo -e "  ${DIM}• telemt: $(command -v /bin/telemt &>/dev/null && echo 'ещё есть' || echo 'удалён')${RESET}"
+    echo -e "  ${DIM}• mytelemtinfo: $(command -v mytelemtinfo &>/dev/null && echo 'ещё есть' || echo 'удалён')${RESET}"
+    echo -e "  ${DIM}• warp интерфейс: $(wg show warp &>/dev/null && echo 'активен' || echo 'нет')${RESET}"
+    echo -e "  ${DIM}• nft telemt_limit: $(nft list table inet telemt_limit &>/dev/null && echo 'активна' || echo 'нет')${RESET}"
+    echo ""
+    return 0
+}
+
+# ─── Режим --purge (только очистка, без установки) ──────────────────────────
+do_purge_only() {
+    check_root
+    print_banner
+    echo -e "  ${BOLD}${RED}РЕЖИМ ПОЛНОЙ ОЧИСТКИ${RESET}"
+    echo -e "  ${DIM}Будут удалены все компоненты telemt-install без последующей установки.${RESET}"
+    echo ""
+    if do_purge_all; then
+        echo -e "  Чтобы установить заново позже:"
+        echo -e "  ${CYAN}sudo bash <(curl -fsSL https://raw.githubusercontent.com/vaalaav/telemt-install/main/install.sh)${RESET}"
+        echo ""
+    fi
+    exit 0
+}
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 main() {
     check_root
     print_banner
 
+    # Флаги командной строки
     [[ "${1:-}" == "--update" ]] && do_update
+    [[ "${1:-}" == "--purge"  ]] && do_purge_only
 
     echo -e "  Установка ${BOLD}telemt${RESET} — Telegram MTProxy на Rust."
+    echo ""
+
+    # Определяем что уже установлено
+    local existing_install=false
+    if [[ -f /bin/telemt ]] || [[ -d /etc/telemt ]] || [[ -f /usr/local/bin/mytelemtinfo ]]; then
+        existing_install=true
+    fi
+
+    # Если что-то уже установлено или передан флаг --clean — предлагаем меню режимов
+    if [[ "$existing_install" == true || "${1:-}" == "--clean" ]]; then
+        if [[ "$existing_install" == true ]]; then
+            warn "Обнаружена существующая установка telemt-install."
+            echo ""
+        fi
+        echo -e "  ${BOLD}Выберите режим:${RESET}"
+        echo -e "  ${BOLD}1.${RESET} Установка поверх ${DIM}(обычная, существующие конфиги сохраняются)${RESET}"
+        echo -e "  ${BOLD}2.${RESET} ${YELLOW}Чистая установка${RESET} ${DIM}(полная очистка + новая установка)${RESET}"
+        echo -e "  ${BOLD}3.${RESET} ${RED}Только очистка${RESET} ${DIM}(удалить всё без новой установки)${RESET}"
+        echo -e "  ${BOLD}0.${RESET} Отмена"
+        echo ""
+        local mode
+        # Если передан --clean — сразу режим 2
+        if [[ "${1:-}" == "--clean" ]]; then
+            mode=2
+            info "Режим --clean: чистая установка"
+        else
+            read -rp "  Режим [1/2/3/0]: " mode
+        fi
+        case "$mode" in
+            1) info "Режим: установка поверх существующей" ;;
+            2)
+                info "Режим: чистая установка (сначала очистка)"
+                if ! do_purge_all; then
+                    echo -e "${RED}Очистка отменена.${RESET}"
+                    exit 1
+                fi
+                echo ""
+                info "Очистка завершена. Переходим к установке..."
+                sleep 2
+                ;;
+            3) do_purge_only ;;
+            0|q|"") echo -e "${YELLOW}Отменено.${RESET}"; exit 0 ;;
+            *) err "Неверный пункт"; exit 1 ;;
+        esac
+    fi
+
     echo -e "  На каждом шаге: ${GREEN}y${RESET} (выполнить), Enter/n (пропустить), ${RED}q${RESET} (выход)."
     echo ""
     confirm "Начать установку?" exit
