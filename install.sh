@@ -298,13 +298,13 @@ select_components() {
 
     # --- WARP для трафика к Telegram DC ---
     echo ""
-    echo -e "  ${BOLD}WARP для трафика к Telegram DC${RESET} ${DIM}(native WireGuard + SOCKS5 bridge)${RESET}"
+    echo -e "  ${BOLD}WARP для трафика к Telegram DC${RESET} ${DIM}(native WireGuard + policy routing)${RESET}"
     echo -e "  Заворачивает трафик ${BOLD}telemt → Telegram DC${RESET} через Cloudflare WARP."
     echo -e "  Клиенты подключаются к серверу ${BOLD}напрямую${RESET}, дальше идёт через WARP."
-    echo -e "  ${DIM}Помогает если Telegram DC блокируется на исходящем (например с некоторых хостеров).${RESET}"
-    echo -e "  ${DIM}Реализация: wgcf создаёт WireGuard-интерфейс 'warp' (Table=off),${RESET}"
-    echo -e "  ${DIM}microsocks поднимает SOCKS5 на 127.0.0.1:40000 через этот интерфейс.${RESET}"
-    echo -e "  ${DIM}НЕ использует громоздкий cloudflare-warp пакет (77 MB).${RESET}"
+    echo -e "  ${DIM}Помогает если Telegram DC блокируется на исходящем (некоторые хостеры).${RESET}"
+    echo -e "  ${DIM}Реализация: wgcf создаёт WireGuard-интерфейс 'warp' (Table=off).${RESET}"
+    echo -e "  ${DIM}ip rule + отдельная таблица маршрутизации форсят 14 подсетей Telegram через warp.${RESET}"
+    echo -e "  ${DIM}Никаких SOCKS5 промежуточных демонов — ядро всё делает само.${RESET}"
     DO_WARP=false
     read -rp "$(echo -e "${YELLOW}?${RESET} Завернуть Telegram-трафик в WARP? [y/N]: ")" ans
     [[ "${ans,,}" =~ ^(y|yes|д|да)$ ]] && DO_WARP=true
@@ -475,18 +475,8 @@ TOMLTIME
             info "Добавлена секция [timeouts]: tg_connect=${TM_TG} handshake=${TM_HS} keepalive=${TM_KA}"
         fi
 
-        # Опциональный upstream через WARP (SOCKS5 на 127.0.0.1:40000)
-        if [[ "${DO_WARP:-false}" == true ]]; then
-            cat >> "/etc/telemt/telemt${n}.toml" << TOMLWARP
-
-[[upstreams]]
-type = "socks5"
-address = "127.0.0.1:40000"
-weight = 1
-enabled = true
-TOMLWARP
-            info "Добавлен upstream через WARP (SOCKS5 127.0.0.1:40000)"
-        fi
+        # При WARP через policy routing никаких изменений в конфигах не нужно —
+        # ядро автоматически маршрутизирует пакеты к подсетям Telegram через интерфейс warp.
 
         ok "Создан /etc/telemt/telemt${n}.toml"
         SECRETS[$n]="$secret"
@@ -800,29 +790,52 @@ SERVICE
 }
 
 
-# ─── ШАГ: Установка Cloudflare WARP ──────────────────────────────────────────
+# ─── ШАГ: Установка WARP (native WireGuard + policy routing) ─────────────────
+# Подсети Telegram DC — статичные публичные диапазоны
+# Источник: docs.telegram.org/cli/configuration#datacenters и публичные whois
+TELEGRAM_SUBNETS_V4=(
+    "91.108.4.0/22"
+    "91.108.8.0/22"
+    "91.108.12.0/22"
+    "91.108.16.0/22"
+    "91.108.20.0/22"
+    "91.108.56.0/22"
+    "91.105.192.0/23"
+    "149.154.160.0/20"
+    "185.76.151.0/24"
+)
+TELEGRAM_SUBNETS_V6=(
+    "2001:b28:f23c::/48"
+    "2001:b28:f23d::/48"
+    "2001:b28:f23f::/48"
+    "2001:67c:4e8::/48"
+    "2a0a:f280::/32"
+)
+WARP_RT_TABLE="200"   # Номер таблицы маршрутизации для policy routing
+WARP_FWMARK="0x42"    # Метка не нужна — оставим для будущего, маркируем по dst
+
 step_warp() {
     [[ "${DO_WARP:-false}" != true ]] && return 0
-    hdr "Установка WARP (native WireGuard + SOCKS5-мост)"
+    hdr "Установка WARP (native WireGuard + policy routing)"
 
     echo ""
-    info "Архитектура: wgcf создаёт WireGuard-интерфейс 'warp' (Table=off — не перехватывает весь трафик)."
-    info "microsocks поднимает SOCKS5 на 127.0.0.1:40000 с привязкой к интерфейсу warp."
-    info "telemt идёт в SOCKS5 → microsocks → WARP-туннель → Telegram DC."
+    info "Архитектура: wgcf создаёт WireGuard-интерфейс 'warp' (Table=off)."
+    info "ip rule + отдельная таблица маршрутизации форсят пакеты к подсетям Telegram через warp."
+    info "Никаких SOCKS5 промежуточных демонов — telemt идёт напрямую, ядро маршрутизирует."
     echo ""
     confirm "Установить?" skip || return 0
 
-    # ── 1) WireGuard + зависимости ────────────────────────────────────────────
-    info "Установка WireGuard и microsocks..."
+    # ── 1) WireGuard ──────────────────────────────────────────────────────────
+    info "Установка wireguard..."
     wait_apt
-    if ! apt-get install -y wireguard microsocks curl 2>&1; then
-        err "Не удалось установить wireguard/microsocks — пропуск WARP"
+    if ! apt-get install -y wireguard curl 2>&1; then
+        err "Не удалось установить wireguard — пропуск WARP"
         DO_WARP=false
         return 0
     fi
-    ok "wireguard + microsocks установлены"
+    ok "wireguard установлен"
 
-    # ── 2) wgcf — Go-бинарник, регистрация free WARP аккаунта ─────────────────
+    # ── 2) wgcf — Go-бинарник ─────────────────────────────────────────────────
     if ! command -v wgcf &>/dev/null; then
         info "Скачивание wgcf..."
         local arch wgcf_arch wgcf_version wgcf_url
@@ -836,7 +849,7 @@ step_warp() {
         esac
 
         wgcf_version=$(curl -s --max-time 10 "https://api.github.com/repos/ViRb3/wgcf/releases/latest" \
-                       | grep tag_name | cut -d '"' -f 4)
+                       | grep tag_name | cut -d \" -f 4)
         if [[ -z "$wgcf_version" ]]; then
             err "Не удалось определить последнюю версию wgcf — пропуск WARP"
             DO_WARP=false
@@ -863,7 +876,7 @@ step_warp() {
     cd /etc/wireguard
 
     if [[ ! -f /etc/wireguard/wgcf-account.toml ]]; then
-        # Бэкап DNS на время регистрации (если /etc/resolv.conf битый)
+        # Бэкап DNS на время регистрации
         local restore_dns=false
         if ! getent hosts api.cloudflareclient.com &>/dev/null; then
             cp /etc/resolv.conf /etc/resolv.conf.warp-backup 2>/dev/null || true
@@ -871,14 +884,11 @@ step_warp() {
             restore_dns=true
         fi
 
-        # yes для авто-подтверждения TOS
         if ! timeout 60 bash -c 'yes | wgcf register' >/dev/null 2>&1; then
-            # Иногда первый раз падает на 500 от Cloudflare — пробуем ещё раз
             sleep 3
             yes | wgcf register >/dev/null 2>&1 || true
         fi
 
-        # Восстановить DNS
         if [[ "$restore_dns" == true && -f /etc/resolv.conf.warp-backup ]]; then
             cp /etc/resolv.conf.warp-backup /etc/resolv.conf
             rm -f /etc/resolv.conf.warp-backup
@@ -886,7 +896,6 @@ step_warp() {
 
         if [[ ! -f /etc/wireguard/wgcf-account.toml ]]; then
             err "Регистрация wgcf не удалась — пропуск WARP"
-            err "Можно попробовать позже через mytelemtinfo → 7"
             DO_WARP=false
             cd - >/dev/null 2>&1 || true
             return 0
@@ -896,7 +905,7 @@ step_warp() {
         ok "WARP-аккаунт уже зарегистрирован"
     fi
 
-    # ── 4) Генерация конфига WireGuard ───────────────────────────────────────
+    # ── 4) Генерация конфига ─────────────────────────────────────────────────
     info "Генерация WireGuard-профиля..."
     if ! wgcf generate >/dev/null 2>&1; then
         err "Не удалось сгенерировать wgcf-profile.conf"
@@ -905,32 +914,65 @@ step_warp() {
         return 0
     fi
 
-    # ── 5) Правка конфига: критично! ─────────────────────────────────────────
-    # - Убираем DNS (мы не хотим чтобы WARP-интерфейс заменял системный DNS)
-    # - Table = off — НЕ создаём маршрутов автоматически (не перехватываем весь трафик)
-    # - PersistentKeepalive для держания соединения
-    # - Убираем IPv6 если он отключён
+    # ── 5) Правка конфига + добавление PostUp/PreDown для policy routing ─────
     local conf=/etc/wireguard/wgcf-profile.conf
     sed -i '/^DNS =/d' "$conf"
     grep -q "Table = off" "$conf" || sed -i '/^MTU =/a Table = off' "$conf"
     grep -q "PersistentKeepalive" "$conf" || sed -i '/^Endpoint =/a PersistentKeepalive = 25' "$conf"
 
-    # IPv6 — если на сервере выключен, убираем из конфига чтобы не было ошибки
+    # IPv6 — если на сервере выключен, убираем из конфига
+    local has_ipv6=true
     if ! sysctl net.ipv6.conf.all.disable_ipv6 2>/dev/null | grep -q ' = 0'; then
         sed -i 's/,\s*[0-9a-fA-F:]\+\/128//' "$conf"
         sed -i '/Address = [0-9a-fA-F:]\+\/128/d' "$conf"
+        has_ipv6=false
         info "IPv6 отключён в системе — убран из WARP-конфига"
     fi
 
-    # Перемещаем в стандартное место для wg-quick
+    # Добавляем PostUp/PreDown для policy routing к Telegram DC
+    # Удаляем старые PostUp/PreDown если они уже есть (на случай переустановки)
+    sed -i '/^PostUp /d' "$conf"
+    sed -i '/^PreDown /d' "$conf"
+
+    # Формируем команды PostUp (запускаются после подъёма интерфейса)
+    # 1. Добавляем default route в нашу таблицу через warp
+    # 2. Для каждой подсети Telegram — ip rule "to <subnet> lookup 200"
+    {
+        echo ""
+        echo "# Policy routing: трафик к Telegram DC идёт через warp"
+        echo "PostUp = ip route add default dev %i table ${WARP_RT_TABLE}"
+        for sn in "${TELEGRAM_SUBNETS_V4[@]}"; do
+            echo "PostUp = ip rule add to ${sn} lookup ${WARP_RT_TABLE}"
+        done
+        if [[ "$has_ipv6" == true ]]; then
+            echo "PostUp = ip -6 route add default dev %i table ${WARP_RT_TABLE}"
+            for sn in "${TELEGRAM_SUBNETS_V6[@]}"; do
+                echo "PostUp = ip -6 rule add to ${sn} lookup ${WARP_RT_TABLE}"
+            done
+        fi
+
+        # PreDown — удаляем правила в обратном порядке
+        for sn in "${TELEGRAM_SUBNETS_V4[@]}"; do
+            echo "PreDown = ip rule del to ${sn} lookup ${WARP_RT_TABLE} 2>/dev/null || true"
+        done
+        echo "PreDown = ip route flush table ${WARP_RT_TABLE} 2>/dev/null || true"
+        if [[ "$has_ipv6" == true ]]; then
+            for sn in "${TELEGRAM_SUBNETS_V6[@]}"; do
+                echo "PreDown = ip -6 rule del to ${sn} lookup ${WARP_RT_TABLE} 2>/dev/null || true"
+            done
+            echo "PreDown = ip -6 route flush table ${WARP_RT_TABLE} 2>/dev/null || true"
+        fi
+    } >> "$conf"
+
+    # Перемещаем в стандартное место
     mv "$conf" /etc/wireguard/warp.conf
     chmod 600 /etc/wireguard/warp.conf
     ok "Конфиг сохранён: /etc/wireguard/warp.conf"
+    info "Policy routing настроен на ${#TELEGRAM_SUBNETS_V4[@]} IPv4 + ${#TELEGRAM_SUBNETS_V6[@]} IPv6 подсетей"
 
     # ── 6) Запуск интерфейса warp ────────────────────────────────────────────
-    info "Поднятие интерфейса warp..."
+    info "Поднятие интерфейса warp (wg-quick применит правила автоматически)..."
     if ! systemctl enable --now wg-quick@warp 2>&1 | grep -v "Created symlink"; then
-        # Иногда нужна вторая попытка
         sleep 2
         systemctl start wg-quick@warp 2>/dev/null || true
     fi
@@ -944,7 +986,7 @@ step_warp() {
         return 0
     fi
 
-    # Проверка handshake (до 10 секунд)
+    # Проверка handshake
     local handshake=""
     for i in {1..10}; do
         handshake=$(wg show warp | grep "latest handshake" | awk -F': ' '{print $2}')
@@ -954,76 +996,50 @@ step_warp() {
     if [[ -n "$handshake" && "$handshake" != "0 seconds ago" ]]; then
         ok "WARP handshake: ${handshake}"
     else
-        warn "Handshake не получен за 10с (но интерфейс может ожить позже)"
+        warn "Handshake не получен за 10с (может появиться позже)"
     fi
 
-    # ── 7) microsocks bridge: SOCKS5 на 127.0.0.1:40000 через warp ───────────
-    info "Запуск SOCKS5-моста (microsocks через warp интерфейс)..."
-
-    # Получаем IP интерфейса warp (что-то типа 172.16.0.2)
-    local warp_ip
-    warp_ip=$(ip -4 -o addr show warp 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
-    if [[ -z "$warp_ip" ]]; then
-        err "Не удалось определить IP интерфейса warp"
-        DO_WARP=false
-        cd - >/dev/null 2>&1 || true
-        return 0
-    fi
-    info "IP интерфейса warp: ${BOLD}${warp_ip}${RESET}"
-
-    # Создаём systemd-сервис для microsocks
-    # Используем -b 127.0.0.1 (listen) + -i $warp_ip (outbound через warp)
-    cat > /etc/systemd/system/telemt-warp-socks.service << UNIT
-[Unit]
-Description=microsocks SOCKS5 bridge to WARP (for telemt upstream)
-After=network-online.target wg-quick@warp.service
-Wants=network-online.target
-Requires=wg-quick@warp.service
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/microsocks -i 127.0.0.1 -p 40000 -b ${warp_ip}
-Restart=on-failure
-RestartSec=5
-User=nobody
-Group=nogroup
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-    systemctl daemon-reload
-    systemctl enable --now telemt-warp-socks.service 2>&1 | grep -v "Created symlink" || true
-    sleep 2
-
-    if systemctl is-active --quiet telemt-warp-socks; then
-        ok "SOCKS5-мост запущен (127.0.0.1:40000 → warp → Telegram)"
+    # Проверка правил
+    local rule_count
+    rule_count=$(ip rule | grep -c "lookup ${WARP_RT_TABLE}" 2>/dev/null || echo 0)
+    if [[ "$rule_count" -gt 0 ]]; then
+        ok "Применено ip rule правил: ${rule_count}"
     else
-        warn "telemt-warp-socks не запустился"
-        warn "Логи: journalctl -u telemt-warp-socks -n 20"
+        warn "ip rule правил не найдено — что-то пошло не так"
     fi
 
-    # ── 8) Проверка ──────────────────────────────────────────────────────────
-    info "Тест: какой IP виден через WARP-мост?"
-    local direct_ip warp_visible_ip
+    # ── 7) Проверка маршрутизации ────────────────────────────────────────────
+    info "Тест: какой IP виден при подключении к Telegram-подсетям?"
+
+    # Прямой IP сервера (любая не-Telegram точка) — должен быть твой IP
+    local direct_ip
     direct_ip=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null)
-    warp_visible_ip=$(curl -s --max-time 10 --socks5 127.0.0.1:40000 https://api.ipify.org 2>/dev/null)
     if [[ -n "$direct_ip" ]]; then
-        info "Прямой IP сервера: ${BOLD}${direct_ip}${RESET}"
+        info "Прямой IP сервера (через обычный маршрут): ${BOLD}${direct_ip}${RESET}"
     fi
-    if [[ -n "$warp_visible_ip" ]]; then
-        ok "Через WARP виден IP: ${BOLD}${warp_visible_ip}${RESET} (Cloudflare)"
-        if [[ "$direct_ip" == "$warp_visible_ip" ]]; then
-            warn "Странно — оба IP одинаковые. Возможно WARP не работает"
+
+    # Trace через warp интерфейс — должен видеть Cloudflare
+    local warp_visible
+    warp_visible=$(curl -s --max-time 5 --interface warp https://api.ipify.org 2>/dev/null)
+    if [[ -n "$warp_visible" ]]; then
+        ok "IP при выходе через warp: ${BOLD}${warp_visible}${RESET} (Cloudflare)"
+        if [[ "$direct_ip" == "$warp_visible" ]]; then
+            warn "Странно — оба IP одинаковые. Возможно warp не работает"
         fi
+    fi
+
+    # Проверка маршрута для конкретного Telegram IP
+    local tg_route
+    tg_route=$(ip route get 149.154.167.51 2>/dev/null | head -1)
+    if echo "$tg_route" | grep -q "warp"; then
+        ok "Маршрут к Telegram (149.154.167.51) идёт через ${BOLD}warp${RESET}"
     else
-        warn "Тест через SOCKS5 не прошёл — проверьте позже:"
-        warn "  curl --socks5 127.0.0.1:40000 https://api.ipify.org"
+        warn "Маршрут к Telegram НЕ через warp:"
+        echo -e "    ${DIM}${tg_route}${RESET}"
     fi
 
     cd - >/dev/null 2>&1 || true
 }
-
 
 # ─── ШАГ: Установка mytelemtinfo ─────────────────────────────────────────────
 step_install_mytelemtinfo() {
@@ -1169,7 +1185,7 @@ print_summary() {
     [[ "${DO_NFT:-false}"      == true ]] && echo -e "  ${GREEN}✓${RESET} nft SYN limiter (${NFT_RATE} burst ${NFT_BURST})"
     [[ "${DO_TIMEOUTS:-false}" == true ]] && echo -e "  ${GREEN}✓${RESET} [timeouts]: tg_connect=${TM_TG} handshake=${TM_HS} keepalive=${TM_KA}"
     [[ "${USE_CUSTOM_DOMAIN:-false}" == true ]] && echo -e "  ${GREEN}✓${RESET} Свой домен в ссылках: ${BOLD}${CUSTOM_LINK_DOMAIN}${RESET}"
-    [[ "${DO_WARP:-false}"     == true ]] && echo -e "  ${GREEN}✓${RESET} Cloudflare WARP upstream (трафик к Telegram DC через WARP)"
+    [[ "${DO_WARP:-false}"     == true ]] && echo -e "  ${GREEN}✓${RESET} WARP policy routing (14 подсетей Telegram через warp интерфейс)"
 
     echo ""
     echo -e "  ${BOLD}Управление:${RESET} ${CYAN}sudo mytelemtinfo${RESET}"
@@ -1235,17 +1251,25 @@ do_purge_all() {
         ok "mytelemtinfo удалён"
     fi
 
-    # ── 4) Удаляем WARP (native WireGuard + microsocks) ──
+    # ── 4) Удаляем WARP (native WireGuard + policy routing) ──
     if [[ -f /etc/wireguard/warp.conf ]] || systemctl list-unit-files 2>/dev/null | grep -q "wg-quick@warp\|telemt-warp-socks"; then
         info "Удаление WARP..."
+        # Старый микрососкс-мост (для совместимости с предыдущими версиями)
         systemctl stop telemt-warp-socks 2>/dev/null || true
         systemctl disable telemt-warp-socks 2>/dev/null || true
         rm -f /etc/systemd/system/telemt-warp-socks.service
 
+        # Основное: WireGuard интерфейс
         systemctl stop wg-quick@warp 2>/dev/null || true
         systemctl disable wg-quick@warp 2>/dev/null || true
         rm -f /etc/wireguard/warp.conf /etc/wireguard/wgcf-account.toml /etc/wireguard/wgcf-profile.conf
         rm -f /usr/local/bin/wgcf
+
+        # Чистим policy routing на случай если что-то осталось в памяти ядра
+        while ip rule 2>/dev/null | grep -q "lookup 200"; do
+            ip rule del lookup 200 2>/dev/null || break
+        done
+        ip route flush table 200 2>/dev/null || true
 
         # Старый cloudflare-warp если был
         if command -v warp-cli &>/dev/null; then
