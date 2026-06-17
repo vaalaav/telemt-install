@@ -38,6 +38,7 @@ sudo bash <(curl -fsSL https://raw.githubusercontent.com/vaalaav/telemt-install/
 | 1 | 443  | `www.cloudflare.com` | Обычный HTTPS / CDN            |
 | 2 | 5223 | `www.apple.com`      | Apple Push Notification (APNs) |
 | 3 | 8530 | `www.microsoft.com`  | Windows Update (WSUS)          |
+| 4 | свой порт и SNI                                              |
 
 Можно выбрать любое подмножество (`1`, `2 3`, `all`).
 
