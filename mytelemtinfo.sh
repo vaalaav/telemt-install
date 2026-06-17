@@ -225,26 +225,33 @@ status_custom_domain() {
     fi
 }
 
-# ─── WARP (native WireGuard + policy routing) ──────────────────────────────
-WARP_RT_TABLE="200"
+# ─── VLESS Reality (xray-core SOCKS5 upstream) ──────────────────────────────
+VLESS_CONFIG_DIR="/etc/telemt-vless"
 
-status_warp() {
-    local wg_up=false rules_count=0
-    if wg show warp &>/dev/null; then
-        wg_up=true
+status_vless() {
+    local service_up=false port_up=false has_upstream=false
+
+    if systemctl is-active --quiet telemt-vless 2>/dev/null; then
+        service_up=true
     fi
-    rules_count=$(ip rule 2>/dev/null | grep -c "lookup ${WARP_RT_TABLE}" || echo 0)
+    if ss -tlnp 2>/dev/null | grep -q "127.0.0.1:40000"; then
+        port_up=true
+    fi
+    for f in /etc/telemt/telemt*.toml; do
+        [[ -f "$f" ]] && grep -q "127.0.0.1:40000" "$f" 2>/dev/null && has_upstream=true && break
+    done
 
-    if [[ ! -f /etc/wireguard/warp.conf ]] && ! command -v wgcf &>/dev/null; then
+    if [[ ! -d "$VLESS_CONFIG_DIR" ]] && [[ ! -f /usr/local/bin/xray ]]; then
         echo -e "${DIM}не установлен${RESET}"
         return
     fi
 
-    if [[ "$wg_up" == true && "$rules_count" -gt 0 ]]; then
-        local hs; hs=$(wg show warp 2>/dev/null | grep "latest handshake" | awk -F': ' '{print $2}')
-        echo -e "${GREEN}активен${RESET}  ${rules_count} правил, ${DIM}handshake: ${hs:-—}${RESET}"
-    elif [[ "$wg_up" == true ]]; then
-        echo -e "${YELLOW}WG up, но policy routing не настроен${RESET}"
+    if [[ "$service_up" == true && "$port_up" == true && "$has_upstream" == true ]]; then
+        echo -e "${GREEN}активен${RESET} (xray + telemt прицеплен)"
+    elif [[ "$service_up" == true && "$port_up" == true ]]; then
+        echo -e "${YELLOW}работает, но не прицеплен к telemt${RESET}"
+    elif [[ "$service_up" == true ]]; then
+        echo -e "${YELLOW}сервис up, порт 40000 не слушается${RESET}"
     else
         echo -e "${DIM}установлен, не запущен${RESET}"
     fi
@@ -265,7 +272,7 @@ main_menu() {
         echo -e "  Таймауты:  $(status_timeouts)"
         echo -e "  UFW:       $(status_ufw)"
         echo -e "  Свой домен: $(status_custom_domain)"
-        echo -e "  WARP:       $(status_warp)"
+        echo -e "  VLESS:      $(status_vless)"
         echo ""
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
         echo -e "  ${BOLD}1.${RESET} Управление прокси"
@@ -274,7 +281,7 @@ main_menu() {
         echo -e "  ${BOLD}4.${RESET} Таймауты telemt"
         echo -e "  ${BOLD}5.${RESET} UFW / Rate-limit"
         echo -e "  ${BOLD}6.${RESET} Свой домен в ссылках"
-        echo -e "  ${BOLD}7.${RESET} WARP upstream"
+        echo -e "  ${BOLD}7.${RESET} VLESS Reality upstream"
         echo -e "  ${BOLD}0.${RESET} Выход"
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
         echo ""
@@ -286,7 +293,7 @@ main_menu() {
             4) menu_timeouts ;;
             5) menu_ufw ;;
             6) menu_custom_domain ;;
-            7) menu_warp ;;
+            7) menu_vless ;;
             0|q) echo ""; exit 0 ;;
             *) warn "Неверный пункт" ; sleep 1 ;;
         esac
@@ -1982,86 +1989,80 @@ custom_domain_remove() {
 }
 
 # ════════════════════════════════════════════════════════════════════════
-#  7. WARP (native WireGuard + policy routing)
+#  7. VLESS Reality upstream (xray-core SOCKS5)
 # ════════════════════════════════════════════════════════════════════════
-# Подсети Telegram DC — статичные публичные диапазоны
-TELEGRAM_SUBNETS_V4=(
-    "91.108.4.0/22"
-    "91.108.8.0/22"
-    "91.108.12.0/22"
-    "91.108.16.0/22"
-    "91.108.20.0/22"
-    "91.108.56.0/22"
-    "91.105.192.0/23"
-    "149.154.160.0/20"
-    "185.76.151.0/24"
-)
-TELEGRAM_SUBNETS_V6=(
-    "2001:b28:f23c::/48"
-    "2001:b28:f23d::/48"
-    "2001:b28:f23f::/48"
-    "2001:67c:4e8::/48"
-    "2a0a:f280::/32"
-)
-
-menu_warp() {
+menu_vless() {
     while true; do
         draw_header
-        echo -e "  ${BOLD}WARP${RESET}  ${DIM}(WireGuard + policy routing)${RESET}\n"
-        echo -e "  Статус: $(status_warp)"
+        echo -e "  ${BOLD}VLESS Reality upstream${RESET}\n"
+        echo -e "  Статус: $(status_vless)"
         echo ""
 
         # Подробности
-        local wg_status="не установлен" rules_count=0
-        if wg show warp &>/dev/null; then
-            local hs; hs=$(wg show warp 2>/dev/null | grep "latest handshake" | awk -F': ' '{print $2}')
-            local warp_iface_ip; warp_iface_ip=$(ip -4 -o addr show warp 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
-            wg_status="${GREEN}up${RESET} (IP: ${warp_iface_ip:-?}, handshake: ${hs:-—})"
-        elif [[ -f /etc/wireguard/warp.conf ]]; then
-            wg_status="${YELLOW}конфиг есть, интерфейс не запущен${RESET}"
-        fi
-        rules_count=$(ip rule 2>/dev/null | grep -c "lookup ${WARP_RT_TABLE}" || echo 0)
+        local link_info="нет"
+        local service_status="не установлен"
+        local port_status="нет"
+        local upstream_status="нет"
 
-        echo -e "  ${DIM}WireGuard 'warp':${RESET}  ${wg_status}"
-        echo -e "  ${DIM}ip rule правил:${RESET}     ${BOLD}${rules_count}${RESET} ${DIM}(ожидается 9 IPv4 + 5 IPv6)${RESET}"
-
-        # Проверяем что таблица не пустая
-        if [[ "$rules_count" -gt 0 ]]; then
-            local routes_count; routes_count=$(ip route show table ${WARP_RT_TABLE} 2>/dev/null | wc -l)
-            echo -e "  ${DIM}Таблица ${WARP_RT_TABLE}:${RESET}       ${BOLD}${routes_count}${RESET} маршрутов"
+        if [[ -f "$VLESS_CONFIG_DIR/link.txt" ]]; then
+            local raw_link host port
+            raw_link=$(cat "$VLESS_CONFIG_DIR/link.txt" 2>/dev/null | tr -d '\n')
+            # Извлекаем хост:порт через Python
+            host=$(VL="$raw_link" python3 -c "import os,urllib.parse as up;p=up.urlparse(os.environ['VL']);print(f'{p.hostname}:{p.port}')" 2>/dev/null)
+            [[ -n "$host" ]] && link_info="${host}"
         fi
+        if systemctl is-active --quiet telemt-vless 2>/dev/null; then
+            service_status="${GREEN}active${RESET}"
+        elif [[ -f /etc/systemd/system/telemt-vless.service ]]; then
+            service_status="${RED}inactive${RESET}"
+        fi
+        if ss -tlnp 2>/dev/null | grep -q "127.0.0.1:40000"; then
+            port_status="${GREEN}127.0.0.1:40000${RESET}"
+        fi
+        for f in /etc/telemt/telemt*.toml; do
+            [[ -f "$f" ]] && grep -q "127.0.0.1:40000" "$f" 2>/dev/null && upstream_status="${GREEN}прицеплен${RESET}" && break
+        done
+
+        echo -e "  ${DIM}xray-core (telemt-vless):${RESET}   ${service_status}"
+        echo -e "  ${DIM}VLESS-сервер:${RESET}              ${link_info}"
+        echo -e "  ${DIM}SOCKS5 порт:${RESET}               ${port_status}"
+        echo -e "  ${DIM}В конфигах telemt:${RESET}         ${upstream_status}"
         echo ""
 
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
-        if [[ ! -f /etc/wireguard/warp.conf ]] && ! command -v wgcf &>/dev/null; then
-            echo -e "  ${BOLD}1.${RESET} Установить WARP (wgcf + WireGuard + policy routing)"
+        if [[ ! -f /usr/local/bin/xray ]] || [[ ! -f "$VLESS_CONFIG_DIR/config.json" ]]; then
+            echo -e "  ${BOLD}1.${RESET} Установить VLESS Reality (xray + конфиг)"
         else
-            echo -e "  ${BOLD}1.${RESET} Запустить WARP (поднять интерфейс)"
-            echo -e "  ${BOLD}2.${RESET} Остановить WARP (без удаления)"
-            echo -e "  ${BOLD}3.${RESET} Проверить маршрутизацию (ip route + правила)"
-            echo -e "  ${BOLD}4.${RESET} Тест: какой IP виден через WARP"
-            echo -e "  ${BOLD}5.${RESET} Применить policy routing заново (после ручных правок)"
-            echo -e "  ${BOLD}6.${RESET} ${RED}Удалить WARP полностью${RESET}"
+            echo -e "  ${BOLD}1.${RESET} Запустить xray (если выключен)"
+            echo -e "  ${BOLD}2.${RESET} Остановить xray"
+            echo -e "  ${BOLD}3.${RESET} Изменить vless:// ссылку"
+            echo -e "  ${BOLD}4.${RESET} Прицепить к telemt (добавить upstream)"
+            echo -e "  ${BOLD}5.${RESET} ${YELLOW}Отцепить от telemt${RESET} (telemt пойдёт напрямую)"
+            echo -e "  ${BOLD}6.${RESET} Тест: какой IP виден через VLESS"
+            echo -e "  ${BOLD}7.${RESET} Показать логи xray"
+            echo -e "  ${BOLD}8.${RESET} ${RED}Удалить полностью${RESET}"
         fi
         echo -e "  ${BOLD}0.${RESET} ← Назад"
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
         echo ""
         read -rp "  Выберите: " ch
 
-        if [[ ! -f /etc/wireguard/warp.conf ]] && ! command -v wgcf &>/dev/null; then
+        if [[ ! -f /usr/local/bin/xray ]] || [[ ! -f "$VLESS_CONFIG_DIR/config.json" ]]; then
             case "$ch" in
-                1) warp_install ;;
+                1) vless_install ;;
                 0|b) return ;;
                 *) warn "Неверный пункт"; sleep 1 ;;
             esac
         else
             case "$ch" in
-                1) warp_start ;;
-                2) warp_stop ;;
-                3) warp_show_routing ;;
-                4) warp_test ;;
-                5) warp_reapply_routing ;;
-                6) warp_remove ;;
+                1) vless_start ;;
+                2) vless_stop ;;
+                3) vless_change_link ;;
+                4) vless_attach ;;
+                5) vless_detach ;;
+                6) vless_test ;;
+                7) vless_logs ;;
+                8) vless_remove ;;
                 0|b) return ;;
                 *) warn "Неверный пункт"; sleep 1 ;;
             esac
@@ -2069,293 +2070,371 @@ menu_warp() {
     done
 }
 
-warp_install() {
+vless_ask_link() {
+    # Запрашивает у пользователя vless:// ссылку, валидирует, возвращает через echo
+    local link
+    echo -e "  ${DIM}Пример: vless://uuid@server:443?security=reality&pbk=...&sni=...${RESET}"
+    while true; do
+        read -rp "  vless:// ссылка: " link
+        if [[ "$link" == vless://*@*:*\?* ]] && [[ "$link" == *security=reality* ]] \
+           && [[ "$link" == *pbk=* ]] && [[ "$link" == *sni=* ]]; then
+            if VL="$link" python3 -c "import os,urllib.parse as up,sys;p=up.urlparse(os.environ['VL']);q=up.parse_qs(p.query);sys.exit(0 if (p.username and p.hostname and p.port and 'pbk' in q and 'sni' in q) else 1)" 2>/dev/null; then
+                echo "$link"
+                return 0
+            fi
+        fi
+        warn "Неверный формат ссылки" >&2
+        read -rp "  Попробовать ещё раз? [Y/n]: " retry >&2
+        if [[ "${retry,,}" =~ ^(n|no)$ ]]; then
+            return 1
+        fi
+    done
+}
+
+vless_generate_config() {
+    # Аргумент: vless ссылка. Создаёт /etc/telemt-vless/config.json
+    local link="$1"
+    mkdir -p "$VLESS_CONFIG_DIR"
+    VL="$link" python3 /dev/stdin << 'PYV'
+import os, json, urllib.parse as up
+url = os.environ['VL']
+p = up.urlparse(url)
+q = {k: v[0] for k, v in up.parse_qs(p.query).items()}
+cfg = {
+    "log": {"loglevel": "warning"},
+    "inbounds": [{
+        "tag": "socks-in",
+        "listen": "127.0.0.1",
+        "port": 40000,
+        "protocol": "socks",
+        "settings": {"auth": "noauth", "udp": True, "ip": "127.0.0.1"},
+        "sniffing": {"enabled": False}
+    }],
+    "outbounds": [{
+        "tag": "vless-reality",
+        "protocol": "vless",
+        "settings": {
+            "vnext": [{
+                "address": p.hostname, "port": p.port or 443,
+                "users": [{"id": p.username, "encryption": "none"}]
+            }]
+        },
+        "streamSettings": {
+            "network": q.get("type", "tcp"),
+            "security": "reality",
+            "realitySettings": {
+                "show": False,
+                "fingerprint": q.get("fp", "chrome"),
+                "serverName": q.get("sni", ""),
+                "publicKey": q.get("pbk", ""),
+                "shortId": q.get("sid", ""),
+                "spiderX": q.get("spx", "/")
+            }
+        }
+    }, {"tag": "direct", "protocol": "freedom"}],
+    "routing": {
+        "domainStrategy": "AsIs",
+        "rules": [{"type": "field", "inboundTag": ["socks-in"], "outboundTag": "vless-reality"}]
+    }
+}
+flow = q.get("flow", "")
+if flow:
+    cfg["outbounds"][0]["settings"]["vnext"][0]["users"][0]["flow"] = flow
+with open("/etc/telemt-vless/config.json", "w") as f:
+    json.dump(cfg, f, indent=2)
+with open("/etc/telemt-vless/link.txt", "w") as f:
+    f.write(url + "\n")
+PYV
+    chmod 600 /etc/telemt-vless/config.json /etc/telemt-vless/link.txt
+}
+
+vless_install() {
     draw_header
-    echo -e "  ${BOLD}Установка WARP (WireGuard + policy routing)${RESET}\n"
-    echo -e "  ${DIM}wgcf создаёт WireGuard-интерфейс 'warp' (Table=off).${RESET}"
-    echo -e "  ${DIM}В /etc/wireguard/warp.conf пропишутся PostUp/PreDown с ip rule${RESET}"
-    echo -e "  ${DIM}на 14 подсетей Telegram (9 IPv4 + 5 IPv6).${RESET}"
+    echo -e "  ${BOLD}Установка VLESS Reality${RESET}\n"
+    echo -e "  ${DIM}Будет скачан xray-core с GitHub releases, создан systemd-сервис,${RESET}"
+    echo -e "  ${DIM}и прописан upstream в конфиги telemt.${RESET}"
     echo ""
-    read -rp "  Установить? [Y/n]: " ans
+    read -rp "  Продолжить? [Y/n]: " ans
     [[ "${ans,,}" =~ ^(n|no)$ ]] && return
 
-    # 1) WireGuard
-    info "Установка wireguard..."
-    apt-get update -qq 2>&1 | tail -1 || true
-    if ! apt-get install -y wireguard curl 2>&1; then
-        err "Не удалось установить wireguard"; pause; return
-    fi
-    ok "wireguard установлен"
+    # 1) Запрашиваем ссылку
+    local link
+    link=$(vless_ask_link) || { info "Отменено"; pause; return; }
 
-    # 2) wgcf
-    if ! command -v wgcf &>/dev/null; then
-        info "Скачивание wgcf..."
-        local arch wgcf_arch wgcf_version wgcf_url
+    # 2) Скачиваем xray-core если ещё нет
+    if [[ ! -f /usr/local/bin/xray ]]; then
+        info "Скачивание xray-core..."
+        local arch xray_arch xray_version xray_url
         arch=$(uname -m)
         case "$arch" in
-            x86_64) wgcf_arch="amd64" ;;
-            aarch64|arm64) wgcf_arch="arm64" ;;
-            armv7l) wgcf_arch="armv7" ;;
-            *) wgcf_arch="amd64" ;;
+            x86_64) xray_arch="64" ;;
+            aarch64|arm64) xray_arch="arm64-v8a" ;;
+            armv7l) xray_arch="arm32-v7a" ;;
+            *) xray_arch="64" ;;
         esac
-        wgcf_version=$(curl -s --max-time 10 "https://api.github.com/repos/ViRb3/wgcf/releases/latest" | grep tag_name | cut -d \" -f 4)
-        [[ -z "$wgcf_version" ]] && { err "Не получили версию wgcf"; pause; return; }
-        wgcf_url="https://github.com/ViRb3/wgcf/releases/download/${wgcf_version}/wgcf_${wgcf_version#v}_linux_${wgcf_arch}"
-        if ! curl -fsSL --max-time 60 -o /usr/local/bin/wgcf "$wgcf_url"; then
-            err "Не удалось скачать wgcf"; pause; return
+        xray_version=$(curl -s --max-time 10 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | grep tag_name | cut -d \" -f 4)
+        [[ -z "$xray_version" ]] && { err "Не получили версию"; pause; return; }
+        xray_url="https://github.com/XTLS/Xray-core/releases/download/${xray_version}/Xray-linux-${xray_arch}.zip"
+
+        apt-get install -y unzip curl >/dev/null 2>&1
+        cd /tmp
+        if ! curl -fsSL --max-time 120 -o /tmp/xray.zip "$xray_url"; then
+            err "Не удалось скачать xray-core"; pause; return
         fi
-        chmod +x /usr/local/bin/wgcf
-        ok "wgcf $wgcf_version установлен"
+        unzip -o -q /tmp/xray.zip -d /tmp/xray-extract >/dev/null
+        mv /tmp/xray-extract/xray /usr/local/bin/xray
+        chmod +x /usr/local/bin/xray
+        rm -rf /tmp/xray.zip /tmp/xray-extract
+        ok "xray-core $xray_version установлен"
     fi
 
-    # 3) Регистрация
-    info "Регистрация WARP-аккаунта..."
-    mkdir -p /etc/wireguard
-    cd /etc/wireguard
-    if [[ ! -f /etc/wireguard/wgcf-account.toml ]]; then
-        if ! timeout 60 bash -c 'yes | wgcf register' >/dev/null 2>&1; then
-            sleep 3
-            yes | wgcf register >/dev/null 2>&1 || true
-        fi
-        [[ ! -f /etc/wireguard/wgcf-account.toml ]] && { err "Регистрация не удалась"; pause; return; }
-    fi
-    ok "WARP-аккаунт готов"
+    # 3) Конфиг
+    vless_generate_config "$link"
+    ok "Конфиг создан"
 
-    # 4) Конфиг + policy routing PostUp/PreDown
-    wgcf generate >/dev/null 2>&1 || { err "Не сгенерировался конфиг"; pause; return; }
-    local conf=/etc/wireguard/wgcf-profile.conf
-    sed -i '/^DNS =/d' "$conf"
-    grep -q "Table = off" "$conf" || sed -i '/^MTU =/a Table = off' "$conf"
-    grep -q "PersistentKeepalive" "$conf" || sed -i '/^Endpoint =/a PersistentKeepalive = 25' "$conf"
-
-    local has_ipv6=true
-    if ! sysctl net.ipv6.conf.all.disable_ipv6 2>/dev/null | grep -q ' = 0'; then
-        sed -i 's/,\s*[0-9a-fA-F:]\+\/128//' "$conf"
-        sed -i '/Address = [0-9a-fA-F:]\+\/128/d' "$conf"
-        has_ipv6=false
+    # Валидация
+    if /usr/local/bin/xray -test -config /etc/telemt-vless/config.json 2>&1 | grep -q "Configuration OK"; then
+        ok "Конфиг xray валиден"
+    else
+        warn "xray -test не прошёл, но продолжаем"
     fi
 
-    sed -i '/^PostUp /d' "$conf"
-    sed -i '/^PreDown /d' "$conf"
+    # 4) systemd
+    cat > /etc/systemd/system/telemt-vless.service << 'SVC'
+[Unit]
+Description=xray-core VLESS Reality client (telemt SOCKS5 upstream)
+After=network-online.target
+Wants=network-online.target
 
-    {
-        echo ""
-        echo "# Policy routing для Telegram DC"
-        echo "PostUp = ip route add default dev %i table ${WARP_RT_TABLE}"
-        for sn in "${TELEGRAM_SUBNETS_V4[@]}"; do
-            echo "PostUp = ip rule add to ${sn} lookup ${WARP_RT_TABLE}"
-        done
-        if [[ "$has_ipv6" == true ]]; then
-            echo "PostUp = ip -6 route add default dev %i table ${WARP_RT_TABLE}"
-            for sn in "${TELEGRAM_SUBNETS_V6[@]}"; do
-                echo "PostUp = ip -6 rule add to ${sn} lookup ${WARP_RT_TABLE}"
-            done
-        fi
-        for sn in "${TELEGRAM_SUBNETS_V4[@]}"; do
-            echo "PreDown = ip rule del to ${sn} lookup ${WARP_RT_TABLE} 2>/dev/null || true"
-        done
-        echo "PreDown = ip route flush table ${WARP_RT_TABLE} 2>/dev/null || true"
-        if [[ "$has_ipv6" == true ]]; then
-            for sn in "${TELEGRAM_SUBNETS_V6[@]}"; do
-                echo "PreDown = ip -6 rule del to ${sn} lookup ${WARP_RT_TABLE} 2>/dev/null || true"
-            done
-            echo "PreDown = ip -6 route flush table ${WARP_RT_TABLE} 2>/dev/null || true"
-        fi
-    } >> "$conf"
+[Service]
+Type=simple
+User=nobody
+Group=nogroup
+ExecStart=/usr/local/bin/xray run -config /etc/telemt-vless/config.json
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+NoNewPrivileges=true
 
-    mv "$conf" /etc/wireguard/warp.conf
-    chmod 600 /etc/wireguard/warp.conf
-    ok "Конфиг сохранён: /etc/wireguard/warp.conf"
-
-    # 5) Запуск
-    systemctl enable --now wg-quick@warp 2>&1 | grep -v "Created symlink" || true
+[Install]
+WantedBy=multi-user.target
+SVC
+    systemctl daemon-reload
+    systemctl enable --now telemt-vless 2>&1 | grep -v "Created symlink" || true
     sleep 3
-    if wg show warp &>/dev/null; then
-        ok "Интерфейс warp поднят"
-        # Перезапуск telemt, чтобы они переподключились через warp
-        local insts; read -ra insts <<< "$(active_instances)"
-        for n in "${insts[@]}"; do systemctl restart "telemt${n}" 2>/dev/null; done
-        ok "Инстансы telemt перезапущены"
+
+    if systemctl is-active --quiet telemt-vless; then
+        ok "Сервис telemt-vless запущен"
     else
-        err "Интерфейс warp не поднялся (см. journalctl -u wg-quick@warp)"
+        err "Сервис не запустился"
+        warn "Логи: journalctl -u telemt-vless -n 30"
+        pause; return
     fi
+
+    # 5) Прицепляем к telemt
+    echo ""
+    read -rp "  Прицепить VLESS к telemt (добавить upstream в конфиги)? [Y/n]: " ans
+    [[ ! "${ans,,}" =~ ^(n|no)$ ]] && vless_attach_silent
     pause
 }
 
-warp_start() {
+vless_start() {
     draw_header
-    info "Запуск WireGuard интерфейса warp..."
-    systemctl start wg-quick@warp 2>&1 || true
+    info "Запуск xray (telemt-vless)..."
+    systemctl start telemt-vless 2>&1 || true
     sleep 2
-    if wg show warp &>/dev/null; then
-        ok "warp интерфейс активен"
-        local rc; rc=$(ip rule 2>/dev/null | grep -c "lookup ${WARP_RT_TABLE}" || echo 0)
-        info "ip rule правил: $rc"
-        # Перезапускаем telemt
-        local insts; read -ra insts <<< "$(active_instances)"
-        for n in "${insts[@]}"; do systemctl restart "telemt${n}" 2>/dev/null; done
+    if systemctl is-active --quiet telemt-vless; then
+        ok "xray активен"
     else
-        err "Не удалось запустить wg-quick@warp"
+        err "Не удалось запустить"
     fi
     pause
 }
 
-warp_stop() {
+vless_stop() {
     draw_header
-    warn "WARP будет остановлен. Если он использовался для telemt — инстансы перейдут на прямую маршрутизацию."
+    warn "Если VLESS прицеплен к telemt — инстансы не смогут коннектиться к Telegram!"
     read -rp "  Подтвердить? [y/N]: " ans
     [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
-    systemctl stop wg-quick@warp 2>/dev/null
-    ok "WARP остановлен"
+    systemctl stop telemt-vless 2>/dev/null
+    ok "xray остановлен"
     pause
 }
 
-warp_show_routing() {
+vless_change_link() {
     draw_header
-    echo -e "  ${BOLD}Состояние маршрутизации WARP${RESET}\n"
+    echo -e "  ${BOLD}Изменение vless:// ссылки${RESET}\n"
+    if [[ -f "$VLESS_CONFIG_DIR/link.txt" ]]; then
+        echo -e "  ${DIM}Текущая ссылка:${RESET}"
+        echo -e "  ${DIM}$(head -1 "$VLESS_CONFIG_DIR/link.txt")${RESET}"
+        echo ""
+    fi
+    local link
+    link=$(vless_ask_link) || { info "Отменено"; pause; return; }
 
-    echo -e "  ${BOLD}ip rule (политики маршрутизации):${RESET}"
-    ip rule 2>/dev/null | grep -E "lookup ${WARP_RT_TABLE}|^[0-9]+:" | head -20 | sed 's/^/    /'
-    echo ""
-
-    echo -e "  ${BOLD}Таблица ${WARP_RT_TABLE} (маршруты):${RESET}"
-    ip route show table ${WARP_RT_TABLE} 2>/dev/null | sed 's/^/    /'
-    echo ""
-
-    echo -e "  ${BOLD}Тест: маршрут к Telegram (149.154.167.51):${RESET}"
-    ip route get 149.154.167.51 2>/dev/null | head -2 | sed 's/^/    /'
-    echo ""
-
-    echo -e "  ${BOLD}Тест: маршрут к Google (8.8.8.8) — должен идти НЕ через warp:${RESET}"
-    ip route get 8.8.8.8 2>/dev/null | head -2 | sed 's/^/    /'
+    vless_generate_config "$link"
+    if /usr/local/bin/xray -test -config /etc/telemt-vless/config.json 2>&1 | grep -q "Configuration OK"; then
+        ok "Новый конфиг валиден"
+    else
+        warn "xray -test не прошёл"
+    fi
+    systemctl restart telemt-vless
+    sleep 2
+    if systemctl is-active --quiet telemt-vless; then
+        ok "xray перезапущен с новой ссылкой"
+        # Перезапускаем telemt чтобы он переподключился
+        local insts; read -ra insts <<< "$(active_instances)"
+        for n in "${insts[@]}"; do systemctl restart "telemt${n}" 2>/dev/null; done
+    else
+        err "xray не запустился — откатите ссылку через этот же пункт"
+    fi
     pause
 }
 
-warp_test() {
-    draw_header
-    echo -e "  ${BOLD}Тест: какой IP виден через WARP${RESET}\n"
+vless_attach_silent() {
+    local count=0
+    for f in /etc/telemt/telemt*.toml; do
+        [[ ! -f "$f" ]] && continue
+        if grep -q "127.0.0.1:40000" "$f" 2>/dev/null; then
+            continue
+        fi
+        python3 - "$f" << 'PYU'
+import sys, re
+path = sys.argv[1]
+content = open(path).read()
+content = re.sub(r'\n*\[\[upstreams\]\][^\[]*', '\n', content, flags=re.DOTALL)
+content = re.sub(r'\n{3,}', '\n\n', content)
+if not content.endswith('\n'): content += '\n'
+content += '\n[[upstreams]]\ntype = "socks5"\naddress = "127.0.0.1:40000"\nweight = 1\nenabled = true\n'
+open(path, 'w').write(content)
+PYU
+        count=$((count + 1))
+    done
+    local insts; read -ra insts <<< "$(active_instances)"
+    for n in "${insts[@]}"; do
+        systemctl restart "telemt${n}" 2>/dev/null
+    done
+    ok "Прицеплено к ${count} конфигам, инстансы перезапущены"
+}
 
-    info "Прямой запрос (через обычный исходящий маршрут):"
+vless_attach() {
+    draw_header
+    echo -e "  ${BOLD}Прицепить VLESS к telemt${RESET}\n"
+    echo -e "  В конфиги всех инстансов будет добавлен ${BOLD}[[upstreams]]${RESET} → 127.0.0.1:40000"
+    echo -e "  ${DIM}telemt пойдёт к Telegram DC через VLESS-туннель.${RESET}"
+    echo ""
+    read -rp "  Применить и перезапустить инстансы? [Y/n]: " ans
+    [[ "${ans,,}" =~ ^(n|no)$ ]] && return
+    vless_attach_silent
+    pause
+}
+
+vless_detach() {
+    draw_header
+    echo -e "  ${BOLD}Отцепить VLESS от telemt${RESET}\n"
+    warn "Из конфигов будут удалены секции [[upstreams]] — telemt пойдёт напрямую"
+    echo ""
+    read -rp "  Применить? [y/N]: " ans
+    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
+
+    local count=0
+    for f in /etc/telemt/telemt*.toml; do
+        [[ ! -f "$f" ]] && continue
+        if ! grep -q "127.0.0.1:40000" "$f" 2>/dev/null; then
+            continue
+        fi
+        python3 - "$f" << 'PYU'
+import sys, re
+path = sys.argv[1]
+content = open(path).read()
+content = re.sub(r'\n*\[\[upstreams\]\][^\[]*', '\n', content, flags=re.DOTALL)
+content = re.sub(r'\n{3,}', '\n\n', content)
+if not content.endswith('\n'): content += '\n'
+open(path, 'w').write(content)
+PYU
+        count=$((count + 1))
+    done
+    local insts; read -ra insts <<< "$(active_instances)"
+    for n in "${insts[@]}"; do
+        systemctl restart "telemt${n}" 2>/dev/null
+    done
+    ok "Отцеплено от ${count} конфигов, инстансы перезапущены"
+    pause
+}
+
+vless_test() {
+    draw_header
+    echo -e "  ${BOLD}Тест: какой IP виден через VLESS${RESET}\n"
+
+    info "Прямое соединение (исходящий IP сервера):"
     local direct_ip; direct_ip=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null)
     echo -e "  ${BOLD}${direct_ip:-(не удалось)}${RESET}"
 
     echo ""
-    info "Через warp интерфейс (--interface warp):"
-    local warp_ip; warp_ip=$(curl -s --max-time 5 --interface warp https://api.ipify.org 2>/dev/null)
-    if [[ -n "$warp_ip" ]]; then
-        echo -e "  ${BOLD}${warp_ip}${RESET}"
-        if [[ "$direct_ip" != "$warp_ip" ]]; then
-            ok "WARP работает: при выходе через warp виден Cloudflare IP"
+    info "Через VLESS SOCKS5 (должен быть IP вашего 3x-ui сервера):"
+    local vless_ip; vless_ip=$(curl -s --max-time 10 --socks5 127.0.0.1:40000 https://api.ipify.org 2>/dev/null)
+    if [[ -n "$vless_ip" ]]; then
+        echo -e "  ${BOLD}${vless_ip}${RESET}"
+        if [[ "$direct_ip" != "$vless_ip" ]]; then
+            ok "VLESS-туннель работает"
         else
-            warn "Оба IP одинаковые — что-то не так"
+            warn "IP одинаковые — туннель может не работать"
         fi
     else
-        err "Запрос через warp не прошёл"
-    fi
-
-    # Cloudflare trace через warp
-    echo ""
-    info "cdn-cgi/trace через warp интерфейс:"
-    curl -s --max-time 5 --interface warp https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
-        | grep -E "warp=|ip=" | sed 's/^/  /'
-    pause
-}
-
-# Полная переустановка PostUp/PreDown правил (если конфиг был отредактирован вручную)
-warp_reapply_routing() {
-    draw_header
-    echo -e "  ${BOLD}Переприменение policy routing${RESET}\n"
-    warn "Будут пересозданы PostUp/PreDown в /etc/wireguard/warp.conf"
-    warn "Интерфейс warp будет перезапущен"
-    echo ""
-    read -rp "  Подтвердить? [y/N]: " ans
-    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
-
-    local conf=/etc/wireguard/warp.conf
-    [[ ! -f "$conf" ]] && { err "Конфиг /etc/wireguard/warp.conf не найден"; pause; return; }
-
-    # Останавливаем
-    systemctl stop wg-quick@warp 2>/dev/null
-
-    # Чистим старые PostUp/PreDown
-    sed -i '/^PostUp /d' "$conf"
-    sed -i '/^PreDown /d' "$conf"
-    sed -i '/^# Policy routing/d' "$conf"
-
-    # Проверяем IPv6
-    local has_ipv6=false
-    grep -q "Address = [0-9a-fA-F:]\+/128" "$conf" 2>/dev/null && has_ipv6=true
-
-    # Добавляем новые
-    {
-        echo ""
-        echo "# Policy routing для Telegram DC"
-        echo "PostUp = ip route add default dev %i table ${WARP_RT_TABLE}"
-        for sn in "${TELEGRAM_SUBNETS_V4[@]}"; do
-            echo "PostUp = ip rule add to ${sn} lookup ${WARP_RT_TABLE}"
-        done
-        if [[ "$has_ipv6" == true ]]; then
-            echo "PostUp = ip -6 route add default dev %i table ${WARP_RT_TABLE}"
-            for sn in "${TELEGRAM_SUBNETS_V6[@]}"; do
-                echo "PostUp = ip -6 rule add to ${sn} lookup ${WARP_RT_TABLE}"
-            done
-        fi
-        for sn in "${TELEGRAM_SUBNETS_V4[@]}"; do
-            echo "PreDown = ip rule del to ${sn} lookup ${WARP_RT_TABLE} 2>/dev/null || true"
-        done
-        echo "PreDown = ip route flush table ${WARP_RT_TABLE} 2>/dev/null || true"
-        if [[ "$has_ipv6" == true ]]; then
-            for sn in "${TELEGRAM_SUBNETS_V6[@]}"; do
-                echo "PreDown = ip -6 rule del to ${sn} lookup ${WARP_RT_TABLE} 2>/dev/null || true"
-            done
-            echo "PreDown = ip -6 route flush table ${WARP_RT_TABLE} 2>/dev/null || true"
-        fi
-    } >> "$conf"
-
-    ok "Конфиг обновлён"
-    systemctl start wg-quick@warp
-    sleep 2
-    if wg show warp &>/dev/null; then
-        local rc; rc=$(ip rule 2>/dev/null | grep -c "lookup ${WARP_RT_TABLE}" || echo 0)
-        ok "warp поднят, применено правил: ${rc}"
-    else
-        err "warp не поднялся, см. journalctl -u wg-quick@warp"
+        err "Запрос через VLESS не прошёл"
+        info "Логи: journalctl -u telemt-vless -n 30"
     fi
     pause
 }
 
-warp_remove() {
+vless_logs() {
     draw_header
-    echo -e "  ${BOLD}${RED}Полное удаление WARP${RESET}\n"
-    warn "Будут удалены: интерфейс warp, конфиги wgcf, бинарник wgcf, все ip rule"
+    echo -e "  ${BOLD}Последние логи xray (telemt-vless)${RESET}\n"
+    journalctl -u telemt-vless -n 50 --no-pager
+    pause
+}
+
+vless_remove() {
+    draw_header
+    echo -e "  ${BOLD}${RED}Полное удаление VLESS${RESET}\n"
+    warn "Будут удалены: сервис telemt-vless, конфиги, upstream из telemt"
+    warn "Бинарник /usr/local/bin/xray НЕ удаляется (может использоваться другими сервисами)"
     echo ""
     read -rp "  Подтвердить? [y/N]: " ans
     [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
 
-    # 1. Остановить и удалить сервис
-    systemctl stop wg-quick@warp 2>/dev/null || true
-    systemctl disable wg-quick@warp 2>/dev/null || true
-
-    # 2. Удалить конфиги
-    rm -f /etc/wireguard/warp.conf /etc/wireguard/wgcf-account.toml /etc/wireguard/wgcf-profile.conf
-    rm -f /usr/local/bin/wgcf
-    ok "Конфиги и wgcf удалены"
-
-    # 3. На всякий случай очистить ip rule если что-то осталось
-    while ip rule | grep -q "lookup ${WARP_RT_TABLE}"; do
-        ip rule del lookup ${WARP_RT_TABLE} 2>/dev/null || break
+    # Отцепить от telemt
+    for f in /etc/telemt/telemt*.toml; do
+        [[ ! -f "$f" ]] && continue
+        python3 - "$f" << 'PYU'
+import sys, re
+path = sys.argv[1]
+content = open(path).read()
+content = re.sub(r'\n*\[\[upstreams\]\][^\[]*', '\n', content, flags=re.DOTALL)
+content = re.sub(r'\n{3,}', '\n\n', content)
+open(path, 'w').write(content)
+PYU
     done
-    ip route flush table ${WARP_RT_TABLE} 2>/dev/null || true
+    ok "Upstream-секции убраны из конфигов"
 
-    # 4. Перезапустить telemt
+    # Остановить сервис
+    systemctl stop telemt-vless 2>/dev/null || true
+    systemctl disable telemt-vless 2>/dev/null || true
+    rm -f /etc/systemd/system/telemt-vless.service
+    rm -rf /etc/telemt-vless
+    systemctl daemon-reload
+    ok "Сервис и конфиги VLESS удалены"
+
+    # Перезапуск telemt
     local insts; read -ra insts <<< "$(active_instances)"
     for n in "${insts[@]}"; do
         systemctl restart "telemt${n}" 2>/dev/null
     done
     ok "Инстансы telemt перезапущены"
 
-    info "Пакет wireguard остаётся (может пригодиться)."
-    info "Если нужно убрать: apt-get purge -y wireguard"
+    if [[ -f /usr/local/bin/xray ]]; then
+        info "Бинарник /usr/local/bin/xray остался. Удалить вручную: rm -f /usr/local/bin/xray"
+    fi
     pause
 }
 
