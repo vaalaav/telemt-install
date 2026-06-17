@@ -95,8 +95,15 @@ get_link() {
       || link=""
     [[ -z "$link" ]] && return
 
-    # Если в ссылке стоит 0.0.0.0 — заменяем на реальный IP
-    if [[ "$link" == *"server=0.0.0.0"* ]]; then
+    # Приоритет: сохранённый кастомный домен → реальный публичный IP
+    local custom_dom
+    custom_dom=$(get_custom_domain)
+    if [[ -n "$custom_dom" ]]; then
+        link="${link/server=0.0.0.0/server=${custom_dom}}"
+        # Также подменяем если там IP (из предыдущей установки)
+        [[ -z "$_PUBLIC_IP_CACHE" ]] && _PUBLIC_IP_CACHE=$(get_public_ip)
+        [[ -n "$_PUBLIC_IP_CACHE" ]] && link="${link/server=${_PUBLIC_IP_CACHE}/server=${custom_dom}}"
+    elif [[ "$link" == *"server=0.0.0.0"* ]]; then
         [[ -z "$_PUBLIC_IP_CACHE" ]] && _PUBLIC_IP_CACHE=$(get_public_ip)
         if [[ -n "$_PUBLIC_IP_CACHE" ]]; then
             link="${link/server=0.0.0.0/server=${_PUBLIC_IP_CACHE}}"
@@ -197,6 +204,47 @@ status_ufw() {
     fi
 }
 
+# ─── Свой домен ──────────────────────────────────────────────────────────────
+CUSTOM_DOMAIN_FILE="/etc/telemt/.custom_domain"
+
+get_custom_domain() {
+    [[ -f "$CUSTOM_DOMAIN_FILE" ]] && cat "$CUSTOM_DOMAIN_FILE" 2>/dev/null || echo ""
+}
+
+status_custom_domain() {
+    local d; d=$(get_custom_domain)
+    if [[ -n "$d" ]]; then
+        echo -e "${GREEN}${d}${RESET}"
+    else
+        echo -e "${DIM}не задан${RESET} (используется IP)"
+    fi
+}
+
+# ─── WARP (native WireGuard + policy routing) ──────────────────────────────
+WARP_RT_TABLE="200"
+
+status_warp() {
+    local wg_up=false rules_count=0
+    if wg show warp &>/dev/null; then
+        wg_up=true
+    fi
+    rules_count=$(ip rule 2>/dev/null | grep -c "lookup ${WARP_RT_TABLE}" || echo 0)
+
+    if [[ ! -f /etc/wireguard/warp.conf ]] && ! command -v wgcf &>/dev/null; then
+        echo -e "${DIM}не установлен${RESET}"
+        return
+    fi
+
+    if [[ "$wg_up" == true && "$rules_count" -gt 0 ]]; then
+        local hs; hs=$(wg show warp 2>/dev/null | grep "latest handshake" | awk -F': ' '{print $2}')
+        echo -e "${GREEN}активен${RESET}  ${rules_count} правил, ${DIM}handshake: ${hs:-—}${RESET}"
+    elif [[ "$wg_up" == true ]]; then
+        echo -e "${YELLOW}WG up, но policy routing не настроен${RESET}"
+    else
+        echo -e "${DIM}установлен, не запущен${RESET}"
+    fi
+}
+
 # ════════════════════════════════════════════════════════════════════════
 #  ГЛАВНОЕ МЕНЮ
 # ════════════════════════════════════════════════════════════════════════
@@ -211,6 +259,8 @@ main_menu() {
         echo -e "  nft SYN:   $(status_nft)"
         echo -e "  Таймауты:  $(status_timeouts)"
         echo -e "  UFW:       $(status_ufw)"
+        echo -e "  Свой домен: $(status_custom_domain)"
+        echo -e "  WARP:       $(status_warp)"
         echo ""
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
         echo -e "  ${BOLD}1.${RESET} Управление прокси"
@@ -218,6 +268,8 @@ main_menu() {
         echo -e "  ${BOLD}3.${RESET} nft SYN Limiter"
         echo -e "  ${BOLD}4.${RESET} Таймауты telemt"
         echo -e "  ${BOLD}5.${RESET} UFW / Rate-limit"
+        echo -e "  ${BOLD}6.${RESET} Свой домен в ссылках"
+        echo -e "  ${BOLD}7.${RESET} WARP upstream"
         echo -e "  ${BOLD}0.${RESET} Выход"
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
         echo ""
@@ -228,6 +280,8 @@ main_menu() {
             3) menu_nft ;;
             4) menu_timeouts ;;
             5) menu_ufw ;;
+            6) menu_custom_domain ;;
+            7) menu_warp ;;
             0|q) echo ""; exit 0 ;;
             *) warn "Неверный пункт" ; sleep 1 ;;
         esac
@@ -1761,11 +1815,556 @@ PYEOF
 }
 
 # ════════════════════════════════════════════════════════════════════════
+#  6. СВОЙ ДОМЕН В ССЫЛКАХ
+# ════════════════════════════════════════════════════════════════════════
+menu_custom_domain() {
+    while true; do
+        draw_header
+        echo -e "  ${BOLD}Свой домен в ссылках для клиентов${RESET}\n"
+        local cur; cur=$(get_custom_domain)
+        if [[ -n "$cur" ]]; then
+            echo -e "  Текущий домен: ${BOLD}${GREEN}${cur}${RESET}"
+            # Проверяем DNS
+            local resolved server_ip
+            resolved=$(getent hosts "$cur" 2>/dev/null | awk '{print $1}' | head -1)
+            server_ip=$(get_public_ip)
+            if [[ -n "$resolved" && -n "$server_ip" ]]; then
+                if [[ "$resolved" == "$server_ip" ]]; then
+                    ok "DNS резолвится корректно: ${cur} → ${resolved} (IP сервера)"
+                else
+                    warn "DNS не совпадает: ${cur} → ${resolved}, IP сервера: ${server_ip}"
+                fi
+            fi
+        else
+            echo -e "  Текущий: ${DIM}не задан${RESET} — в ссылках используется реальный IP сервера"
+        fi
+        echo ""
+
+        # Превью одной ссылки
+        local insts; read -ra insts <<< "$(active_instances)"
+        if [[ ${#insts[@]} -gt 0 ]]; then
+            local first="${insts[0]}"
+            local link; link=$(get_link "${INSTANCE_APIS[$first]}")
+            if [[ -n "$link" ]]; then
+                echo -e "  ${DIM}Пример ссылки сейчас:${RESET}"
+                echo -e "  ${GREEN}${link}${RESET}"
+                echo ""
+            fi
+        fi
+
+        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+        echo -e "  ${BOLD}1.${RESET} Установить / изменить домен"
+        echo -e "  ${BOLD}2.${RESET} Проверить DNS"
+        echo -e "  ${BOLD}3.${RESET} ${YELLOW}Удалить домен${RESET} (вернуть IP в ссылках)"
+        echo -e "  ${BOLD}0.${RESET} ← Назад"
+        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+        echo ""
+        read -rp "  Выберите: " ch
+        case "$ch" in
+            1) custom_domain_set ;;
+            2) custom_domain_check ;;
+            3) custom_domain_remove ;;
+            0|b) return ;;
+            *) warn "Неверный пункт"; sleep 1 ;;
+        esac
+    done
+}
+
+custom_domain_set() {
+    draw_header
+    echo -e "  ${BOLD}Установка собственного домена${RESET}\n"
+    echo -e "  Этот домен будет использоваться в tg://proxy ссылках вместо IP."
+    echo -e "  ${DIM}Требование: A-запись домен → IP сервера должна быть настроена.${RESET}"
+    echo -e "  ${DIM}Telegram-клиент сам делает DNS-резолв при подключении.${RESET}"
+    echo ""
+
+    local server_ip; server_ip=$(get_public_ip)
+    [[ -n "$server_ip" ]] && info "IP вашего сервера: ${BOLD}${server_ip}${RESET}"
+    echo ""
+
+    local inp_dom
+    while true; do
+        read -rp "  Введите домен (или 'q' для отмены): " inp_dom
+        [[ "$inp_dom" == "q" || -z "$inp_dom" ]] && { info "Отменено"; pause; return; }
+        if [[ "$inp_dom" == *.* ]]; then
+            break
+        else
+            warn "Введите корректный домен (например proxy.example.com)"
+        fi
+    done
+
+    # DNS проверка
+    local resolved
+    resolved=$(getent hosts "$inp_dom" 2>/dev/null | awk '{print $1}' | head -1)
+    if [[ -n "$resolved" && -n "$server_ip" ]]; then
+        if [[ "$resolved" == "$server_ip" ]]; then
+            ok "DNS проверка пройдена: ${inp_dom} → ${resolved}"
+        else
+            warn "DNS не совпадает: ${inp_dom} → ${resolved}, IP сервера: ${server_ip}"
+            warn "Возможные причины: A-запись не настроена / TTL ещё держит старое / CDN перед сервером"
+            read -rp "  Сохранить домен несмотря на это? [y/N]: " ans
+            [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && { info "Отменено"; pause; return; }
+        fi
+    else
+        warn "Не удалось проверить DNS (нет соединения или DNS не настроен)"
+        read -rp "  Сохранить домен? [Y/n]: " ans
+        [[ "${ans,,}" =~ ^(n|no)$ ]] && { info "Отменено"; pause; return; }
+    fi
+
+    # Сохраняем
+    mkdir -p /etc/telemt
+    echo "$inp_dom" > "$CUSTOM_DOMAIN_FILE"
+    chmod 644 "$CUSTOM_DOMAIN_FILE"
+    ok "Сохранён домен: ${BOLD}${inp_dom}${RESET}"
+    info "Теперь в ссылках tg://proxy будет использоваться этот домен."
+    pause
+}
+
+custom_domain_check() {
+    draw_header
+    echo -e "  ${BOLD}Проверка DNS${RESET}\n"
+    local dom; dom=$(get_custom_domain)
+    if [[ -z "$dom" ]]; then
+        warn "Домен не задан"; pause; return
+    fi
+    info "Проверка резолва для ${BOLD}${dom}${RESET}..."
+
+    # Несколько проверок
+    echo ""
+    echo -e "  ${BOLD}1) Системный getent (использует /etc/resolv.conf):${RESET}"
+    local sys_ip; sys_ip=$(getent hosts "$dom" 2>/dev/null | awk '{print $1}' | head -1)
+    [[ -n "$sys_ip" ]] && echo "    → $sys_ip" || warn "    не резолвится"
+
+    if command -v dig &>/dev/null; then
+        echo ""
+        echo -e "  ${BOLD}2) Через публичный DNS Cloudflare (1.1.1.1):${RESET}"
+        local cf_ip; cf_ip=$(dig +short @1.1.1.1 "$dom" A 2>/dev/null | grep -E '^[0-9]+\.' | head -1)
+        [[ -n "$cf_ip" ]] && echo "    → $cf_ip" || warn "    не резолвится"
+
+        echo ""
+        echo -e "  ${BOLD}3) Через публичный DNS Google (8.8.8.8):${RESET}"
+        local g_ip; g_ip=$(dig +short @8.8.8.8 "$dom" A 2>/dev/null | grep -E '^[0-9]+\.' | head -1)
+        [[ -n "$g_ip" ]] && echo "    → $g_ip" || warn "    не резолвится"
+    fi
+
+    echo ""
+    local server_ip; server_ip=$(get_public_ip)
+    echo -e "  ${BOLD}IP сервера:${RESET} ${BOLD}${server_ip}${RESET}"
+
+    if [[ -n "$sys_ip" && "$sys_ip" == "$server_ip" ]]; then
+        echo ""
+        ok "Всё работает: домен правильно указывает на сервер"
+    fi
+    pause
+}
+
+custom_domain_remove() {
+    draw_header
+    echo -e "  ${BOLD}Удаление кастомного домена${RESET}\n"
+    local dom; dom=$(get_custom_domain)
+    if [[ -z "$dom" ]]; then
+        warn "Домен не задан — нечего удалять"; pause; return
+    fi
+    warn "Текущий домен: ${dom}"
+    warn "После удаления в ссылках будет реальный IP сервера"
+    echo ""
+    read -rp "  Подтвердить? [y/N]: " ans
+    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
+
+    rm -f "$CUSTOM_DOMAIN_FILE"
+    ok "Кастомный домен удалён"
+    pause
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  7. WARP (native WireGuard + policy routing)
+# ════════════════════════════════════════════════════════════════════════
+# Подсети Telegram DC — статичные публичные диапазоны
+TELEGRAM_SUBNETS_V4=(
+    "91.108.4.0/22"
+    "91.108.8.0/22"
+    "91.108.12.0/22"
+    "91.108.16.0/22"
+    "91.108.20.0/22"
+    "91.108.56.0/22"
+    "91.105.192.0/23"
+    "149.154.160.0/20"
+    "185.76.151.0/24"
+)
+TELEGRAM_SUBNETS_V6=(
+    "2001:b28:f23c::/48"
+    "2001:b28:f23d::/48"
+    "2001:b28:f23f::/48"
+    "2001:67c:4e8::/48"
+    "2a0a:f280::/32"
+)
+
+menu_warp() {
+    while true; do
+        draw_header
+        echo -e "  ${BOLD}WARP${RESET}  ${DIM}(WireGuard + policy routing)${RESET}\n"
+        echo -e "  Статус: $(status_warp)"
+        echo ""
+
+        # Подробности
+        local wg_status="не установлен" rules_count=0
+        if wg show warp &>/dev/null; then
+            local hs; hs=$(wg show warp 2>/dev/null | grep "latest handshake" | awk -F': ' '{print $2}')
+            local warp_iface_ip; warp_iface_ip=$(ip -4 -o addr show warp 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+            wg_status="${GREEN}up${RESET} (IP: ${warp_iface_ip:-?}, handshake: ${hs:-—})"
+        elif [[ -f /etc/wireguard/warp.conf ]]; then
+            wg_status="${YELLOW}конфиг есть, интерфейс не запущен${RESET}"
+        fi
+        rules_count=$(ip rule 2>/dev/null | grep -c "lookup ${WARP_RT_TABLE}" || echo 0)
+
+        echo -e "  ${DIM}WireGuard 'warp':${RESET}  ${wg_status}"
+        echo -e "  ${DIM}ip rule правил:${RESET}     ${BOLD}${rules_count}${RESET} ${DIM}(ожидается 9 IPv4 + 5 IPv6)${RESET}"
+
+        # Проверяем что таблица не пустая
+        if [[ "$rules_count" -gt 0 ]]; then
+            local routes_count; routes_count=$(ip route show table ${WARP_RT_TABLE} 2>/dev/null | wc -l)
+            echo -e "  ${DIM}Таблица ${WARP_RT_TABLE}:${RESET}       ${BOLD}${routes_count}${RESET} маршрутов"
+        fi
+        echo ""
+
+        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+        if [[ ! -f /etc/wireguard/warp.conf ]] && ! command -v wgcf &>/dev/null; then
+            echo -e "  ${BOLD}1.${RESET} Установить WARP (wgcf + WireGuard + policy routing)"
+        else
+            echo -e "  ${BOLD}1.${RESET} Запустить WARP (поднять интерфейс)"
+            echo -e "  ${BOLD}2.${RESET} Остановить WARP (без удаления)"
+            echo -e "  ${BOLD}3.${RESET} Проверить маршрутизацию (ip route + правила)"
+            echo -e "  ${BOLD}4.${RESET} Тест: какой IP виден через WARP"
+            echo -e "  ${BOLD}5.${RESET} Применить policy routing заново (после ручных правок)"
+            echo -e "  ${BOLD}6.${RESET} ${RED}Удалить WARP полностью${RESET}"
+        fi
+        echo -e "  ${BOLD}0.${RESET} ← Назад"
+        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+        echo ""
+        read -rp "  Выберите: " ch
+
+        if [[ ! -f /etc/wireguard/warp.conf ]] && ! command -v wgcf &>/dev/null; then
+            case "$ch" in
+                1) warp_install ;;
+                0|b) return ;;
+                *) warn "Неверный пункт"; sleep 1 ;;
+            esac
+        else
+            case "$ch" in
+                1) warp_start ;;
+                2) warp_stop ;;
+                3) warp_show_routing ;;
+                4) warp_test ;;
+                5) warp_reapply_routing ;;
+                6) warp_remove ;;
+                0|b) return ;;
+                *) warn "Неверный пункт"; sleep 1 ;;
+            esac
+        fi
+    done
+}
+
+warp_install() {
+    draw_header
+    echo -e "  ${BOLD}Установка WARP (WireGuard + policy routing)${RESET}\n"
+    echo -e "  ${DIM}wgcf создаёт WireGuard-интерфейс 'warp' (Table=off).${RESET}"
+    echo -e "  ${DIM}В /etc/wireguard/warp.conf пропишутся PostUp/PreDown с ip rule${RESET}"
+    echo -e "  ${DIM}на 14 подсетей Telegram (9 IPv4 + 5 IPv6).${RESET}"
+    echo ""
+    read -rp "  Установить? [Y/n]: " ans
+    [[ "${ans,,}" =~ ^(n|no)$ ]] && return
+
+    # 1) WireGuard
+    info "Установка wireguard..."
+    apt-get update -qq 2>&1 | tail -1 || true
+    if ! apt-get install -y wireguard curl 2>&1; then
+        err "Не удалось установить wireguard"; pause; return
+    fi
+    ok "wireguard установлен"
+
+    # 2) wgcf
+    if ! command -v wgcf &>/dev/null; then
+        info "Скачивание wgcf..."
+        local arch wgcf_arch wgcf_version wgcf_url
+        arch=$(uname -m)
+        case "$arch" in
+            x86_64) wgcf_arch="amd64" ;;
+            aarch64|arm64) wgcf_arch="arm64" ;;
+            armv7l) wgcf_arch="armv7" ;;
+            *) wgcf_arch="amd64" ;;
+        esac
+        wgcf_version=$(curl -s --max-time 10 "https://api.github.com/repos/ViRb3/wgcf/releases/latest" | grep tag_name | cut -d \" -f 4)
+        [[ -z "$wgcf_version" ]] && { err "Не получили версию wgcf"; pause; return; }
+        wgcf_url="https://github.com/ViRb3/wgcf/releases/download/${wgcf_version}/wgcf_${wgcf_version#v}_linux_${wgcf_arch}"
+        if ! curl -fsSL --max-time 60 -o /usr/local/bin/wgcf "$wgcf_url"; then
+            err "Не удалось скачать wgcf"; pause; return
+        fi
+        chmod +x /usr/local/bin/wgcf
+        ok "wgcf $wgcf_version установлен"
+    fi
+
+    # 3) Регистрация
+    info "Регистрация WARP-аккаунта..."
+    mkdir -p /etc/wireguard
+    cd /etc/wireguard
+    if [[ ! -f /etc/wireguard/wgcf-account.toml ]]; then
+        if ! timeout 60 bash -c 'yes | wgcf register' >/dev/null 2>&1; then
+            sleep 3
+            yes | wgcf register >/dev/null 2>&1 || true
+        fi
+        [[ ! -f /etc/wireguard/wgcf-account.toml ]] && { err "Регистрация не удалась"; pause; return; }
+    fi
+    ok "WARP-аккаунт готов"
+
+    # 4) Конфиг + policy routing PostUp/PreDown
+    wgcf generate >/dev/null 2>&1 || { err "Не сгенерировался конфиг"; pause; return; }
+    local conf=/etc/wireguard/wgcf-profile.conf
+    sed -i '/^DNS =/d' "$conf"
+    grep -q "Table = off" "$conf" || sed -i '/^MTU =/a Table = off' "$conf"
+    grep -q "PersistentKeepalive" "$conf" || sed -i '/^Endpoint =/a PersistentKeepalive = 25' "$conf"
+
+    local has_ipv6=true
+    if ! sysctl net.ipv6.conf.all.disable_ipv6 2>/dev/null | grep -q ' = 0'; then
+        sed -i 's/,\s*[0-9a-fA-F:]\+\/128//' "$conf"
+        sed -i '/Address = [0-9a-fA-F:]\+\/128/d' "$conf"
+        has_ipv6=false
+    fi
+
+    sed -i '/^PostUp /d' "$conf"
+    sed -i '/^PreDown /d' "$conf"
+
+    {
+        echo ""
+        echo "# Policy routing для Telegram DC"
+        echo "PostUp = ip route add default dev %i table ${WARP_RT_TABLE}"
+        for sn in "${TELEGRAM_SUBNETS_V4[@]}"; do
+            echo "PostUp = ip rule add to ${sn} lookup ${WARP_RT_TABLE}"
+        done
+        if [[ "$has_ipv6" == true ]]; then
+            echo "PostUp = ip -6 route add default dev %i table ${WARP_RT_TABLE}"
+            for sn in "${TELEGRAM_SUBNETS_V6[@]}"; do
+                echo "PostUp = ip -6 rule add to ${sn} lookup ${WARP_RT_TABLE}"
+            done
+        fi
+        for sn in "${TELEGRAM_SUBNETS_V4[@]}"; do
+            echo "PreDown = ip rule del to ${sn} lookup ${WARP_RT_TABLE} 2>/dev/null || true"
+        done
+        echo "PreDown = ip route flush table ${WARP_RT_TABLE} 2>/dev/null || true"
+        if [[ "$has_ipv6" == true ]]; then
+            for sn in "${TELEGRAM_SUBNETS_V6[@]}"; do
+                echo "PreDown = ip -6 rule del to ${sn} lookup ${WARP_RT_TABLE} 2>/dev/null || true"
+            done
+            echo "PreDown = ip -6 route flush table ${WARP_RT_TABLE} 2>/dev/null || true"
+        fi
+    } >> "$conf"
+
+    mv "$conf" /etc/wireguard/warp.conf
+    chmod 600 /etc/wireguard/warp.conf
+    ok "Конфиг сохранён: /etc/wireguard/warp.conf"
+
+    # 5) Запуск
+    systemctl enable --now wg-quick@warp 2>&1 | grep -v "Created symlink" || true
+    sleep 3
+    if wg show warp &>/dev/null; then
+        ok "Интерфейс warp поднят"
+        # Перезапуск telemt, чтобы они переподключились через warp
+        local insts; read -ra insts <<< "$(active_instances)"
+        for n in "${insts[@]}"; do systemctl restart "telemt${n}" 2>/dev/null; done
+        ok "Инстансы telemt перезапущены"
+    else
+        err "Интерфейс warp не поднялся (см. journalctl -u wg-quick@warp)"
+    fi
+    pause
+}
+
+warp_start() {
+    draw_header
+    info "Запуск WireGuard интерфейса warp..."
+    systemctl start wg-quick@warp 2>&1 || true
+    sleep 2
+    if wg show warp &>/dev/null; then
+        ok "warp интерфейс активен"
+        local rc; rc=$(ip rule 2>/dev/null | grep -c "lookup ${WARP_RT_TABLE}" || echo 0)
+        info "ip rule правил: $rc"
+        # Перезапускаем telemt
+        local insts; read -ra insts <<< "$(active_instances)"
+        for n in "${insts[@]}"; do systemctl restart "telemt${n}" 2>/dev/null; done
+    else
+        err "Не удалось запустить wg-quick@warp"
+    fi
+    pause
+}
+
+warp_stop() {
+    draw_header
+    warn "WARP будет остановлен. Если он использовался для telemt — инстансы перейдут на прямую маршрутизацию."
+    read -rp "  Подтвердить? [y/N]: " ans
+    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
+    systemctl stop wg-quick@warp 2>/dev/null
+    ok "WARP остановлен"
+    pause
+}
+
+warp_show_routing() {
+    draw_header
+    echo -e "  ${BOLD}Состояние маршрутизации WARP${RESET}\n"
+
+    echo -e "  ${BOLD}ip rule (политики маршрутизации):${RESET}"
+    ip rule 2>/dev/null | grep -E "lookup ${WARP_RT_TABLE}|^[0-9]+:" | head -20 | sed 's/^/    /'
+    echo ""
+
+    echo -e "  ${BOLD}Таблица ${WARP_RT_TABLE} (маршруты):${RESET}"
+    ip route show table ${WARP_RT_TABLE} 2>/dev/null | sed 's/^/    /'
+    echo ""
+
+    echo -e "  ${BOLD}Тест: маршрут к Telegram (149.154.167.51):${RESET}"
+    ip route get 149.154.167.51 2>/dev/null | head -2 | sed 's/^/    /'
+    echo ""
+
+    echo -e "  ${BOLD}Тест: маршрут к Google (8.8.8.8) — должен идти НЕ через warp:${RESET}"
+    ip route get 8.8.8.8 2>/dev/null | head -2 | sed 's/^/    /'
+    pause
+}
+
+warp_test() {
+    draw_header
+    echo -e "  ${BOLD}Тест: какой IP виден через WARP${RESET}\n"
+
+    info "Прямой запрос (через обычный исходящий маршрут):"
+    local direct_ip; direct_ip=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null)
+    echo -e "  ${BOLD}${direct_ip:-(не удалось)}${RESET}"
+
+    echo ""
+    info "Через warp интерфейс (--interface warp):"
+    local warp_ip; warp_ip=$(curl -s --max-time 5 --interface warp https://api.ipify.org 2>/dev/null)
+    if [[ -n "$warp_ip" ]]; then
+        echo -e "  ${BOLD}${warp_ip}${RESET}"
+        if [[ "$direct_ip" != "$warp_ip" ]]; then
+            ok "WARP работает: при выходе через warp виден Cloudflare IP"
+        else
+            warn "Оба IP одинаковые — что-то не так"
+        fi
+    else
+        err "Запрос через warp не прошёл"
+    fi
+
+    # Cloudflare trace через warp
+    echo ""
+    info "cdn-cgi/trace через warp интерфейс:"
+    curl -s --max-time 5 --interface warp https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+        | grep -E "warp=|ip=" | sed 's/^/  /'
+    pause
+}
+
+# Полная переустановка PostUp/PreDown правил (если конфиг был отредактирован вручную)
+warp_reapply_routing() {
+    draw_header
+    echo -e "  ${BOLD}Переприменение policy routing${RESET}\n"
+    warn "Будут пересозданы PostUp/PreDown в /etc/wireguard/warp.conf"
+    warn "Интерфейс warp будет перезапущен"
+    echo ""
+    read -rp "  Подтвердить? [y/N]: " ans
+    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
+
+    local conf=/etc/wireguard/warp.conf
+    [[ ! -f "$conf" ]] && { err "Конфиг /etc/wireguard/warp.conf не найден"; pause; return; }
+
+    # Останавливаем
+    systemctl stop wg-quick@warp 2>/dev/null
+
+    # Чистим старые PostUp/PreDown
+    sed -i '/^PostUp /d' "$conf"
+    sed -i '/^PreDown /d' "$conf"
+    sed -i '/^# Policy routing/d' "$conf"
+
+    # Проверяем IPv6
+    local has_ipv6=false
+    grep -q "Address = [0-9a-fA-F:]\+/128" "$conf" 2>/dev/null && has_ipv6=true
+
+    # Добавляем новые
+    {
+        echo ""
+        echo "# Policy routing для Telegram DC"
+        echo "PostUp = ip route add default dev %i table ${WARP_RT_TABLE}"
+        for sn in "${TELEGRAM_SUBNETS_V4[@]}"; do
+            echo "PostUp = ip rule add to ${sn} lookup ${WARP_RT_TABLE}"
+        done
+        if [[ "$has_ipv6" == true ]]; then
+            echo "PostUp = ip -6 route add default dev %i table ${WARP_RT_TABLE}"
+            for sn in "${TELEGRAM_SUBNETS_V6[@]}"; do
+                echo "PostUp = ip -6 rule add to ${sn} lookup ${WARP_RT_TABLE}"
+            done
+        fi
+        for sn in "${TELEGRAM_SUBNETS_V4[@]}"; do
+            echo "PreDown = ip rule del to ${sn} lookup ${WARP_RT_TABLE} 2>/dev/null || true"
+        done
+        echo "PreDown = ip route flush table ${WARP_RT_TABLE} 2>/dev/null || true"
+        if [[ "$has_ipv6" == true ]]; then
+            for sn in "${TELEGRAM_SUBNETS_V6[@]}"; do
+                echo "PreDown = ip -6 rule del to ${sn} lookup ${WARP_RT_TABLE} 2>/dev/null || true"
+            done
+            echo "PreDown = ip -6 route flush table ${WARP_RT_TABLE} 2>/dev/null || true"
+        fi
+    } >> "$conf"
+
+    ok "Конфиг обновлён"
+    systemctl start wg-quick@warp
+    sleep 2
+    if wg show warp &>/dev/null; then
+        local rc; rc=$(ip rule 2>/dev/null | grep -c "lookup ${WARP_RT_TABLE}" || echo 0)
+        ok "warp поднят, применено правил: ${rc}"
+    else
+        err "warp не поднялся, см. journalctl -u wg-quick@warp"
+    fi
+    pause
+}
+
+warp_remove() {
+    draw_header
+    echo -e "  ${BOLD}${RED}Полное удаление WARP${RESET}\n"
+    warn "Будут удалены: интерфейс warp, конфиги wgcf, бинарник wgcf, все ip rule"
+    echo ""
+    read -rp "  Подтвердить? [y/N]: " ans
+    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
+
+    # 1. Остановить и удалить сервис
+    systemctl stop wg-quick@warp 2>/dev/null || true
+    systemctl disable wg-quick@warp 2>/dev/null || true
+
+    # 2. Удалить конфиги
+    rm -f /etc/wireguard/warp.conf /etc/wireguard/wgcf-account.toml /etc/wireguard/wgcf-profile.conf
+    rm -f /usr/local/bin/wgcf
+    ok "Конфиги и wgcf удалены"
+
+    # 3. На всякий случай очистить ip rule если что-то осталось
+    while ip rule | grep -q "lookup ${WARP_RT_TABLE}"; do
+        ip rule del lookup ${WARP_RT_TABLE} 2>/dev/null || break
+    done
+    ip route flush table ${WARP_RT_TABLE} 2>/dev/null || true
+
+    # 4. Перезапустить telemt
+    local insts; read -ra insts <<< "$(active_instances)"
+    for n in "${insts[@]}"; do
+        systemctl restart "telemt${n}" 2>/dev/null
+    done
+    ok "Инстансы telemt перезапущены"
+
+    info "Пакет wireguard остаётся (может пригодиться)."
+    info "Если нужно убрать: apt-get purge -y wireguard"
+    pause
+}
+
+# ════════════════════════════════════════════════════════════════════════
 #  ТОЧКА ВХОДА
 # ════════════════════════════════════════════════════════════════════════
 if [[ $EUID -ne 0 ]]; then
     echo -e "${RED}Требуется root (sudo mytelemtinfo)${RESET}"
     exit 1
+fi
+
+# Перенаправляем stdin на /dev/tty для работы через пайп
+if [[ ! -t 0 ]] && [[ -e /dev/tty ]]; then
+    exec < /dev/tty
 fi
 
 main_menu
