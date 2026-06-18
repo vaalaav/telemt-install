@@ -117,6 +117,158 @@ get_link() {
     echo "$link"
 }
 
+# ─── Health check: проверка цепочки telemt → upstream → Telegram DC ─────────
+# Универсальная функция, вызывается после изменений через mytelemtinfo.
+# Возвращает 0 если всё ок, !=0 если есть проблемы.
+# Аргумент: уровень детализации
+#   "brief"  — короткий отчёт после операций (5-7 строк)
+#   "full"   — полный отчёт со всеми проверками
+health_check() {
+    local mode="${1:-brief}"
+    local issues=0
+    local results=()  # массив строк "STATUS\tNAME\tDETAILS"
+
+    # 1. telemt инстансы — все ли active?
+    local insts; read -ra insts <<< "$(active_instances)"
+    if [[ ${#insts[@]} -eq 0 ]]; then
+        results+=("WARN\tИнстансы telemt\tнет установленных инстансов")
+    else
+        local all_active=true broken=()
+        for n in "${insts[@]}"; do
+            local st; st=$(systemctl is-active "telemt${n}" 2>/dev/null)
+            if [[ "$st" != "active" ]]; then
+                all_active=false
+                broken+=("telemt${n}:${st}")
+            fi
+        done
+        if [[ "$all_active" == true ]]; then
+            results+=("OK\tИнстансы telemt\tвсе ${#insts[@]} active")
+        else
+            results+=("FAIL\tИнстансы telemt\tпроблемы: ${broken[*]}")
+            issues=$((issues+1))
+        fi
+    fi
+
+    # 2. Если VLESS установлен — проверяем сервис и SOCKS5 порт
+    if [[ -f /etc/telemt-vless/config.json ]]; then
+        local vless_active=false vless_port=false
+        systemctl is-active --quiet telemt-vless && vless_active=true
+        ss -tlnp 2>/dev/null | grep -q "127.0.0.1:40000" && vless_port=true
+
+        if [[ "$vless_active" == true && "$vless_port" == true ]]; then
+            results+=("OK\tVLESS сервис\txray active, SOCKS5 на 40000")
+        elif [[ "$vless_active" == true ]]; then
+            results+=("FAIL\tVLESS сервис\txray active, но порт 40000 не слушает")
+            issues=$((issues+1))
+        else
+            results+=("FAIL\tVLESS сервис\txray не active")
+            issues=$((issues+1))
+        fi
+
+        # 3. upstream блоки в telemt-конфигах — соответствуют ли реальности?
+        local upstream_count=0
+        for f in /etc/telemt/telemt*.toml; do
+            [[ -f "$f" ]] && grep -q "127.0.0.1:40000" "$f" 2>/dev/null && upstream_count=$((upstream_count+1))
+        done
+        if [[ ${#insts[@]} -gt 0 && $upstream_count -eq 0 ]]; then
+            results+=("WARN\tVLESS прицеплен к telemt\tнет, инстансы идут напрямую")
+        elif [[ $upstream_count -gt 0 && $upstream_count -lt ${#insts[@]} ]]; then
+            results+=("WARN\tVLESS прицеплен к telemt\tтолько ${upstream_count}/${#insts[@]} инстансов")
+        elif [[ $upstream_count -eq ${#insts[@]} && $upstream_count -gt 0 ]]; then
+            results+=("OK\tVLESS прицеплен к telemt\tвсе ${upstream_count} конфигов")
+        fi
+
+        # 4. Тест туннеля — пакет через SOCKS5 доходит?
+        if [[ "$vless_active" == true && "$vless_port" == true ]]; then
+            local vless_test_ip
+            vless_test_ip=$(curl -s --max-time 5 --socks5 127.0.0.1:40000 https://api.ipify.org 2>/dev/null)
+            if [[ -n "$vless_test_ip" ]]; then
+                results+=("OK\tТуннель VLESS\tвыход через IP ${vless_test_ip}")
+            else
+                results+=("FAIL\tТуннель VLESS\tне отвечает на запрос через SOCKS5")
+                issues=$((issues+1))
+            fi
+        fi
+
+        # 5. Refresh timer (только в full режиме)
+        if [[ "$mode" == "full" && -f /etc/systemd/system/telemt-vless-refresh.timer ]]; then
+            if systemctl is-active --quiet telemt-vless-refresh.timer; then
+                local next_run; next_run=$(systemctl list-timers telemt-vless-refresh.timer --no-pager 2>/dev/null | grep telemt-vless | awk '{print $1,$2}')
+                results+=("OK\tАвто-обновление подписки\tследующий запуск: ${next_run:-?}")
+            else
+                results+=("WARN\tАвто-обновление подписки\ttimer не активен")
+            fi
+        fi
+    fi
+
+    # 6. Keepalive sysctl
+    if [[ "$mode" == "full" ]]; then
+        if [[ -f /etc/sysctl.d/99-telemt-net.conf ]] && grep -q tcp_keepalive_time /etc/sysctl.d/99-telemt-net.conf; then
+            local t i p
+            t=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)
+            if [[ "$t" == "60" ]]; then
+                results+=("OK\tTCP Keepalive\ttime=$t (применён)")
+            else
+                results+=("WARN\tTCP Keepalive\tconf есть, но sysctl=$t (нужно sysctl --system)")
+            fi
+        fi
+        # BBR
+        if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; then
+            results+=("OK\tBBR + fq\tactive")
+        fi
+        # nft limiter
+        if nft list table inet telemt_limit &>/dev/null 2>&1; then
+            local nft_rules; nft_rules=$(nft list chain inet telemt_limit input 2>/dev/null | grep -c "dport")
+            results+=("OK\tnft SYN limiter\t${nft_rules} правил активно")
+        elif [[ -f /usr/local/sbin/telemt-nft-limit.sh ]]; then
+            results+=("WARN\tnft SYN limiter\tскрипт есть, таблица не активна")
+        fi
+        # UFW
+        if ufw status 2>/dev/null | grep -q "Status: active"; then
+            results+=("OK\tUFW фаервол\tactive")
+            # Проверяем что все порты инстансов открыты
+            for n in "${insts[@]}"; do
+                local port="${INSTANCE_PORTS[$n]}"
+                if ! ufw status 2>/dev/null | grep -qE "^${port}/tcp\s+ALLOW"; then
+                    results+=("WARN\tUFW порт инстанса ${n}\t${port}/tcp не открыт")
+                fi
+            done
+        fi
+    fi
+
+    # 7. WireGuard warp (legacy) — должен быть удалён
+    if [[ "$mode" == "full" && -f /etc/wireguard/warp.conf ]]; then
+        results+=("WARN\tWARP legacy\tобнаружен /etc/wireguard/warp.conf — удалите если не используется")
+    fi
+
+    # Печать результата
+    echo ""
+    echo -e "  ${BOLD}${CYAN}── Проверка состояния (${mode}) ──${RESET}"
+    for line in "${results[@]}"; do
+        local status name details
+        status=$(echo -e "$line" | awk -F'\t' '{print $1}')
+        name=$(echo -e "$line" | awk -F'\t' '{print $2}')
+        details=$(echo -e "$line" | awk -F'\t' '{print $3}')
+        case "$status" in
+            OK)   echo -e "  ${GREEN}✓${RESET} ${name}  ${DIM}— ${details}${RESET}" ;;
+            WARN) echo -e "  ${YELLOW}⚠${RESET} ${name}  ${DIM}— ${details}${RESET}" ;;
+            FAIL) echo -e "  ${RED}✗${RESET} ${name}  ${DIM}— ${details}${RESET}" ;;
+        esac
+    done
+    echo ""
+    if [[ $issues -eq 0 ]]; then
+        echo -e "  ${GREEN}${BOLD}Всё работает корректно.${RESET}"
+    else
+        echo -e "  ${YELLOW}${BOLD}Найдено проблем: ${issues}${RESET}"
+    fi
+    echo ""
+    return $issues
+}
+
+# Короткая обёртка для использования после операций
+health_check_brief() { health_check brief; }
+health_check_full()  { health_check full;  }
+
 # ─── Заголовок ────────────────────────────────────────────────────────────────
 draw_header() {
     clear
@@ -351,7 +503,8 @@ menu_proxy() {
         echo -e "  ${YELLOW}${BOLD}7.${RESET} ${YELLOW}Удалить отдельный инстанс${RESET}"
         echo -e "  ${BOLD}8.${RESET} Обновить бинарник telemt"
         echo -e "  ${BOLD}9.${RESET} Просмотр логов"
-        echo -e "  ${BOLD}10.${RESET} ${RED}Удалить telemt полностью${RESET}"
+        echo -e "  ${BOLD}${CYAN}10.${RESET} ${BOLD}${CYAN}Проверка работоспособности${RESET} ${DIM}(полный health check)${RESET}"
+        echo -e "  ${BOLD}11.${RESET} ${RED}Удалить telemt полностью${RESET}"
         echo -e "  ${BOLD}0.${RESET} ← Назад"
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
         echo ""
@@ -366,7 +519,8 @@ menu_proxy() {
             7) proxy_remove_single ;;
             8) proxy_update ;;
             9) proxy_logs ;;
-            10) proxy_remove ;;
+            10) draw_header; health_check_full; pause ;;
+            11) proxy_remove ;;
             0|b) return ;;
             *) warn "Неверный пункт"; sleep 1 ;;
         esac
@@ -526,21 +680,110 @@ proxy_single() {
 proxy_update() {
     draw_header
     echo -e "  ${BOLD}Обновление бинарника telemt${RESET}\n"
-    local cur; cur=$(/bin/telemt --version 2>&1 || echo "неизвестна")
-    info "Текущая версия: ${BOLD}$cur${RESET}"
+    local ver_before; ver_before=$(/bin/telemt --version 2>&1 | head -1 || echo "неизвестна")
+    info "Текущая версия: ${BOLD}${ver_before}${RESET}"
     echo ""
     read -rp "  Скачать и установить новую версию? [y/N]: " ans
     [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
     echo ""
-    info "Скачивание..."
+
+    # 1) Бэкап старого бинарника
+    if [[ -f /bin/telemt ]]; then
+        cp /bin/telemt "/tmp/telemt.backup.$(date +%s)" 2>/dev/null && \
+            info "Бэкап старого бинарника: /tmp/telemt.backup.$(date +%s)"
+    fi
+
+    # 2) Останавливаем инстансы
+    info "Остановка инстансов..."
     local insts; read -ra insts <<< "$(active_instances)"
     for n in "${insts[@]}"; do systemctl stop "telemt${n}" 2>/dev/null || true; done
-    cd /tmp && wget -qO- \
-        "https://github.com/telemt/telemt/releases/latest/download/telemt-x86_64-linux-gnu.tar.gz" \
-        | tar -xz
+
+    # 3) Скачивание
+    info "Скачивание новой версии..."
+    cd /tmp
+    if ! wget -qO- "https://github.com/telemt/telemt/releases/latest/download/telemt-x86_64-linux-gnu.tar.gz" | tar -xz; then
+        err "Не удалось скачать новую версию"
+        info "Восстанавливаем старые инстансы..."
+        for n in "${insts[@]}"; do systemctl start "telemt${n}" 2>/dev/null || true; done
+        pause; return
+    fi
     mv /tmp/telemt /bin/telemt && chmod +x /bin/telemt
-    for n in "${insts[@]}"; do systemctl start "telemt${n}" 2>/dev/null || true; done
-    ok "Обновлено: $(/bin/telemt --version 2>&1)"
+    local ver_after; ver_after=$(/bin/telemt --version 2>&1 | head -1 || echo "?")
+
+    # 4) Сравнение версий
+    echo ""
+    if [[ "$ver_before" == "$ver_after" ]]; then
+        info "Версия не изменилась: ${BOLD}${ver_after}${RESET}"
+    else
+        ok "Обновлено: ${DIM}${ver_before}${RESET} → ${BOLD}${ver_after}${RESET}"
+    fi
+
+    # 5) Валидация конфигов через тестовый запуск (telemt не имеет --check-config,
+    #    но запускается с ошибкой если конфиг битый — поэтому смотрим journalctl
+    #    первые 5 секунд после рестарта каждого инстанса)
+    echo ""
+    info "Проверка совместимости конфигов с новой версией..."
+    local broken=()
+    for n in "${insts[@]}"; do
+        # Чистим логи перед рестартом, чтобы видеть только новые
+        systemctl reset-failed "telemt${n}" 2>/dev/null || true
+        local before_ts; before_ts=$(date +%s)
+        systemctl start "telemt${n}" 2>/dev/null || true
+        sleep 3
+
+        # Проверяем что сервис запустился И не упал в первые 3 секунды
+        local st; st=$(systemctl is-active "telemt${n}" 2>/dev/null)
+        if [[ "$st" != "active" ]]; then
+            broken+=("telemt${n}")
+            err "telemt${n} не запустился"
+            # Показываем ошибки из логов
+            echo -e "  ${DIM}Логи (последние ошибки):${RESET}"
+            journalctl -u "telemt${n}" --since "@${before_ts}" 2>/dev/null \
+                | grep -iE "error|fatal|panic|fail" | head -5 | sed 's/^/    /'
+        else
+            # Проверим что нет ошибок в логах с момента старта
+            local errors_count; errors_count=$(journalctl -u "telemt${n}" --since "@${before_ts}" 2>/dev/null \
+                | grep -ciE "error|fatal|panic" || echo 0)
+            if [[ "$errors_count" -gt 0 ]]; then
+                warn "telemt${n}: active, но в логах ${errors_count} ошибок — проверьте"
+            else
+                ok "telemt${n}: запущен, ошибок в логах нет"
+            fi
+        fi
+    done
+
+    # 6) Если есть проблемы — предложить откат
+    if [[ ${#broken[@]} -gt 0 ]]; then
+        echo ""
+        err "Сломанные инстансы: ${broken[*]}"
+        warn "Возможные причины: формат конфига изменился, нужно скорректировать /etc/telemt/telemt*.toml"
+        echo ""
+        local backup; backup=$(ls -t /tmp/telemt.backup.* 2>/dev/null | head -1)
+        if [[ -n "$backup" ]]; then
+            info "Доступен бэкап: ${backup}"
+            read -rp "  Откатить к старой версии? [y/N]: " roll
+            if [[ "${roll,,}" =~ ^(y|yes|д|да)$ ]]; then
+                cp "$backup" /bin/telemt && chmod +x /bin/telemt
+                for n in "${insts[@]}"; do systemctl restart "telemt${n}" 2>/dev/null || true; done
+                ok "Откат выполнен — ${ver_before}"
+            fi
+        fi
+    fi
+
+    # 7) Если есть VLESS upstream — проверим что xray ещё работает (он от telemt не зависит,
+    #    но на всякий случай покажем статус)
+    if [[ -f /etc/telemt-vless/config.json ]]; then
+        echo ""
+        info "Проверка зависимых компонентов..."
+        if systemctl is-active --quiet telemt-vless; then
+            ok "VLESS upstream работает (xray active)"
+        else
+            warn "VLESS upstream не активен — telemt не сможет подключаться к Telegram"
+        fi
+    fi
+
+    # 8) Полный health check
+    health_check_full
     pause
 }
 
@@ -952,6 +1195,7 @@ SERVICE
     else
         warn "API ещё не ответил. Получите ссылку позже из главного меню."
     fi
+    health_check_brief
     pause
 }
 
@@ -1016,6 +1260,7 @@ proxy_remove_single() {
     ok "Инстанс ${BOLD}#${n}${RESET} полностью удалён"
     local remaining; read -ra remaining <<< "$(active_instances)"
     info "Оставшиеся инстансы: ${remaining[*]:-(нет)}"
+    health_check_brief
     pause
 }
 
@@ -1228,6 +1473,7 @@ keepalive_apply() {
 
     netconf_write true "$bbr" "$t" "$i" "$p"
     ok "Применено: keepalive time=$t intvl=$i probes=$p"
+    health_check_brief
     pause
 }
 
@@ -1248,6 +1494,7 @@ keepalive_off() {
               net.ipv4.tcp_keepalive_intvl=75  \
               net.ipv4.tcp_keepalive_probes=9 > /dev/null 2>&1
     ok "Keepalive отключён (дефолты ядра)"
+    health_check_brief
     pause
 }
 
@@ -1282,6 +1529,7 @@ bbr_on() {
     cc=$(sysctl -n net.ipv4.tcp_congestion_control)
     qdisc=$(sysctl -n net.core.default_qdisc)
     ok "BBR включён: congestion=${BOLD}${cc}${RESET} qdisc=${BOLD}${qdisc}${RESET}"
+    health_check_brief
     pause
 }
 
@@ -1300,6 +1548,7 @@ bbr_off() {
     sysctl -w net.core.default_qdisc=fq_codel \
               net.ipv4.tcp_congestion_control=cubic > /dev/null 2>&1
     ok "BBR отключён (cubic + fq_codel)"
+    health_check_brief
     pause
 }
 
@@ -1459,6 +1708,7 @@ nft_apply_rules() {
     else
         err "Ошибка применения правил"
     fi
+    health_check_brief
     pause
 }
 
@@ -1498,6 +1748,7 @@ nft_change_params() {
     sed -i "s|^METER_TIMEOUT=.*|METER_TIMEOUT=\"${new_timeout}\"|" /usr/local/sbin/telemt-nft-limit.sh
     ok "Параметры обновлены в скрипте"
     /usr/local/sbin/telemt-nft-limit.sh && ok "Правила применены" || err "Ошибка"
+    health_check_brief
     pause
 }
 
@@ -1519,6 +1770,7 @@ nft_disable_temp() {
     read -rp "  Отключить? [y/N]: " ans
     [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
     nft delete table inet telemt_limit 2>/dev/null && ok "Таблица удалена" || warn "Таблица не существовала"
+    health_check_brief
     pause
 }
 
@@ -1535,6 +1787,7 @@ nft_remove() {
     nft delete table inet telemt_limit 2>/dev/null || true
     systemctl daemon-reload
     ok "nft limiter удалён"
+    health_check_brief
     pause
 }
 
@@ -1660,6 +1913,7 @@ PYEOF
             systemctl restart "telemt${n}" 2>/dev/null && ok "telemt${n} перезапущен" || err "Ошибка"
         done
     fi
+    health_check_brief
     pause
 }
 
@@ -1697,6 +1951,7 @@ PYEOF
             systemctl restart "telemt${n}" 2>/dev/null && ok "telemt${n} перезапущен" || err "Ошибка"
         done
     fi
+    health_check_brief
     pause
 }
 
@@ -1796,6 +2051,7 @@ open(path, "w").writelines(lines)
 print(f"Вставлено {len(block)} строк")
 PYEOF
     ufw reload && ok "UFW перезагружен с rate-limit" || err "Ошибка ufw reload"
+    health_check_brief
     pause
 }
 
@@ -1823,6 +2079,7 @@ PYEOF
     ufw reload && ok "UFW перезагружен" || err "Ошибка"
     rm -f /etc/modules-load.d/xt_recent.conf
     ok "xt_recent убран из автозагрузки"
+    health_check_brief
     pause
 }
 
@@ -1929,6 +2186,7 @@ custom_domain_set() {
     chmod 644 "$CUSTOM_DOMAIN_FILE"
     ok "Сохранён домен: ${BOLD}${inp_dom}${RESET}"
     info "Теперь в ссылках tg://proxy будет использоваться этот домен."
+    health_check_brief
     pause
 }
 
@@ -1985,12 +2243,29 @@ custom_domain_remove() {
 
     rm -f "$CUSTOM_DOMAIN_FILE"
     ok "Кастомный домен удалён"
+    health_check_brief
     pause
 }
 
 # ════════════════════════════════════════════════════════════════════════
 #  7. VLESS Reality upstream (xray-core SOCKS5)
 # ════════════════════════════════════════════════════════════════════════
+
+# Получить тип ссылки (single | subscription)
+vless_link_type() {
+    cat "$VLESS_CONFIG_DIR/type.txt" 2>/dev/null || echo "single"
+}
+
+# Получить стратегию (только для subscription)
+vless_strategy() {
+    cat "$VLESS_CONFIG_DIR/strategy.txt" 2>/dev/null || echo "leastPing"
+}
+
+# Кол-во узлов в текущем конфиге
+vless_node_count() {
+    [[ -f "$VLESS_CONFIG_DIR/nodes.txt" ]] && wc -l < "$VLESS_CONFIG_DIR/nodes.txt" || echo 0
+}
+
 menu_vless() {
     while true; do
         draw_header
@@ -1998,49 +2273,61 @@ menu_vless() {
         echo -e "  Статус: $(status_vless)"
         echo ""
 
-        # Подробности
-        local link_info="нет"
-        local service_status="не установлен"
-        local port_status="нет"
-        local upstream_status="нет"
+        local link_type service_status port_status upstream_status nodes
+        link_type=$(vless_link_type)
+        nodes=$(vless_node_count)
 
-        if [[ -f "$VLESS_CONFIG_DIR/link.txt" ]]; then
-            local raw_link host port
-            raw_link=$(cat "$VLESS_CONFIG_DIR/link.txt" 2>/dev/null | tr -d '\n')
-            # Извлекаем хост:порт через Python
-            host=$(VL="$raw_link" python3 -c "import os,urllib.parse as up;p=up.urlparse(os.environ['VL']);print(f'{p.hostname}:{p.port}')" 2>/dev/null)
-            [[ -n "$host" ]] && link_info="${host}"
-        fi
+        service_status="${DIM}не установлен${RESET}"
         if systemctl is-active --quiet telemt-vless 2>/dev/null; then
             service_status="${GREEN}active${RESET}"
         elif [[ -f /etc/systemd/system/telemt-vless.service ]]; then
             service_status="${RED}inactive${RESET}"
         fi
-        if ss -tlnp 2>/dev/null | grep -q "127.0.0.1:40000"; then
-            port_status="${GREEN}127.0.0.1:40000${RESET}"
-        fi
+        port_status="${DIM}нет${RESET}"
+        ss -tlnp 2>/dev/null | grep -q "127.0.0.1:40000" && port_status="${GREEN}слушает${RESET}"
+        upstream_status="${DIM}нет${RESET}"
         for f in /etc/telemt/telemt*.toml; do
             [[ -f "$f" ]] && grep -q "127.0.0.1:40000" "$f" 2>/dev/null && upstream_status="${GREEN}прицеплен${RESET}" && break
         done
 
-        echo -e "  ${DIM}xray-core (telemt-vless):${RESET}   ${service_status}"
-        echo -e "  ${DIM}VLESS-сервер:${RESET}              ${link_info}"
-        echo -e "  ${DIM}SOCKS5 порт:${RESET}               ${port_status}"
-        echo -e "  ${DIM}В конфигах telemt:${RESET}         ${upstream_status}"
+        echo -e "  ${DIM}Тип:${RESET}              ${BOLD}${link_type}${RESET}"
+        if [[ "$link_type" == "subscription" ]]; then
+            echo -e "  ${DIM}Стратегия:${RESET}        ${BOLD}$(vless_strategy)${RESET}"
+            echo -e "  ${DIM}Узлов в конфиге:${RESET}  ${BOLD}${nodes}${RESET}"
+            if [[ -f /etc/systemd/system/telemt-vless-refresh.timer ]] && systemctl is-active --quiet telemt-vless-refresh.timer 2>/dev/null; then
+                local next_run; next_run=$(systemctl list-timers telemt-vless-refresh.timer --no-pager 2>/dev/null | grep telemt-vless | awk '{print $1, $2}')
+                echo -e "  ${DIM}Авто-обновление:${RESET}  ${GREEN}вкл${RESET} (следующее: ${next_run:-?})"
+            else
+                echo -e "  ${DIM}Авто-обновление:${RESET}  ${YELLOW}выкл${RESET}"
+            fi
+        fi
+        echo -e "  ${DIM}xray service:${RESET}     ${service_status}"
+        echo -e "  ${DIM}SOCKS5 порт:${RESET}      ${port_status}"
+        echo -e "  ${DIM}В конфигах telemt:${RESET} ${upstream_status}"
         echo ""
 
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
         if [[ ! -f /usr/local/bin/xray ]] || [[ ! -f "$VLESS_CONFIG_DIR/config.json" ]]; then
-            echo -e "  ${BOLD}1.${RESET} Установить VLESS Reality (xray + конфиг)"
+            echo -e "  ${BOLD}1.${RESET} Установить VLESS Reality (одна ссылка или подписка)"
         else
-            echo -e "  ${BOLD}1.${RESET} Запустить xray (если выключен)"
+            echo -e "  ${BOLD}1.${RESET} Запустить xray"
             echo -e "  ${BOLD}2.${RESET} Остановить xray"
-            echo -e "  ${BOLD}3.${RESET} Изменить vless:// ссылку"
-            echo -e "  ${BOLD}4.${RESET} Прицепить к telemt (добавить upstream)"
-            echo -e "  ${BOLD}5.${RESET} ${YELLOW}Отцепить от telemt${RESET} (telemt пойдёт напрямую)"
-            echo -e "  ${BOLD}6.${RESET} Тест: какой IP виден через VLESS"
-            echo -e "  ${BOLD}7.${RESET} Показать логи xray"
-            echo -e "  ${BOLD}8.${RESET} ${RED}Удалить полностью${RESET}"
+            echo -e "  ${BOLD}3.${RESET} Изменить vless ссылку / подписку"
+            if [[ "$link_type" == "subscription" ]]; then
+                echo -e "  ${BOLD}4.${RESET} ${BOLD}${CYAN}Обновить подписку сейчас${RESET}"
+                echo -e "  ${BOLD}5.${RESET} Включить / выключить авто-обновление"
+                echo -e "  ${BOLD}6.${RESET} Сменить стратегию (leastPing/roundRobin/random)"
+                echo -e "  ${BOLD}7.${RESET} Показать узлы из подписки"
+                echo -e "  ${BOLD}8.${RESET} Прицепить к telemt / отцепить"
+                echo -e "  ${BOLD}9.${RESET} Тест: IP через VLESS"
+                echo -e "  ${BOLD}10.${RESET} Логи xray"
+                echo -e "  ${BOLD}11.${RESET} ${RED}Удалить полностью${RESET}"
+            else
+                echo -e "  ${BOLD}4.${RESET} Прицепить к telemt / отцепить"
+                echo -e "  ${BOLD}5.${RESET} Тест: IP через VLESS"
+                echo -e "  ${BOLD}6.${RESET} Логи xray"
+                echo -e "  ${BOLD}7.${RESET} ${RED}Удалить полностью${RESET}"
+            fi
         fi
         echo -e "  ${BOLD}0.${RESET} ← Назад"
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
@@ -2053,16 +2340,31 @@ menu_vless() {
                 0|b) return ;;
                 *) warn "Неверный пункт"; sleep 1 ;;
             esac
+        elif [[ "$link_type" == "subscription" ]]; then
+            case "$ch" in
+                1)  vless_start ;;
+                2)  vless_stop ;;
+                3)  vless_change_link ;;
+                4)  vless_refresh_now ;;
+                5)  vless_toggle_autorefresh ;;
+                6)  vless_change_strategy ;;
+                7)  vless_show_nodes ;;
+                8)  vless_attach_toggle ;;
+                9)  vless_test ;;
+                10) vless_logs ;;
+                11) vless_remove ;;
+                0|b) return ;;
+                *) warn "Неверный пункт"; sleep 1 ;;
+            esac
         else
             case "$ch" in
                 1) vless_start ;;
                 2) vless_stop ;;
                 3) vless_change_link ;;
-                4) vless_attach ;;
-                5) vless_detach ;;
-                6) vless_test ;;
-                7) vless_logs ;;
-                8) vless_remove ;;
+                4) vless_attach_toggle ;;
+                5) vless_test ;;
+                6) vless_logs ;;
+                7) vless_remove ;;
                 0|b) return ;;
                 *) warn "Неверный пункт"; sleep 1 ;;
             esac
@@ -2070,106 +2372,106 @@ menu_vless() {
     done
 }
 
-vless_ask_link() {
-    # Запрашивает у пользователя vless:// ссылку, валидирует, возвращает через echo
-    local link
-    echo -e "  ${DIM}Пример: vless://uuid@server:443?security=reality&pbk=...&sni=...${RESET}"
+# Запрос ссылки/подписки. echo'ит обратно через stdout: type|link[|strategy]
+vless_ask_link_or_subscription() {
+    echo "  ${BOLD}Тип подключения:${RESET}" >&2
+    echo "  ${GREEN}1${RESET} — одна ${BOLD}vless://${RESET} ссылка" >&2
+    echo "  ${GREEN}2${RESET} — ${BOLD}подписка${RESET} 3x-ui (несколько узлов)" >&2
+    local choice
     while true; do
-        read -rp "  vless:// ссылка: " link
-        if [[ "$link" == vless://*@*:*\?* ]] && [[ "$link" == *security=reality* ]] \
-           && [[ "$link" == *pbk=* ]] && [[ "$link" == *sni=* ]]; then
-            if VL="$link" python3 -c "import os,urllib.parse as up,sys;p=up.urlparse(os.environ['VL']);q=up.parse_qs(p.query);sys.exit(0 if (p.username and p.hostname and p.port and 'pbk' in q and 'sni' in q) else 1)" 2>/dev/null; then
-                echo "$link"
-                return 0
-            fi
-        fi
-        warn "Неверный формат ссылки" >&2
-        read -rp "  Попробовать ещё раз? [Y/n]: " retry >&2
-        if [[ "${retry,,}" =~ ^(n|no)$ ]]; then
-            return 1
-        fi
+        read -rp "  Тип [1/2]: " choice >&2
+        case "$choice" in 1|2) break ;; *) warn "1 или 2" >&2 ;; esac
     done
-}
 
-vless_generate_config() {
-    # Аргумент: vless ссылка. Создаёт /etc/telemt-vless/config.json
-    local link="$1"
-    mkdir -p "$VLESS_CONFIG_DIR"
-    VL="$link" python3 /dev/stdin << 'PYV'
-import os, json, urllib.parse as up
-url = os.environ['VL']
-p = up.urlparse(url)
-q = {k: v[0] for k, v in up.parse_qs(p.query).items()}
-cfg = {
-    "log": {"loglevel": "warning"},
-    "inbounds": [{
-        "tag": "socks-in",
-        "listen": "127.0.0.1",
-        "port": 40000,
-        "protocol": "socks",
-        "settings": {"auth": "noauth", "udp": True, "ip": "127.0.0.1"},
-        "sniffing": {"enabled": False}
-    }],
-    "outbounds": [{
-        "tag": "vless-reality",
-        "protocol": "vless",
-        "settings": {
-            "vnext": [{
-                "address": p.hostname, "port": p.port or 443,
-                "users": [{"id": p.username, "encryption": "none"}]
-            }]
-        },
-        "streamSettings": {
-            "network": q.get("type", "tcp"),
-            "security": "reality",
-            "realitySettings": {
-                "show": False,
-                "fingerprint": q.get("fp", "chrome"),
-                "serverName": q.get("sni", ""),
-                "publicKey": q.get("pbk", ""),
-                "shortId": q.get("sid", ""),
-                "spiderX": q.get("spx", "/")
-            }
-        }
-    }, {"tag": "direct", "protocol": "freedom"}],
-    "routing": {
-        "domainStrategy": "AsIs",
-        "rules": [{"type": "field", "inboundTag": ["socks-in"], "outboundTag": "vless-reality"}]
-    }
-}
-flow = q.get("flow", "")
-if flow:
-    cfg["outbounds"][0]["settings"]["vnext"][0]["users"][0]["flow"] = flow
-with open("/etc/telemt-vless/config.json", "w") as f:
-    json.dump(cfg, f, indent=2)
-with open("/etc/telemt-vless/link.txt", "w") as f:
-    f.write(url + "\n")
-PYV
-    # Создаём пользователя xray если ещё нет (на случай если поставили из старой версии)
-    if ! id xray &>/dev/null; then
-        useradd --system --shell /usr/sbin/nologin --no-create-home --user-group xray 2>/dev/null \
-        || useradd --system --shell /usr/sbin/nologin --no-create-home xray 2>/dev/null || true
+    if [[ "$choice" == "1" ]]; then
+        local lnk
+        while true; do
+            read -rp "  vless:// ссылка: " lnk >&2
+            if [[ "$lnk" == vless://*@*:*\?* ]] && [[ "$lnk" == *security=reality* ]] \
+               && [[ "$lnk" == *pbk=* ]] && [[ "$lnk" == *sni=* ]]; then
+                if VL="$lnk" python3 -c "import os,urllib.parse as up,sys;p=up.urlparse(os.environ['VL']);q=up.parse_qs(p.query);sys.exit(0 if (p.username and p.hostname and p.port and 'pbk' in q and 'sni' in q) else 1)" 2>/dev/null; then
+                    echo "single|${lnk}"
+                    return 0
+                fi
+            fi
+            warn "Неверный формат ссылки" >&2
+            read -rp "  Попробовать ещё? [Y/n]: " r >&2
+            [[ "${r,,}" =~ ^(n|no)$ ]] && return 1
+        done
+    else
+        local sub
+        while true; do
+            read -rp "  URL подписки: " sub >&2
+            if [[ "$sub" =~ ^https?:// ]]; then
+                local nodes_count
+                info "Получение и парсинг подписки..." >&2
+                nodes_count=$(SUB_URL="$sub" python3 << 'PYT'
+import os, sys, urllib.request, base64, ssl
+url = os.environ["SUB_URL"]
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+try:
+    req = urllib.request.Request(url, headers={"User-Agent": "v2rayN/6.0"})
+    with urllib.request.urlopen(req, context=ctx, timeout=15) as r:
+        data = r.read().decode("utf-8", errors="ignore").strip()
+except Exception as e:
+    print(f"ERROR: {e}", file=sys.stderr); sys.exit(1)
+decoded = data
+try:
+    pad = "=" * (-len(data) % 4)
+    decoded = base64.b64decode(data + pad).decode("utf-8", errors="ignore")
+except Exception: pass
+nodes = [ln.strip() for ln in decoded.split("\n") if ln.strip().startswith("vless://") and "security=reality" in ln]
+if not nodes:
+    print("ERROR: VLESS Reality узлы не найдены", file=sys.stderr); sys.exit(2)
+print(len(nodes))
+PYT
+)
+                if [[ -n "$nodes_count" && "$nodes_count" =~ ^[0-9]+$ ]]; then
+                    ok "Подписка работает: найдено ${nodes_count} узлов" >&2
+                    # Выбор стратегии
+                    echo "" >&2
+                    echo "  ${BOLD}Стратегия балансировки:${RESET}" >&2
+                    echo "  ${GREEN}1${RESET} — leastPing (рекомендуется)" >&2
+                    echo "  ${GREEN}2${RESET} — roundRobin" >&2
+                    echo "  ${GREEN}3${RESET} — random" >&2
+                    local stratch strat
+                    while true; do
+                        read -rp "  Стратегия [1/2/3]: " stratch >&2
+                        case "$stratch" in
+                            1|"") strat="leastPing"; break ;;
+                            2)    strat="roundRobin"; break ;;
+                            3)    strat="random"; break ;;
+                            *)    warn "1-3" >&2 ;;
+                        esac
+                    done
+                    echo "subscription|${sub}|${strat}"
+                    return 0
+                fi
+                warn "Не удалось извлечь узлы. Формат подписки base64-plain?" >&2
+            else
+                warn "URL должен начинаться с http:// или https://" >&2
+            fi
+            read -rp "  Попробовать ещё? [Y/n]: " r >&2
+            [[ "${r,,}" =~ ^(n|no)$ ]] && return 1
+        done
     fi
-    # Права: xray-пользователь должен читать конфиг
-    chown -R xray:xray /etc/telemt-vless 2>/dev/null || chown -R root:root /etc/telemt-vless
-    chmod 750 /etc/telemt-vless
-    chmod 640 /etc/telemt-vless/config.json /etc/telemt-vless/link.txt 2>/dev/null || true
 }
 
 vless_install() {
     draw_header
     echo -e "  ${BOLD}Установка VLESS Reality${RESET}\n"
-    echo -e "  ${DIM}Будет скачан xray-core с GitHub releases, создан systemd-сервис,${RESET}"
-    echo -e "  ${DIM}и прописан upstream в конфиги telemt.${RESET}"
-    echo ""
     read -rp "  Продолжить? [Y/n]: " ans
     [[ "${ans,,}" =~ ^(n|no)$ ]] && return
 
-    # 1) Запрашиваем ссылку
-    local link
-    link=$(vless_ask_link) || { info "Отменено"; pause; return; }
+    # 1) Запрашиваем ссылку или подписку
+    local got
+    got=$(vless_ask_link_or_subscription) || { info "Отменено"; pause; return; }
+    local link_type link strategy
+    IFS='|' read -r link_type link strategy <<< "$got"
 
-    # 2) Скачиваем xray-core если ещё нет
+    # 2) Скачиваем xray если ещё нет
     if [[ ! -f /usr/local/bin/xray ]]; then
         info "Скачивание xray-core..."
         local arch xray_arch xray_version xray_url
@@ -2183,7 +2485,6 @@ vless_install() {
         xray_version=$(curl -s --max-time 10 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | grep tag_name | cut -d \" -f 4)
         [[ -z "$xray_version" ]] && { err "Не получили версию"; pause; return; }
         xray_url="https://github.com/XTLS/Xray-core/releases/download/${xray_version}/Xray-linux-${xray_arch}.zip"
-
         apt-get install -y unzip curl >/dev/null 2>&1
         cd /tmp
         if ! curl -fsSL --max-time 120 -o /tmp/xray.zip "$xray_url"; then
@@ -2196,18 +2497,30 @@ vless_install() {
         ok "xray-core $xray_version установлен"
     fi
 
-    # 3) Конфиг
-    vless_generate_config "$link"
-    ok "Конфиг создан"
+    # 3) Установка генератора конфига (тот же скрипт что и install.sh использует)
+    install_xray_refresh_helper
+    ok "Генератор конфига установлен"
 
-    # Валидация
-    if /usr/local/bin/xray -test -config /etc/telemt-vless/config.json 2>&1 | grep -q "Configuration OK"; then
-        ok "Конфиг xray валиден"
-    else
-        warn "xray -test не прошёл, но продолжаем"
+    # 4) Сохраняем link/type/strategy
+    mkdir -p "$VLESS_CONFIG_DIR"
+    echo "$link" > "$VLESS_CONFIG_DIR/link.txt"
+    echo "$link_type" > "$VLESS_CONFIG_DIR/type.txt"
+    [[ -n "$strategy" ]] && echo "$strategy" > "$VLESS_CONFIG_DIR/strategy.txt"
+
+    # 5) Создаём xray user если нет
+    if ! id xray &>/dev/null; then
+        useradd --system --shell /usr/sbin/nologin --no-create-home --user-group xray 2>/dev/null \
+        || useradd --system --shell /usr/sbin/nologin --no-create-home xray 2>/dev/null || true
     fi
 
-    # 4) systemd
+    # 6) Генерация конфига
+    if ! /usr/local/sbin/telemt-vless-refresh; then
+        err "Не удалось сгенерировать конфиг"
+        pause; return
+    fi
+    ok "Конфиг создан"
+
+    # 7) systemd-сервис
     cat > /etc/systemd/system/telemt-vless.service << 'SVC'
 [Unit]
 Description=xray-core VLESS Reality client (telemt SOCKS5 upstream)
@@ -2235,31 +2548,70 @@ SVC
     systemctl enable --now telemt-vless 2>&1 | grep -v "Created symlink" || true
     sleep 3
 
-    if systemctl is-active --quiet telemt-vless; then
-        ok "Сервис telemt-vless запущен"
-    else
-        err "Сервис не запустился"
-        warn "Логи: journalctl -u telemt-vless -n 30"
-        pause; return
+    # 8) Если подписка — спросить про авто-обновление
+    if [[ "$link_type" == "subscription" ]]; then
+        read -rp "  Включить авто-обновление подписки (каждые 6ч)? [Y/n]: " auto
+        if [[ ! "${auto,,}" =~ ^(n|no)$ ]]; then
+            install_xray_refresh_timer_helper
+            ok "Авто-обновление включено"
+        fi
     fi
 
-    # 5) Прицепляем к telemt
-    echo ""
-    read -rp "  Прицепить VLESS к telemt (добавить upstream в конфиги)? [Y/n]: " ans
-    [[ ! "${ans,,}" =~ ^(n|no)$ ]] && vless_attach_silent
+    # 9) Прицепить к telemt?
+    read -rp "  Прицепить VLESS к telemt (добавить upstream)? [Y/n]: " att
+    [[ ! "${att,,}" =~ ^(n|no)$ ]] && vless_attach_silent
+
+    health_check_brief
     pause
+}
+
+# Установка скрипта-генератора (для случая когда mytelemtinfo запускают без install.sh)
+install_xray_refresh_helper() {
+    if [[ -f /usr/local/sbin/telemt-vless-refresh ]]; then
+        return 0  # уже установлен
+    fi
+    # Скачиваем из репо
+    if curl -fsSL "https://raw.githubusercontent.com/vaalaav/telemt-install/main/telemt-vless-refresh.sh?v=$(date +%s)" -o /usr/local/sbin/telemt-vless-refresh 2>/dev/null; then
+        chmod +x /usr/local/sbin/telemt-vless-refresh
+    else
+        warn "Не удалось скачать telemt-vless-refresh — нужно переустановить через install.sh"
+    fi
+}
+
+install_xray_refresh_timer_helper() {
+    cat > /etc/systemd/system/telemt-vless-refresh.service << 'RUNIT'
+[Unit]
+Description=Refresh telemt VLESS subscription
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/telemt-vless-refresh
+RUNIT
+    cat > /etc/systemd/system/telemt-vless-refresh.timer << 'TUNIT'
+[Unit]
+Description=Refresh VLESS subscription every 6 hours
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TUNIT
+    systemctl daemon-reload
+    systemctl enable --now telemt-vless-refresh.timer 2>&1 | grep -v "Created symlink" || true
 }
 
 vless_start() {
     draw_header
-    info "Запуск xray (telemt-vless)..."
+    info "Запуск xray..."
     systemctl start telemt-vless 2>&1 || true
     sleep 2
-    if systemctl is-active --quiet telemt-vless; then
-        ok "xray активен"
-    else
-        err "Не удалось запустить"
-    fi
+    systemctl is-active --quiet telemt-vless && ok "xray active" || err "не запустился"
+    health_check_brief
     pause
 }
 
@@ -2270,36 +2622,155 @@ vless_stop() {
     [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
     systemctl stop telemt-vless 2>/dev/null
     ok "xray остановлен"
+    health_check_brief
     pause
 }
 
 vless_change_link() {
     draw_header
-    echo -e "  ${BOLD}Изменение vless:// ссылки${RESET}\n"
+    echo -e "  ${BOLD}Изменение vless ссылки или подписки${RESET}\n"
     if [[ -f "$VLESS_CONFIG_DIR/link.txt" ]]; then
-        echo -e "  ${DIM}Текущая ссылка:${RESET}"
-        echo -e "  ${DIM}$(head -1 "$VLESS_CONFIG_DIR/link.txt")${RESET}"
+        echo -e "  ${DIM}Текущая ссылка ($(vless_link_type)):${RESET}"
+        echo -e "  ${DIM}$(head -c 80 "$VLESS_CONFIG_DIR/link.txt")...${RESET}"
         echo ""
     fi
-    local link
-    link=$(vless_ask_link) || { info "Отменено"; pause; return; }
 
-    vless_generate_config "$link"
-    if /usr/local/bin/xray -test -config /etc/telemt-vless/config.json 2>&1 | grep -q "Configuration OK"; then
-        ok "Новый конфиг валиден"
+    local got
+    got=$(vless_ask_link_or_subscription) || { info "Отменено"; pause; return; }
+    local link_type link strategy
+    IFS='|' read -r link_type link strategy <<< "$got"
+
+    # Обновляем файлы
+    echo "$link" > "$VLESS_CONFIG_DIR/link.txt"
+    echo "$link_type" > "$VLESS_CONFIG_DIR/type.txt"
+    if [[ "$link_type" == "subscription" ]]; then
+        echo "$strategy" > "$VLESS_CONFIG_DIR/strategy.txt"
     else
-        warn "xray -test не прошёл"
+        rm -f "$VLESS_CONFIG_DIR/strategy.txt"
     fi
-    systemctl restart telemt-vless
-    sleep 2
-    if systemctl is-active --quiet telemt-vless; then
-        ok "xray перезапущен с новой ссылкой"
-        # Перезапускаем telemt чтобы он переподключился
+
+    # Регенерация
+    info "Регенерация конфига xray..."
+    if /usr/local/sbin/telemt-vless-refresh; then
+        ok "Конфиг обновлён"
+        # Перезапустить telemt чтобы переподключился через свежий upstream
         local insts; read -ra insts <<< "$(active_instances)"
         for n in "${insts[@]}"; do systemctl restart "telemt${n}" 2>/dev/null; done
+
+        # Если подписка - предложить таймер если ещё не настроен
+        if [[ "$link_type" == "subscription" ]] && [[ ! -f /etc/systemd/system/telemt-vless-refresh.timer ]]; then
+            read -rp "  Включить авто-обновление? [Y/n]: " auto
+            [[ ! "${auto,,}" =~ ^(n|no)$ ]] && install_xray_refresh_timer_helper && ok "Авто-обновление включено"
+        fi
     else
-        err "xray не запустился — откатите ссылку через этот же пункт"
+        err "Не удалось обновить конфиг"
     fi
+    health_check_brief
+    pause
+}
+
+vless_refresh_now() {
+    draw_header
+    echo -e "  ${BOLD}Обновление подписки${RESET}\n"
+    info "Скачивание свежего списка узлов..."
+    if /usr/local/sbin/telemt-vless-refresh; then
+        ok "Подписка обновлена. Узлов: $(vless_node_count)"
+    else
+        err "Не удалось обновить подписку"
+    fi
+    health_check_brief
+    pause
+}
+
+vless_toggle_autorefresh() {
+    draw_header
+    echo -e "  ${BOLD}Авто-обновление подписки${RESET}\n"
+    if systemctl is-active --quiet telemt-vless-refresh.timer 2>/dev/null; then
+        warn "Автообновление сейчас ВКЛЮЧЕНО (каждые 6 часов)"
+        read -rp "  Выключить? [y/N]: " a
+        if [[ "${a,,}" =~ ^(y|yes|д|да)$ ]]; then
+            systemctl disable --now telemt-vless-refresh.timer 2>/dev/null
+            ok "Авто-обновление выключено"
+        fi
+    else
+        info "Авто-обновление сейчас ВЫКЛЮЧЕНО"
+        read -rp "  Включить (каждые 6 часов)? [Y/n]: " a
+        if [[ ! "${a,,}" =~ ^(n|no)$ ]]; then
+            install_xray_refresh_timer_helper
+            ok "Авто-обновление включено"
+        fi
+    fi
+    pause
+}
+
+vless_change_strategy() {
+    draw_header
+    echo -e "  ${BOLD}Смена стратегии балансировки${RESET}\n"
+    local cur; cur=$(vless_strategy)
+    echo -e "  Текущая: ${BOLD}${cur}${RESET}"
+    echo ""
+    echo -e "  ${GREEN}1${RESET} — leastPing (рекомендуется)"
+    echo -e "  ${GREEN}2${RESET} — roundRobin"
+    echo -e "  ${GREEN}3${RESET} — random"
+    local ch new
+    read -rp "  Выбрать [1/2/3]: " ch
+    case "$ch" in
+        1) new="leastPing" ;;
+        2) new="roundRobin" ;;
+        3) new="random" ;;
+        *) info "Отменено"; pause; return ;;
+    esac
+    echo "$new" > "$VLESS_CONFIG_DIR/strategy.txt"
+    if /usr/local/sbin/telemt-vless-refresh; then
+        ok "Стратегия изменена на ${new}, конфиг применён"
+    else
+        err "Ошибка применения"
+    fi
+    health_check_brief
+    pause
+}
+
+vless_show_nodes() {
+    draw_header
+    echo -e "  ${BOLD}Узлы из подписки${RESET}\n"
+    if [[ -f "$VLESS_CONFIG_DIR/nodes.txt" ]]; then
+        cat "$VLESS_CONFIG_DIR/nodes.txt" | nl -ba | sed 's/^/  /'
+    else
+        warn "nodes.txt не найден (выполните 'Обновить подписку сейчас')"
+    fi
+    pause
+}
+
+# Прицепить или отцепить — выбор внутри
+vless_attach_toggle() {
+    draw_header
+    echo -e "  ${BOLD}Прицепить / отцепить VLESS к telemt${RESET}\n"
+
+    # Проверим текущее состояние
+    local attached=0 total=0
+    for f in /etc/telemt/telemt*.toml; do
+        [[ ! -f "$f" ]] && continue
+        total=$((total+1))
+        grep -q "127.0.0.1:40000" "$f" 2>/dev/null && attached=$((attached+1))
+    done
+
+    if [[ $attached -eq $total && $total -gt 0 ]]; then
+        info "Сейчас VLESS прицеплен ко всем ${total} инстансам"
+        read -rp "  Отцепить (telemt пойдёт напрямую)? [y/N]: " a
+        [[ "${a,,}" =~ ^(y|yes|д|да)$ ]] && vless_detach_silent
+    elif [[ $attached -eq 0 ]]; then
+        info "VLESS сейчас не прицеплен"
+        read -rp "  Прицепить ко всем ${total} инстансам? [Y/n]: " a
+        [[ ! "${a,,}" =~ ^(n|no)$ ]] && vless_attach_silent
+    else
+        warn "Прицеплен частично: ${attached}/${total}"
+        read -rp "  Привести в единое состояние — [a]прицепить всё / [d]отцепить всё: " a
+        case "${a,,}" in
+            a) vless_attach_silent ;;
+            d) vless_detach_silent ;;
+        esac
+    fi
+    health_check_brief
     pause
 }
 
@@ -2307,9 +2778,7 @@ vless_attach_silent() {
     local count=0
     for f in /etc/telemt/telemt*.toml; do
         [[ ! -f "$f" ]] && continue
-        if grep -q "127.0.0.1:40000" "$f" 2>/dev/null; then
-            continue
-        fi
+        grep -q "127.0.0.1:40000" "$f" 2>/dev/null && continue
         python3 - "$f" << 'PYU'
 import sys, re
 path = sys.argv[1]
@@ -2329,32 +2798,11 @@ PYU
     ok "Прицеплено к ${count} конфигам, инстансы перезапущены"
 }
 
-vless_attach() {
-    draw_header
-    echo -e "  ${BOLD}Прицепить VLESS к telemt${RESET}\n"
-    echo -e "  В конфиги всех инстансов будет добавлен ${BOLD}[[upstreams]]${RESET} → 127.0.0.1:40000"
-    echo -e "  ${DIM}telemt пойдёт к Telegram DC через VLESS-туннель.${RESET}"
-    echo ""
-    read -rp "  Применить и перезапустить инстансы? [Y/n]: " ans
-    [[ "${ans,,}" =~ ^(n|no)$ ]] && return
-    vless_attach_silent
-    pause
-}
-
-vless_detach() {
-    draw_header
-    echo -e "  ${BOLD}Отцепить VLESS от telemt${RESET}\n"
-    warn "Из конфигов будут удалены секции [[upstreams]] — telemt пойдёт напрямую"
-    echo ""
-    read -rp "  Применить? [y/N]: " ans
-    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
-
+vless_detach_silent() {
     local count=0
     for f in /etc/telemt/telemt*.toml; do
         [[ ! -f "$f" ]] && continue
-        if ! grep -q "127.0.0.1:40000" "$f" 2>/dev/null; then
-            continue
-        fi
+        if ! grep -q "127.0.0.1:40000" "$f" 2>/dev/null; then continue; fi
         python3 - "$f" << 'PYU'
 import sys, re
 path = sys.argv[1]
@@ -2371,19 +2819,16 @@ PYU
         systemctl restart "telemt${n}" 2>/dev/null
     done
     ok "Отцеплено от ${count} конфигов, инстансы перезапущены"
-    pause
 }
 
 vless_test() {
     draw_header
     echo -e "  ${BOLD}Тест: какой IP виден через VLESS${RESET}\n"
-
-    info "Прямое соединение (исходящий IP сервера):"
+    info "Прямой запрос:"
     local direct_ip; direct_ip=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null)
     echo -e "  ${BOLD}${direct_ip:-(не удалось)}${RESET}"
-
     echo ""
-    info "Через VLESS SOCKS5 (должен быть IP вашего 3x-ui сервера):"
+    info "Через VLESS SOCKS5:"
     local vless_ip; vless_ip=$(curl -s --max-time 10 --socks5 127.0.0.1:40000 https://api.ipify.org 2>/dev/null)
     if [[ -n "$vless_ip" ]]; then
         echo -e "  ${BOLD}${vless_ip}${RESET}"
@@ -2394,14 +2839,13 @@ vless_test() {
         fi
     else
         err "Запрос через VLESS не прошёл"
-        info "Логи: journalctl -u telemt-vless -n 30"
     fi
     pause
 }
 
 vless_logs() {
     draw_header
-    echo -e "  ${BOLD}Последние логи xray (telemt-vless)${RESET}\n"
+    echo -e "  ${BOLD}Последние логи xray${RESET}\n"
     journalctl -u telemt-vless -n 50 --no-pager
     pause
 }
@@ -2409,50 +2853,37 @@ vless_logs() {
 vless_remove() {
     draw_header
     echo -e "  ${BOLD}${RED}Полное удаление VLESS${RESET}\n"
-    warn "Будут удалены: сервис telemt-vless, конфиги, upstream из telemt"
-    warn "Бинарник /usr/local/bin/xray НЕ удаляется (может использоваться другими сервисами)"
+    warn "Будут удалены: сервис, refresh-timer, конфиги, upstream из telemt"
+    warn "Бинарник /usr/local/bin/xray НЕ удаляется"
     echo ""
     read -rp "  Подтвердить? [y/N]: " ans
     [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
 
-    # Отцепить от telemt
-    for f in /etc/telemt/telemt*.toml; do
-        [[ ! -f "$f" ]] && continue
-        python3 - "$f" << 'PYU'
-import sys, re
-path = sys.argv[1]
-content = open(path).read()
-content = re.sub(r'\n*\[\[upstreams\]\][^\[]*', '\n', content, flags=re.DOTALL)
-content = re.sub(r'\n{3,}', '\n\n', content)
-open(path, 'w').write(content)
-PYU
-    done
-    ok "Upstream-секции убраны из конфигов"
-
-    # Остановить сервис
+    vless_detach_silent
     systemctl stop telemt-vless 2>/dev/null || true
     systemctl disable telemt-vless 2>/dev/null || true
+    systemctl stop telemt-vless-refresh.timer 2>/dev/null || true
+    systemctl disable telemt-vless-refresh.timer 2>/dev/null || true
     rm -f /etc/systemd/system/telemt-vless.service
+    rm -f /etc/systemd/system/telemt-vless-refresh.service
+    rm -f /etc/systemd/system/telemt-vless-refresh.timer
+    rm -f /usr/local/sbin/telemt-vless-refresh
     rm -rf /etc/telemt-vless
     systemctl daemon-reload
 
-    # Удаляем пользователя xray, если он не используется другими сервисами
     if id xray &>/dev/null && ! pgrep -u xray &>/dev/null; then
         userdel xray 2>/dev/null && info "Удалён системный пользователь xray" || true
     fi
 
-    ok "Сервис, конфиги и пользователь VLESS удалены"
+    ok "VLESS компоненты удалены"
 
-    # Перезапуск telemt
     local insts; read -ra insts <<< "$(active_instances)"
-    for n in "${insts[@]}"; do
-        systemctl restart "telemt${n}" 2>/dev/null
-    done
-    ok "Инстансы telemt перезапущены"
+    for n in "${insts[@]}"; do systemctl restart "telemt${n}" 2>/dev/null; done
 
     if [[ -f /usr/local/bin/xray ]]; then
-        info "Бинарник /usr/local/bin/xray остался. Удалить вручную: rm -f /usr/local/bin/xray"
+        info "Бинарник /usr/local/bin/xray остался — удалите вручную если не нужен"
     fi
+    health_check_brief
     pause
 }
 
