@@ -308,40 +308,137 @@ select_components() {
     echo -e "  ${BOLD}VLESS Reality upstream${RESET} ${DIM}(туннель через ваш 3x-ui сервер)${RESET}"
     echo -e "  Заворачивает трафик ${BOLD}telemt → Telegram DC${RESET} через VLESS Reality."
     echo -e "  Клиенты подключаются к серверу ${BOLD}напрямую${RESET}, дальше идёт через VLESS."
-    echo -e "  ${DIM}Помогает если Telegram DC блокируется на исходящем у хостера.${RESET}"
     echo -e "  ${DIM}Реализация: xray-core поднимает локальный SOCKS5 на 127.0.0.1:40000,${RESET}"
-    echo -e "  ${DIM}telemt идёт через него как [[upstreams]]. Нужна готовая vless:// ссылка${RESET}"
-    echo -e "  ${DIM}из вашей 3x-ui панели (или другого VLESS Reality сервера).${RESET}"
+    echo -e "  ${DIM}telemt идёт через него как [[upstreams]].${RESET}"
     DO_VLESS=false
     VLESS_LINK=""
+    VLESS_TYPE=""           # "single" — одна vless ссылка / "subscription" — URL подписки 3x-ui
+    VLESS_STRATEGY="leastPing"  # для подписок: leastPing | random | roundRobin
+    VLESS_AUTO_REFRESH=true     # для подписок: автообновление раз в 6 часов
     read -rp "$(echo -e "${YELLOW}?${RESET} Использовать VLESS Reality upstream? [y/N]: ")" ans
     if [[ "${ans,,}" =~ ^(y|yes|д|да)$ ]]; then
         echo ""
-        echo -e "  ${DIM}Вставьте полную vless:// ссылку (одной строкой):${RESET}"
-        echo -e "  ${DIM}Пример: vless://uuid@server:443?security=reality&pbk=...&sni=...${RESET}"
+        echo -e "  ${BOLD}Тип подключения:${RESET}"
+        echo -e "  ${GREEN}1${RESET} — одна ${BOLD}vless://${RESET} ссылка (один сервер)"
+        echo -e "  ${GREEN}2${RESET} — ${BOLD}подписка${RESET} 3x-ui (https://..., несколько серверов с балансировкой)"
+        local link_type
         while true; do
-            read -rp "  vless:// ссылка: " VLESS_LINK
-            # Базовая проверка структуры
-            if [[ "$VLESS_LINK" == vless://*@*:*\?* ]] && [[ "$VLESS_LINK" == *security=reality* ]] \
-               && [[ "$VLESS_LINK" == *pbk=* ]] && [[ "$VLESS_LINK" == *sni=* ]]; then
-                # Дополнительная валидация через Python — корректность URL и обязательные поля
-                if VL="$VLESS_LINK" python3 -c "import os,urllib.parse as up,sys;p=up.urlparse(os.environ['VL']);q=up.parse_qs(p.query);sys.exit(0 if (p.username and p.hostname and p.port and 'pbk' in q and 'sni' in q) else 1)" 2>/dev/null; then
-                    DO_VLESS=true
-                    ok "VLESS ссылка принята (Reality)"
-                    break
-                else
-                    warn "Не удалось разобрать ссылку — проверьте формат"
-                fi
-            else
-                warn "Ссылка должна быть формата: vless://uuid@server:port?security=reality&pbk=...&sni=..."
-            fi
-            read -rp "  Попробовать ещё раз? [Y/n]: " retry
-            if [[ "${retry,,}" =~ ^(n|no)$ ]]; then
-                DO_VLESS=false
-                VLESS_LINK=""
-                break
-            fi
+            read -rp "$(echo -e "  ${YELLOW}?${RESET} Тип [1/2]: ")" link_type
+            [[ "$link_type" == "1" || "$link_type" == "2" ]] && break
+            warn "Введите 1 или 2"
         done
+
+        if [[ "$link_type" == "1" ]]; then
+            VLESS_TYPE="single"
+            echo ""
+            echo -e "  ${DIM}Вставьте полную vless:// ссылку:${RESET}"
+            echo -e "  ${DIM}vless://uuid@server:443?security=reality&pbk=...&sni=...${RESET}"
+            while true; do
+                read -rp "  vless:// ссылка: " VLESS_LINK
+                if [[ "$VLESS_LINK" == vless://*@*:*\?* ]] && [[ "$VLESS_LINK" == *security=reality* ]] \
+                   && [[ "$VLESS_LINK" == *pbk=* ]] && [[ "$VLESS_LINK" == *sni=* ]]; then
+                    if VL="$VLESS_LINK" python3 -c "import os,urllib.parse as up,sys;p=up.urlparse(os.environ['VL']);q=up.parse_qs(p.query);sys.exit(0 if (p.username and p.hostname and p.port and 'pbk' in q and 'sni' in q) else 1)" 2>/dev/null; then
+                        DO_VLESS=true
+                        ok "VLESS ссылка принята (Reality)"
+                        break
+                    else
+                        warn "Не удалось разобрать ссылку"
+                    fi
+                else
+                    warn "Формат: vless://uuid@server:port?security=reality&pbk=...&sni=..."
+                fi
+                read -rp "  Попробовать ещё раз? [Y/n]: " retry
+                if [[ "${retry,,}" =~ ^(n|no)$ ]]; then
+                    DO_VLESS=false
+                    VLESS_LINK=""
+                    break
+                fi
+            done
+        else
+            VLESS_TYPE="subscription"
+            echo ""
+            echo -e "  ${DIM}Подписка 3x-ui — обычно HTTPS-URL вида:${RESET}"
+            echo -e "  ${DIM}https://your-server:2096/path/subscription_id${RESET}"
+            echo -e "  ${DIM}3x-ui отдаёт base64-кодированный список vless:// ссылок.${RESET}"
+            while true; do
+                read -rp "  URL подписки: " VLESS_LINK
+                if [[ "$VLESS_LINK" =~ ^https?:// ]]; then
+                    # Пробуем скачать и распарсить
+                    info "Получение и парсинг подписки..."
+                    local nodes
+                    nodes=$(SUB_URL="$VLESS_LINK" python3 << 'PYTEST'
+import os, sys, urllib.request, base64, ssl
+url = os.environ['SUB_URL']
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE  # 3x-ui часто с self-signed
+try:
+    req = urllib.request.Request(url, headers={'User-Agent': 'v2rayN/6.0'})
+    with urllib.request.urlopen(req, context=ctx, timeout=15) as r:
+        data = r.read().decode('utf-8', errors='ignore').strip()
+except Exception as e:
+    print(f"ERROR: {e}", file=sys.stderr)
+    sys.exit(1)
+# Пробуем декодировать как base64
+decoded = data
+try:
+    pad = '=' * (-len(data) % 4)
+    decoded = base64.b64decode(data + pad).decode('utf-8', errors='ignore')
+except Exception:
+    pass
+nodes = [ln.strip() for ln in decoded.split('\n') if ln.strip().startswith('vless://') and 'security=reality' in ln]
+if not nodes:
+    print("ERROR: VLESS Reality узлы не найдены в подписке", file=sys.stderr)
+    sys.exit(2)
+print(len(nodes))
+PYTEST
+)
+                    if [[ -n "$nodes" && "$nodes" =~ ^[0-9]+$ ]]; then
+                        DO_VLESS=true
+                        ok "Подписка работает: найдено ${BOLD}${nodes}${RESET} VLESS Reality узлов"
+                        break
+                    else
+                        warn "Не удалось извлечь узлы из подписки. Проверь URL и что 3x-ui отдаёт base64-формат"
+                    fi
+                else
+                    warn "URL должен начинаться с http:// или https://"
+                fi
+                read -rp "  Попробовать ещё раз? [Y/n]: " retry
+                if [[ "${retry,,}" =~ ^(n|no)$ ]]; then
+                    DO_VLESS=false
+                    VLESS_LINK=""
+                    VLESS_TYPE=""
+                    break
+                fi
+            done
+
+            if [[ "$DO_VLESS" == true ]]; then
+                # Стратегия балансировки
+                echo ""
+                echo -e "  ${BOLD}Стратегия балансировки между узлами:${RESET}"
+                echo -e "  ${GREEN}1${RESET} — ${BOLD}leastPing${RESET} — автоматически выбирает самый быстрый ${DIM}(рекомендуется)${RESET}"
+                echo -e "  ${GREEN}2${RESET} — ${BOLD}roundRobin${RESET} — по очереди по всем"
+                echo -e "  ${GREEN}3${RESET} — ${BOLD}random${RESET} — случайно для каждого соединения"
+                while true; do
+                    read -rp "$(echo -e "  ${YELLOW}?${RESET} Стратегия [1/2/3]: ")" str
+                    case "$str" in
+                        1|"") VLESS_STRATEGY="leastPing"; break ;;
+                        2)    VLESS_STRATEGY="roundRobin"; break ;;
+                        3)    VLESS_STRATEGY="random"; break ;;
+                        *)    warn "Введите 1, 2 или 3" ;;
+                    esac
+                done
+                ok "Стратегия: $VLESS_STRATEGY"
+
+                # Автообновление подписки
+                echo ""
+                read -rp "$(echo -e "  ${YELLOW}?${RESET} Авто-обновление подписки каждые 6 часов? [Y/n]: ")" auto
+                if [[ "${auto,,}" =~ ^(n|no)$ ]]; then
+                    VLESS_AUTO_REFRESH=false
+                fi
+                ok "Авто-обновление: $VLESS_AUTO_REFRESH"
+            fi
+        fi
     fi
 }
 
@@ -836,23 +933,25 @@ SERVICE
 
 
 # ─── ШАГ: Установка VLESS Reality upstream ──────────────────────────────────
-# xray-core с локальным SOCKS5 на 127.0.0.1:40000, outbound — VLESS Reality.
-# telemt использует SOCKS5 как [[upstreams]] для трафика к Telegram DC.
+# Поддерживает: одну vless:// ссылку ИЛИ подписку 3x-ui (https://...) с балансировкой
 step_vless() {
     [[ "${DO_VLESS:-false}" != true ]] && return 0
     hdr "Установка VLESS Reality (xray-core)"
 
     echo ""
-    info "Архитектура: xray слушает SOCKS5 на 127.0.0.1:40000, отправляет через VLESS Reality."
-    info "telemt в [[upstreams]] идёт в этот SOCKS5 -> 3x-ui сервер -> Telegram DC."
+    if [[ "$VLESS_TYPE" == "subscription" ]]; then
+        info "Тип: подписка 3x-ui (балансировка по стратегии $VLESS_STRATEGY)"
+    else
+        info "Тип: одна VLESS Reality ссылка"
+    fi
+    info "Архитектура: xray → SOCKS5 127.0.0.1:40000 → VLESS → Telegram DC."
     echo ""
     confirm "Установить?" skip || return 0
 
-    # 1) Скачиваем бинарник xray-core с GitHub releases
+    # 1) Скачиваем xray-core бинарник
     if [[ ! -f /usr/local/bin/xray ]]; then
         info "Скачивание xray-core..."
         local arch xray_arch xray_version xray_url
-
         arch=$(uname -m)
         case "$arch" in
             x86_64) xray_arch="64" ;;
@@ -860,20 +959,17 @@ step_vless() {
             armv7l) xray_arch="arm32-v7a" ;;
             *) xray_arch="64" ;;
         esac
-
         xray_version=$(curl -s --max-time 10 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | grep tag_name | cut -d '"' -f 4)
         if [[ -z "$xray_version" ]]; then
-            err "Не удалось определить версию xray-core — пропуск VLESS"
+            err "Не удалось определить версию xray-core"
             DO_VLESS=false
             return 0
         fi
-
         xray_url="https://github.com/XTLS/Xray-core/releases/download/${xray_version}/Xray-linux-${xray_arch}.zip"
-        info "Версия xray-core: ${BOLD}${xray_version}${RESET} (${xray_arch})"
+        info "Версия: ${BOLD}${xray_version}${RESET} (${xray_arch})"
 
         wait_apt
         apt-get install -y unzip curl >/dev/null 2>&1
-
         cd /tmp
         if ! curl -fsSL --max-time 120 -o /tmp/xray.zip "$xray_url"; then
             err "Не удалось скачать xray-core"
@@ -887,105 +983,45 @@ step_vless() {
         rm -rf /tmp/xray.zip /tmp/xray-extract
         ok "xray-core $(/usr/local/bin/xray version 2>&1 | head -1 | awk '{print $2}') установлен"
     else
-        ok "xray-core уже установлен: $(/usr/local/bin/xray version 2>&1 | head -1 | awk '{print $2}')"
+        ok "xray-core уже установлен"
     fi
 
-    # 2) Парсим vless:// ссылку через Python, пишем JSON конфиг
-    info "Парсинг VLESS-ссылки и генерация конфига..."
-    mkdir -p /etc/telemt-vless
-    VL="$VLESS_LINK" python3 /dev/stdin << 'PYVLESS'
-import os, json, urllib.parse as up, sys
-url = os.environ['VL']
-p = up.urlparse(url)
-q = {k: v[0] for k, v in up.parse_qs(p.query).items()}
-
-cfg = {
-    "log": {"loglevel": "warning"},
-    "inbounds": [{
-        "tag": "socks-in",
-        "listen": "127.0.0.1",
-        "port": 40000,
-        "protocol": "socks",
-        "settings": {"auth": "noauth", "udp": True, "ip": "127.0.0.1"},
-        "sniffing": {"enabled": False}
-    }],
-    "outbounds": [{
-        "tag": "vless-reality",
-        "protocol": "vless",
-        "settings": {
-            "vnext": [{
-                "address": p.hostname,
-                "port": p.port or 443,
-                "users": [{"id": p.username, "encryption": "none"}]
-            }]
-        },
-        "streamSettings": {
-            "network": q.get("type", "tcp"),
-            "security": "reality",
-            "realitySettings": {
-                "show": False,
-                "fingerprint": q.get("fp", "chrome"),
-                "serverName": q.get("sni", ""),
-                "publicKey": q.get("pbk", ""),
-                "shortId": q.get("sid", ""),
-                "spiderX": q.get("spx", "/")
-            }
-        }
-    }, {
-        "tag": "direct",
-        "protocol": "freedom"
-    }],
-    "routing": {
-        "domainStrategy": "AsIs",
-        "rules": [{
-            "type": "field",
-            "inboundTag": ["socks-in"],
-            "outboundTag": "vless-reality"
-        }]
-    }
-}
-
-# flow если указан
-flow = q.get("flow", "")
-if flow:
-    cfg["outbounds"][0]["settings"]["vnext"][0]["users"][0]["flow"] = flow
-
-with open("/etc/telemt-vless/config.json", "w") as f:
-    json.dump(cfg, f, indent=2)
-with open("/etc/telemt-vless/link.txt", "w") as f:
-    f.write(url + "\n")
-
-print("OK: server={}:{} sni={}".format(p.hostname, p.port, q.get("sni", "?")))
-PYVLESS
-
-    if [[ ! -f /etc/telemt-vless/config.json ]]; then
-        err "Не удалось создать конфиг xray"
-        DO_VLESS=false
-        return 0
-    fi
-    # Создаём системного пользователя xray (если ещё нет) — для запуска сервиса
-    # под непривилегированным аккаунтом с явным доступом к /etc/telemt-vless
+    # 2) Создаём пользователя xray для запуска сервиса
     if ! id xray &>/dev/null; then
-        useradd --system --shell /usr/sbin/nologin --no-create-home --user-group xray 2>/dev/null || \
-        useradd --system --shell /usr/sbin/nologin --no-create-home xray 2>/dev/null || true
+        useradd --system --shell /usr/sbin/nologin --no-create-home --user-group xray 2>/dev/null \
+        || useradd --system --shell /usr/sbin/nologin --no-create-home xray 2>/dev/null || true
         ok "Создан системный пользователь xray"
     fi
 
-    # Права на конфиг: владелец xray, директория 750, файлы 640
-    # nogroup нет на Ubuntu/Debian с systemd — поэтому именно отдельный пользователь
-    chown -R xray:xray /etc/telemt-vless 2>/dev/null || chown -R root:root /etc/telemt-vless
-    chmod 750 /etc/telemt-vless
-    chmod 640 /etc/telemt-vless/config.json /etc/telemt-vless/link.txt 2>/dev/null || true
-    ok "Конфиг сохранён: /etc/telemt-vless/config.json (xray:xray, 640)"
+    # 3) Готовим директорию + сохраняем ссылку/URL
+    mkdir -p /etc/telemt-vless
+    echo "$VLESS_LINK" > /etc/telemt-vless/link.txt
+    echo "$VLESS_TYPE" > /etc/telemt-vless/type.txt
+    if [[ "$VLESS_TYPE" == "subscription" ]]; then
+        echo "$VLESS_STRATEGY" > /etc/telemt-vless/strategy.txt
+    fi
 
-    # 3) Валидация конфига
+    # 4) Устанавливаем helper-скрипт для генерации конфига xray
+    info "Установка генератора конфига..."
+    install_xray_config_generator
+    ok "Генератор установлен: /usr/local/sbin/telemt-vless-refresh"
+
+    # 5) Первичная генерация конфига
+    info "Генерация конфига xray..."
+    if ! /usr/local/sbin/telemt-vless-refresh; then
+        err "Не удалось сгенерировать конфиг"
+        DO_VLESS=false
+        return 0
+    fi
+
+    # 6) Валидация
     if /usr/local/bin/xray -test -config /etc/telemt-vless/config.json 2>&1 | grep -q "Configuration OK"; then
         ok "Конфиг xray валиден"
     else
-        warn "xray -test не подтвердил валидность — продолжаем, но может не работать"
+        warn "xray -test не прошёл, но продолжаем"
     fi
 
-    # 4) systemd-сервис
+    # 7) systemd-сервис
     cat > /etc/systemd/system/telemt-vless.service << 'SVC'
 [Unit]
 Description=xray-core VLESS Reality client (telemt SOCKS5 upstream)
@@ -1013,7 +1049,14 @@ SVC
     systemctl enable --now telemt-vless 2>&1 | grep -v "Created symlink" || true
     sleep 3
 
-    # 5) Проверка статуса
+    # 8) Авто-обновление подписки (только для типа subscription)
+    if [[ "$VLESS_TYPE" == "subscription" && "$VLESS_AUTO_REFRESH" == true ]]; then
+        info "Настройка автообновления подписки (каждые 6 часов)..."
+        install_xray_refresh_timer
+        ok "Авто-обновление включено: telemt-vless-refresh.timer"
+    fi
+
+    # 9) Проверка статуса
     if systemctl is-active --quiet telemt-vless; then
         ok "Сервис telemt-vless запущен"
     else
@@ -1029,14 +1072,12 @@ SVC
         warn "Порт 40000 не слушается"
     fi
 
-    # 6) Тест: какой IP виден через VLESS
+    # 10) Тест: какой IP виден через VLESS
     info "Тест: какой IP виден через VLESS-туннель?"
     local direct_ip vless_ip
     direct_ip=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null)
     vless_ip=$(curl -s --max-time 10 --socks5 127.0.0.1:40000 https://api.ipify.org 2>/dev/null)
-    if [[ -n "$direct_ip" ]]; then
-        info "Прямой IP сервера: ${BOLD}${direct_ip}${RESET}"
-    fi
+    [[ -n "$direct_ip" ]] && info "Прямой IP сервера: ${BOLD}${direct_ip}${RESET}"
     if [[ -n "$vless_ip" ]]; then
         ok "Через VLESS виден IP: ${BOLD}${vless_ip}${RESET}"
         if [[ "$direct_ip" == "$vless_ip" ]]; then
@@ -1045,6 +1086,230 @@ SVC
     else
         warn "Тест не прошёл — проверьте позже: journalctl -u telemt-vless -n 50"
     fi
+}
+
+# ─── Установка генератора конфига xray ──────────────────────────────────────
+# Создаёт /usr/local/sbin/telemt-vless-refresh — самостоятельный скрипт,
+# который читает /etc/telemt-vless/link.txt и type.txt, генерит config.json,
+# проверяет валидность и перезагружает сервис.
+install_xray_config_generator() {
+    cat > /usr/local/sbin/telemt-vless-refresh << 'GENEOF'
+#!/usr/bin/env bash
+# telemt-vless-refresh — генератор конфига xray из vless:// ссылки или 3x-ui подписки
+set -uo pipefail
+
+LINK_FILE="/etc/telemt-vless/link.txt"
+TYPE_FILE="/etc/telemt-vless/type.txt"
+STRATEGY_FILE="/etc/telemt-vless/strategy.txt"
+CONFIG_FILE="/etc/telemt-vless/config.json"
+NODES_FILE="/etc/telemt-vless/nodes.txt"  # последний скачанный список (для diff)
+
+[[ ! -f "$LINK_FILE" ]] && { echo "ERROR: $LINK_FILE не существует"; exit 1; }
+[[ ! -f "$TYPE_FILE" ]] && echo "single" > "$TYPE_FILE"
+LINK=$(cat "$LINK_FILE")
+TYPE=$(cat "$TYPE_FILE")
+STRATEGY=$(cat "$STRATEGY_FILE" 2>/dev/null || echo "leastPing")
+
+LINK="$LINK" TYPE="$TYPE" STRATEGY="$STRATEGY" CONFIG_FILE="$CONFIG_FILE" NODES_FILE="$NODES_FILE" python3 << 'PYGEN'
+import os, json, sys, urllib.request, urllib.parse as up, base64, ssl
+
+link = os.environ["LINK"].strip()
+typ = os.environ["TYPE"].strip()
+strategy = os.environ["STRATEGY"].strip() or "leastPing"
+cfg_path = os.environ["CONFIG_FILE"]
+nodes_path = os.environ["NODES_FILE"]
+
+def parse_vless(url):
+    p = up.urlparse(url)
+    q = {k: v[0] for k, v in up.parse_qs(p.query).items()}
+    if not (p.username and p.hostname and p.port and "pbk" in q and "sni" in q):
+        return None
+    name = up.unquote(p.fragment) if p.fragment else f"{p.hostname}:{p.port}"
+    return {
+        "name": name,
+        "host": p.hostname, "port": p.port or 443,
+        "uuid": p.username,
+        "flow": q.get("flow", ""),
+        "network": q.get("type", "tcp"),
+        "fp": q.get("fp", "chrome"),
+        "sni": q.get("sni", ""),
+        "pbk": q.get("pbk", ""),
+        "sid": q.get("sid", ""),
+        "spx": q.get("spx", "/"),
+    }
+
+# Собираем список узлов
+nodes = []
+if typ == "subscription":
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        req = urllib.request.Request(link, headers={"User-Agent": "v2rayN/6.0"})
+        with urllib.request.urlopen(req, context=ctx, timeout=20) as r:
+            data = r.read().decode("utf-8", errors="ignore").strip()
+    except Exception as e:
+        print(f"ERROR: подписка недоступна: {e}", file=sys.stderr)
+        sys.exit(2)
+    decoded = data
+    try:
+        pad = "=" * (-len(data) % 4)
+        decoded = base64.b64decode(data + pad).decode("utf-8", errors="ignore")
+    except Exception:
+        pass
+    for ln in decoded.split("\n"):
+        ln = ln.strip()
+        if not ln.startswith("vless://") or "security=reality" not in ln:
+            continue
+        n = parse_vless(ln)
+        if n:
+            nodes.append(n)
+    if not nodes:
+        print("ERROR: VLESS Reality узлы не найдены", file=sys.stderr)
+        sys.exit(3)
+else:
+    n = parse_vless(link)
+    if not n:
+        print("ERROR: не удалось распарсить ссылку", file=sys.stderr)
+        sys.exit(4)
+    nodes.append(n)
+
+def make_outbound(idx, n):
+    out = {
+        "tag": f"node-{idx}",
+        "protocol": "vless",
+        "settings": {
+            "vnext": [{
+                "address": n["host"], "port": n["port"],
+                "users": [{"id": n["uuid"], "encryption": "none"}]
+            }]
+        },
+        "streamSettings": {
+            "network": n["network"],
+            "security": "reality",
+            "realitySettings": {
+                "show": False,
+                "fingerprint": n["fp"] or "chrome",
+                "serverName": n["sni"],
+                "publicKey": n["pbk"],
+                "shortId": n["sid"],
+                "spiderX": n["spx"]
+            }
+        }
+    }
+    if n["flow"]:
+        out["settings"]["vnext"][0]["users"][0]["flow"] = n["flow"]
+    return out
+
+cfg = {
+    "log": {"loglevel": "warning"},
+    "inbounds": [{
+        "tag": "socks-in",
+        "listen": "127.0.0.1",
+        "port": 40000,
+        "protocol": "socks",
+        "settings": {"auth": "noauth", "udp": True, "ip": "127.0.0.1"},
+        "sniffing": {"enabled": False}
+    }],
+    "outbounds": [make_outbound(i+1, n) for i, n in enumerate(nodes)] + [{"tag": "direct", "protocol": "freedom"}],
+    "routing": {
+        "domainStrategy": "AsIs",
+        "rules": []
+    }
+}
+
+if len(nodes) > 1:
+    # Балансер на все node-* outbound'ы
+    cfg["routing"]["balancers"] = [{
+        "tag": "balancer-vless",
+        "selector": ["node-"],
+        "strategy": {"type": strategy if strategy != "leastPing" else "leastPing"}
+    }]
+    cfg["routing"]["rules"].append({
+        "type": "field",
+        "inboundTag": ["socks-in"],
+        "balancerTag": "balancer-vless"
+    })
+    # Для leastPing нужен observatory
+    if strategy == "leastPing":
+        cfg["observatory"] = {
+            "subjectSelector": ["node-"],
+            "probeUrl": "https://www.google.com/gen_204",
+            "probeInterval": "300s"
+        }
+else:
+    cfg["routing"]["rules"].append({
+        "type": "field",
+        "inboundTag": ["socks-in"],
+        "outboundTag": "node-1"
+    })
+
+with open(cfg_path, "w") as f:
+    json.dump(cfg, f, indent=2)
+
+# Сохраняем список узлов для diff
+with open(nodes_path, "w") as f:
+    for n in nodes:
+        f.write(f"{n['name']}\t{n['host']}:{n['port']}\n")
+
+print(f"OK: {len(nodes)} узлов, стратегия={strategy if len(nodes) > 1 else 'single'}")
+PYGEN
+GEN_RC=$?
+[[ $GEN_RC -ne 0 ]] && exit $GEN_RC
+
+# Применяем права (xray должен читать)
+if ! id xray &>/dev/null; then
+    useradd --system --shell /usr/sbin/nologin --no-create-home --user-group xray 2>/dev/null     || useradd --system --shell /usr/sbin/nologin --no-create-home xray 2>/dev/null || true
+fi
+chown -R xray:xray /etc/telemt-vless 2>/dev/null || chown -R root:root /etc/telemt-vless
+chmod 750 /etc/telemt-vless
+chmod 640 "$CONFIG_FILE" "$LINK_FILE" 2>/dev/null || true
+chmod 644 "$TYPE_FILE" "$STRATEGY_FILE" "$NODES_FILE" 2>/dev/null || true
+
+# Валидация и рестарт
+if ! /usr/local/bin/xray -test -config "$CONFIG_FILE" 2>&1 | grep -q "Configuration OK"; then
+    echo "WARN: xray -test не прошёл"
+fi
+
+# Если сервис уже запущен — рестартим
+if systemctl is-active --quiet telemt-vless 2>/dev/null; then
+    systemctl restart telemt-vless
+fi
+
+echo "OK: конфиг обновлён"
+exit 0
+GENEOF
+    chmod +x /usr/local/sbin/telemt-vless-refresh
+}
+
+# ─── Установка systemd timer для авто-обновления подписки ───────────────────
+install_xray_refresh_timer() {
+    cat > /etc/systemd/system/telemt-vless-refresh.service << 'RUNIT'
+[Unit]
+Description=Refresh telemt VLESS subscription from 3x-ui
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/telemt-vless-refresh
+RUNIT
+
+    cat > /etc/systemd/system/telemt-vless-refresh.timer << 'TUNIT'
+[Unit]
+Description=Refresh VLESS subscription every 6 hours
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TUNIT
+    systemctl daemon-reload
+    systemctl enable --now telemt-vless-refresh.timer 2>&1 | grep -v "Created symlink" || true
 }
 
 # ─── ШАГ: Установка mytelemtinfo ─────────────────────────────────────────────
@@ -1263,12 +1528,20 @@ do_purge_all() {
         info "Удаление VLESS Reality..."
         systemctl stop telemt-vless 2>/dev/null || true
         systemctl disable telemt-vless 2>/dev/null || true
+        # Refresh timer и сервис
+        systemctl stop telemt-vless-refresh.timer 2>/dev/null || true
+        systemctl disable telemt-vless-refresh.timer 2>/dev/null || true
+        systemctl stop telemt-vless-refresh.service 2>/dev/null || true
         rm -f /etc/systemd/system/telemt-vless.service
+        rm -f /etc/systemd/system/telemt-vless-refresh.service
+        rm -f /etc/systemd/system/telemt-vless-refresh.timer
+        rm -f /usr/local/sbin/telemt-vless-refresh
         rm -rf /etc/telemt-vless
         # Удаляем пользователя xray если он остался без процессов
         if id xray &>/dev/null && ! pgrep -u xray &>/dev/null; then
             userdel xray 2>/dev/null || true
         fi
+        systemctl daemon-reload 2>/dev/null || true
         # xray бинарник не трогаем — он мог стоять и до нас (от других сервисов)
         ok "VLESS Reality компоненты удалены"
         if [[ -f /usr/local/bin/xray ]]; then
