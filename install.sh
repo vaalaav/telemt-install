@@ -963,8 +963,20 @@ PYVLESS
         DO_VLESS=false
         return 0
     fi
-    chmod 600 /etc/telemt-vless/config.json /etc/telemt-vless/link.txt
-    ok "Конфиг сохранён: /etc/telemt-vless/config.json"
+    # Создаём системного пользователя xray (если ещё нет) — для запуска сервиса
+    # под непривилегированным аккаунтом с явным доступом к /etc/telemt-vless
+    if ! id xray &>/dev/null; then
+        useradd --system --shell /usr/sbin/nologin --no-create-home --user-group xray 2>/dev/null || \
+        useradd --system --shell /usr/sbin/nologin --no-create-home xray 2>/dev/null || true
+        ok "Создан системный пользователь xray"
+    fi
+
+    # Права на конфиг: владелец xray, директория 750, файлы 640
+    # nogroup нет на Ubuntu/Debian с systemd — поэтому именно отдельный пользователь
+    chown -R xray:xray /etc/telemt-vless 2>/dev/null || chown -R root:root /etc/telemt-vless
+    chmod 750 /etc/telemt-vless
+    chmod 640 /etc/telemt-vless/config.json /etc/telemt-vless/link.txt 2>/dev/null || true
+    ok "Конфиг сохранён: /etc/telemt-vless/config.json (xray:xray, 640)"
 
     # 3) Валидация конфига
     if /usr/local/bin/xray -test -config /etc/telemt-vless/config.json 2>&1 | grep -q "Configuration OK"; then
@@ -982,13 +994,17 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=nobody
-Group=nogroup
+User=xray
+Group=xray
 ExecStart=/usr/local/bin/xray run -config /etc/telemt-vless/config.json
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
 NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/etc/telemt-vless
 
 [Install]
 WantedBy=multi-user.target
@@ -1243,14 +1259,17 @@ do_purge_all() {
     fi
 
     # ── 4) Удаляем VLESS Reality (xray-core) ──
-    if [[ -f /etc/telemt-vless/config.json ]] || systemctl list-unit-files 2>/dev/null | grep -q "telemt-vless"; then
+    if [[ -f /etc/telemt-vless/config.json ]] || systemctl list-unit-files 2>/dev/null | grep -q "telemt-vless" || id xray &>/dev/null; then
         info "Удаление VLESS Reality..."
         systemctl stop telemt-vless 2>/dev/null || true
         systemctl disable telemt-vless 2>/dev/null || true
         rm -f /etc/systemd/system/telemt-vless.service
         rm -rf /etc/telemt-vless
+        # Удаляем пользователя xray если он остался без процессов
+        if id xray &>/dev/null && ! pgrep -u xray &>/dev/null; then
+            userdel xray 2>/dev/null || true
+        fi
         # xray бинарник не трогаем — он мог стоять и до нас (от других сервисов)
-        # но если он стоит ТОЛЬКО для нас — даём пользователю удалить отдельно
         ok "VLESS Reality компоненты удалены"
         if [[ -f /usr/local/bin/xray ]]; then
             info "Бинарник /usr/local/bin/xray не тронут (может использоваться другими сервисами)"
