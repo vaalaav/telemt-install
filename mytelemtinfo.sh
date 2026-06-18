@@ -2145,7 +2145,15 @@ with open("/etc/telemt-vless/config.json", "w") as f:
 with open("/etc/telemt-vless/link.txt", "w") as f:
     f.write(url + "\n")
 PYV
-    chmod 600 /etc/telemt-vless/config.json /etc/telemt-vless/link.txt
+    # Создаём пользователя xray если ещё нет (на случай если поставили из старой версии)
+    if ! id xray &>/dev/null; then
+        useradd --system --shell /usr/sbin/nologin --no-create-home --user-group xray 2>/dev/null \
+        || useradd --system --shell /usr/sbin/nologin --no-create-home xray 2>/dev/null || true
+    fi
+    # Права: xray-пользователь должен читать конфиг
+    chown -R xray:xray /etc/telemt-vless 2>/dev/null || chown -R root:root /etc/telemt-vless
+    chmod 750 /etc/telemt-vless
+    chmod 640 /etc/telemt-vless/config.json /etc/telemt-vless/link.txt 2>/dev/null || true
 }
 
 vless_install() {
@@ -2208,13 +2216,17 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=nobody
-Group=nogroup
+User=xray
+Group=xray
 ExecStart=/usr/local/bin/xray run -config /etc/telemt-vless/config.json
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
 NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/etc/telemt-vless
 
 [Install]
 WantedBy=multi-user.target
@@ -2423,7 +2435,13 @@ PYU
     rm -f /etc/systemd/system/telemt-vless.service
     rm -rf /etc/telemt-vless
     systemctl daemon-reload
-    ok "Сервис и конфиги VLESS удалены"
+
+    # Удаляем пользователя xray, если он не используется другими сервисами
+    if id xray &>/dev/null && ! pgrep -u xray &>/dev/null; then
+        userdel xray 2>/dev/null && info "Удалён системный пользователь xray" || true
+    fi
+
+    ok "Сервис, конфиги и пользователь VLESS удалены"
 
     # Перезапуск telemt
     local insts; read -ra insts <<< "$(active_instances)"
