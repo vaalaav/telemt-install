@@ -348,6 +348,33 @@ status_timeouts() {
     fi
 }
 
+# Статус client_mss = "tspu" по всем конфигам telemt
+status_tspu() {
+    local on=0 off=0 absent=0 total=0
+    for f in /etc/telemt/telemt*.toml; do
+        [[ ! -f "$f" ]] && continue
+        total=$((total+1))
+        if grep -qE '^\s*client_mss\s*=\s*"tspu"' "$f" 2>/dev/null; then
+            on=$((on+1))
+        elif grep -qE '^\s*#\s*client_mss\s*=\s*"tspu"' "$f" 2>/dev/null; then
+            off=$((off+1))
+        else
+            absent=$((absent+1))
+        fi
+    done
+    if [[ $total -eq 0 ]]; then
+        echo -e "${DIM}нет инстансов${RESET}"
+    elif [[ $on -eq $total ]]; then
+        echo -e "${GREEN}включено${RESET} во всех ${total} конфигах"
+    elif [[ $off -eq $total ]]; then
+        echo -e "${YELLOW}отключено${RESET} (закомментировано) во всех конфигах"
+    elif [[ $absent -eq $total ]]; then
+        echo -e "${DIM}нет строки${RESET} (дефолт telemt)"
+    else
+        echo -e "${YELLOW}смешано${RESET}: вкл=$on, выкл=$off, отсутствует=$absent"
+    fi
+}
+
 status_ufw() {
     if ufw status 2>/dev/null | grep -q "Status: active"; then
         local rl; rl=$(grep -c "MTProto rate-limit" /etc/ufw/before.rules 2>/dev/null || echo 0)
@@ -1797,8 +1824,8 @@ nft_remove() {
 menu_timeouts() {
     while true; do
         draw_header
-        echo -e "  ${BOLD}Таймауты telemt [timeouts]${RESET}\n"
-        echo -e "  Статус: $(status_timeouts)\n"
+        echo -e "  ${BOLD}Настройки конфигов telemt${RESET}\n"
+        echo -e "  ${BOLD}── Таймауты [timeouts]:${RESET} $(status_timeouts)"
 
         # Показываем текущие значения по инстансам
         local insts; read -ra insts <<< "$(active_instances)"
@@ -1818,9 +1845,31 @@ menu_timeouts() {
             echo ""
         fi
 
+        # client_mss = "tspu" статус
+        echo -e "  ${BOLD}── client_mss=\"tspu\":${RESET} $(status_tspu)"
+        if [[ ${#insts[@]} -gt 0 ]]; then
+            for n in "${insts[@]}"; do
+                local f="/etc/telemt/telemt${n}.toml" mss_st
+                if grep -qE '^\s*client_mss\s*=\s*"tspu"' "$f" 2>/dev/null; then
+                    mss_st="${GREEN}вкл${RESET}"
+                elif grep -qE '^\s*#\s*client_mss\s*=\s*"tspu"' "$f" 2>/dev/null; then
+                    mss_st="${YELLOW}выкл${RESET} (закомментировано)"
+                else
+                    mss_st="${DIM}нет в конфиге${RESET}"
+                fi
+                echo -e "  Инстанс ${BOLD}$n${RESET}: $mss_st"
+            done
+            echo ""
+        fi
+
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+        echo -e "  ${BOLD}── Таймауты:${RESET}"
         echo -e "  ${BOLD}1.${RESET} Установить / изменить значения"
         echo -e "  ${BOLD}2.${RESET} Сбросить к дефолтам (удалить секцию [timeouts])"
+        echo ""
+        echo -e "  ${BOLD}── client_mss=\"tspu\" (обход ТСПУ для РФ):${RESET}"
+        echo -e "  ${BOLD}3.${RESET} ${GREEN}Включить${RESET} (раскомментировать или добавить во все конфиги)"
+        echo -e "  ${BOLD}4.${RESET} ${YELLOW}Отключить${RESET} (закомментировать во всех конфигах)"
         echo -e "  ${BOLD}0.${RESET} ← Назад"
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
         echo ""
@@ -1828,6 +1877,8 @@ menu_timeouts() {
         case "$ch" in
             1) timeouts_set ;;
             2) timeouts_reset ;;
+            3) tspu_enable ;;
+            4) tspu_disable ;;
             0|b) return ;;
             *) warn "Неверный пункт"; sleep 1 ;;
         esac
@@ -1942,6 +1993,148 @@ if not content.endswith('\n'): content += '\n'
 open(path, 'w').write(content)
 PYEOF
         ok "Инстанс $n — [timeouts] и tg_connect удалены"
+    done
+
+    echo ""
+    read -rp "  Перезапустить инстансы? [Y/n]: " ans2
+    if [[ ! "${ans2,,}" =~ ^(n|no)$ ]]; then
+        for n in "${insts[@]}"; do
+            systemctl restart "telemt${n}" 2>/dev/null && ok "telemt${n} перезапущен" || err "Ошибка"
+        done
+    fi
+    health_check_brief
+    pause
+}
+
+# ─── client_mss = "tspu" — включение / отключение ──────────────────────────
+# Включает (раскомментирует или добавляет) во всех конфигах /etc/telemt/telemt*.toml
+tspu_enable() {
+    draw_header
+    echo -e "  ${BOLD}Включение client_mss = \"tspu\"${RESET}\n"
+    info "Включает обход ТСПУ во всех инстансах."
+    info "Если строка есть закомментированная — раскомментирует."
+    info "Если строки нет — добавит в секцию [server]."
+    echo ""
+    read -rp "  Применить ко всем конфигам? [Y/n]: " ans
+    [[ "${ans,,}" =~ ^(n|no)$ ]] && return
+
+    local insts; read -ra insts <<< "$(active_instances)"
+    if [[ ${#insts[@]} -eq 0 ]]; then
+        warn "Нет установленных инстансов"; pause; return
+    fi
+
+    for n in "${insts[@]}"; do
+        local f="/etc/telemt/telemt${n}.toml"
+        python3 - "$f" << 'PYEOF'
+import sys, re
+path = sys.argv[1]
+content = open(path).read()
+
+# Случай 1: уже включена — ничего не делаем
+if re.search(r'^\s*client_mss\s*=\s*"tspu"', content, flags=re.MULTILINE):
+    print("already_on")
+    sys.exit(0)
+
+# Случай 2: закомментирована — раскомментировать
+new = re.sub(
+    r'^(\s*)#\s*client_mss\s*=\s*"tspu".*$',
+    r'\1client_mss = "tspu"',
+    content,
+    flags=re.MULTILINE
+)
+if new != content:
+    open(path, 'w').write(new)
+    print("uncommented")
+    sys.exit(0)
+
+# Случай 3: строки вообще нет — добавляем в секцию [server] после listen_addr_ipv4
+new = re.sub(
+    r'(^\s*listen_addr_ipv4\s*=\s*"[^"]+"\s*$)',
+    r'\1\nclient_mss = "tspu"',
+    content,
+    count=1,
+    flags=re.MULTILINE
+)
+if new != content:
+    open(path, 'w').write(new)
+    print("added")
+else:
+    # Резерв: вставка после [server] заголовка
+    new = re.sub(
+        r'(^\[server\]\s*$)',
+        r'\1\nclient_mss = "tspu"',
+        content,
+        count=1,
+        flags=re.MULTILINE
+    )
+    if new != content:
+        open(path, 'w').write(new)
+        print("added_after_section")
+    else:
+        print("failed")
+        sys.exit(1)
+PYEOF
+        local rc=$?
+        if [[ $rc -eq 0 ]]; then
+            ok "Инстанс $n: client_mss=\"tspu\" включён"
+        else
+            err "Инстанс $n: не удалось обновить конфиг"
+        fi
+    done
+
+    echo ""
+    read -rp "  Перезапустить инстансы? [Y/n]: " ans2
+    if [[ ! "${ans2,,}" =~ ^(n|no)$ ]]; then
+        for n in "${insts[@]}"; do
+            systemctl restart "telemt${n}" 2>/dev/null && ok "telemt${n} перезапущен" || err "Ошибка"
+        done
+    fi
+    health_check_brief
+    pause
+}
+
+# Отключает (закомментирует) client_mss во всех конфигах
+tspu_disable() {
+    draw_header
+    echo -e "  ${BOLD}Отключение client_mss = \"tspu\"${RESET}\n"
+    warn "Строка будет закомментирована во всех конфигах telemt."
+    warn "Это может ухудшить работу прокси если сервер в РФ или провайдер фильтрует MSS."
+    echo ""
+    read -rp "  Применить? [y/N]: " ans
+    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
+
+    local insts; read -ra insts <<< "$(active_instances)"
+    if [[ ${#insts[@]} -eq 0 ]]; then
+        warn "Нет установленных инстансов"; pause; return
+    fi
+
+    for n in "${insts[@]}"; do
+        local f="/etc/telemt/telemt${n}.toml"
+        python3 - "$f" << 'PYEOF'
+import sys, re
+path = sys.argv[1]
+content = open(path).read()
+
+# Случай 1: уже закомментирована — ничего не делаем
+if re.search(r'^\s*#\s*client_mss\s*=\s*"tspu"', content, flags=re.MULTILINE):
+    print("already_off")
+    sys.exit(0)
+
+# Случай 2: активная — комментируем
+new = re.sub(
+    r'^(\s*)client_mss\s*=\s*"tspu"(.*)$',
+    r'\1#client_mss = "tspu"\2',
+    content,
+    flags=re.MULTILINE
+)
+if new != content:
+    open(path, 'w').write(new)
+    print("commented")
+else:
+    # Строки нет — фактически уже отключено (дефолт telemt)
+    print("absent_no_action")
+PYEOF
+        ok "Инстанс $n: client_mss обработан"
     done
 
     echo ""
