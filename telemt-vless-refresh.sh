@@ -145,7 +145,10 @@ with open(nodes_path, "w") as f:
     for n in nodes:
         f.write(f"{n['name']}\t{n['host']}:{n['port']}\n")
 
-print(f"OK: {len(nodes)} узлов, стратегия={strategy if len(nodes) > 1 else 'single'}")
+if len(nodes) > 1:
+    print(f"OK: {len(nodes)} узлов, стратегия={strategy}", file=sys.stderr)
+else:
+    print(f"OK: 1 узел (балансировка не активна)", file=sys.stderr)
 PYGEN
 GEN_RC=$?
 [[ $GEN_RC -ne 0 ]] && exit $GEN_RC
@@ -172,5 +175,5 @@ if systemctl is-active --quiet telemt-vless 2>/dev/null; then
     systemctl restart telemt-vless
 fi
 
-echo "OK: конфиг обновлён"
+echo "OK: конфиг обновлён" >&2
 exit 0
