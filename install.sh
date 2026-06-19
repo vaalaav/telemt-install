@@ -1667,6 +1667,228 @@ do_purge_only() {
     exit 0
 }
 
+# ─── Режим --vless-only: установить только VLESS туннель ────────────────────
+# Используется когда telemt уже работает (поставлен нашим скриптом или другим способом)
+# и нужно добавить только xray VLESS Reality upstream поверх него.
+do_vless_only_install() {
+    check_root
+    print_banner
+    hdr "Установка VLESS Reality поверх существующего telemt"
+
+    echo ""
+    info "Этот режим установит только xray + VLESS туннель."
+    info "telemt НЕ устанавливается и НЕ изменяется (только опционально"
+    info "добавляется upstream-секция в его конфиги, если найдены)."
+    echo ""
+
+    # Детектим telemt
+    local telemt_bin=""
+    for p in /bin/telemt /usr/local/bin/telemt /usr/bin/telemt; do
+        [[ -x "$p" ]] && telemt_bin="$p" && break
+    done
+
+    if [[ -n "$telemt_bin" ]]; then
+        ok "Обнаружен telemt: ${BOLD}${telemt_bin}${RESET}"
+        local tv; tv=$("$telemt_bin" --version 2>&1 | head -1)
+        info "Версия: ${tv}"
+    else
+        warn "telemt не найден в /bin /usr/local/bin /usr/bin"
+        warn "xray будет установлен, но без активного потребителя SOCKS5"
+        echo ""
+        read -rp "  Всё равно продолжить? [y/N]: " ans
+        [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && { info "Отменено"; exit 0; }
+    fi
+
+    # Запрос ссылки/подписки — переиспользуем select_components, но только VLESS-часть
+    echo ""
+    DO_VLESS=true
+    VLESS_LINK=""
+    VLESS_TYPE=""
+    VLESS_STRATEGY="leastPing"
+    VLESS_AUTO_REFRESH=true
+
+    echo -e "  ${BOLD}Тип подключения:${RESET}"
+    echo -e "  ${GREEN}1${RESET} — одна ${BOLD}vless://${RESET} ссылка ${DIM}(vless://uuid@server:port?...)${RESET}"
+    echo -e "  ${GREEN}2${RESET} — ${BOLD}подписка${RESET} 3x-ui ${DIM}(https://server:port/path/sub-id)${RESET}"
+    echo ""
+    local link_type
+    while true; do
+        read -rp "  Тип [1/2]: " link_type
+        [[ "$link_type" == "1" || "$link_type" == "2" ]] && break
+        warn "Введите 1 или 2"
+    done
+
+    if [[ "$link_type" == "1" ]]; then
+        VLESS_TYPE="single"
+        while true; do
+            read -rp "  vless:// ссылка: " VLESS_LINK
+            if [[ "$VLESS_LINK" == vless://*@*:*\?* ]] && [[ "$VLESS_LINK" == *security=reality* ]] \
+               && [[ "$VLESS_LINK" == *pbk=* ]] && [[ "$VLESS_LINK" == *sni=* ]]; then
+                if VL="$VLESS_LINK" python3 -c "import os,urllib.parse as up,sys;p=up.urlparse(os.environ['VL']);q=up.parse_qs(p.query);sys.exit(0 if (p.username and p.hostname and p.port and 'pbk' in q and 'sni' in q) else 1)" 2>/dev/null; then
+                    ok "VLESS ссылка принята"
+                    break
+                fi
+            fi
+            warn "Неверный формат ссылки"
+            read -rp "  Попробовать ещё раз? [Y/n]: " retry
+            [[ "${retry,,}" =~ ^(n|no)$ ]] && { info "Отменено"; exit 0; }
+        done
+    else
+        VLESS_TYPE="subscription"
+        while true; do
+            read -rp "  URL подписки: " VLESS_LINK
+            if [[ "$VLESS_LINK" =~ ^https?:// ]]; then
+                info "Получение и парсинг подписки..."
+                local nodes
+                nodes=$(SUB_URL="$VLESS_LINK" python3 << 'PYTEST'
+import os, sys, urllib.request, base64, ssl
+url = os.environ["SUB_URL"]
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+try:
+    req = urllib.request.Request(url, headers={"User-Agent": "v2rayN/6.0"})
+    with urllib.request.urlopen(req, context=ctx, timeout=15) as r:
+        data = r.read().decode("utf-8", errors="ignore").strip()
+except Exception as e:
+    print(f"ERROR: {e}", file=sys.stderr); sys.exit(1)
+decoded = data
+try:
+    pad = "=" * (-len(data) % 4)
+    decoded = base64.b64decode(data + pad).decode("utf-8", errors="ignore")
+except Exception: pass
+nodes = [ln.strip() for ln in decoded.split("\n") if ln.strip().startswith("vless://") and "security=reality" in ln]
+if not nodes:
+    print("ERROR: VLESS Reality узлы не найдены", file=sys.stderr); sys.exit(2)
+print(len(nodes))
+PYTEST
+)
+                if [[ -n "$nodes" && "$nodes" =~ ^[0-9]+$ ]]; then
+                    ok "Подписка работает: найдено ${BOLD}${nodes}${RESET} узлов"
+                    break
+                fi
+                warn "Не удалось извлечь узлы из подписки"
+            else
+                warn "URL должен начинаться с http:// или https://"
+            fi
+            read -rp "  Попробовать ещё раз? [Y/n]: " retry
+            [[ "${retry,,}" =~ ^(n|no)$ ]] && { info "Отменено"; exit 0; }
+        done
+
+        echo ""
+        echo -e "  ${BOLD}Стратегия балансировки:${RESET}"
+        echo -e "  ${GREEN}1${RESET} — leastPing (рекомендуется)"
+        echo -e "  ${GREEN}2${RESET} — roundRobin"
+        echo -e "  ${GREEN}3${RESET} — random"
+        while true; do
+            read -rp "  Стратегия [1/2/3]: " s
+            case "$s" in
+                1|"") VLESS_STRATEGY="leastPing"; break ;;
+                2)    VLESS_STRATEGY="roundRobin"; break ;;
+                3)    VLESS_STRATEGY="random"; break ;;
+                *)    warn "1, 2 или 3" ;;
+            esac
+        done
+
+        echo ""
+        read -rp "  Автообновление подписки каждые 6 часов? [Y/n]: " auto
+        [[ "${auto,,}" =~ ^(n|no)$ ]] && VLESS_AUTO_REFRESH=false
+    fi
+
+    # Запускаем step_warp-style установку
+    echo ""
+    info "Установка xray-core и настройка туннеля..."
+    AUTO_CONFIRM=true   # пропускаем confirm в step_vless
+    step_vless
+
+    # Поиск telemt-конфигов чтобы прицепить upstream
+    echo ""
+    info "Поиск telemt-конфигов для интеграции..."
+    local found_configs=()
+    if [[ -d /etc/telemt ]]; then
+        for f in /etc/telemt/telemt*.toml; do
+            [[ -f "$f" ]] && found_configs+=("$f")
+        done
+    fi
+
+    if [[ ${#found_configs[@]} -gt 0 ]]; then
+        ok "Найдено telemt-конфигов: ${#found_configs[@]}"
+        for f in "${found_configs[@]}"; do
+            echo -e "    ${DIM}- ${f}${RESET}"
+        done
+        echo ""
+        read -rp "  Прицепить VLESS upstream ко всем конфигам и перезапустить telemt? [Y/n]: " att
+        if [[ ! "${att,,}" =~ ^(n|no)$ ]]; then
+            local attached=0
+            for f in "${found_configs[@]}"; do
+                if grep -q "127.0.0.1:40000" "$f" 2>/dev/null; then
+                    info "Уже прицеплен: $(basename "$f")"
+                    continue
+                fi
+                python3 - "$f" << 'PYU'
+import sys, re
+path = sys.argv[1]
+content = open(path).read()
+content = re.sub(r'\n*\[\[upstreams\]\][^\[]*', '\n', content, flags=re.DOTALL)
+content = re.sub(r'\n{3,}', '\n\n', content)
+if not content.endswith('\n'): content += '\n'
+content += '\n[[upstreams]]\ntype = "socks5"\naddress = "127.0.0.1:40000"\nweight = 1\nenabled = true\n'
+open(path, 'w').write(content)
+PYU
+                attached=$((attached + 1))
+            done
+            ok "Прицеплено к ${attached} конфигам"
+
+            # Рестарт telemt: пробуем стандартные имена сервисов
+            info "Перезапуск инстансов telemt..."
+            local restarted=0
+            for n in 1 2 3 4 5 6 7 8 9 10; do
+                if systemctl is-enabled "telemt${n}" &>/dev/null; then
+                    systemctl restart "telemt${n}" 2>/dev/null && restarted=$((restarted + 1))
+                fi
+            done
+            # Также пробуем общий сервис telemt
+            if systemctl is-enabled telemt &>/dev/null && [[ "$restarted" -eq 0 ]]; then
+                systemctl restart telemt 2>/dev/null && restarted=1
+            fi
+            if [[ "$restarted" -gt 0 ]]; then
+                ok "Перезапущено сервисов: ${restarted}"
+            else
+                warn "Не нашёл активных telemt-сервисов. Перезапусти telemt вручную:"
+                warn "  systemctl restart telemt    # или telemt1 telemt2 ..."
+            fi
+        fi
+    else
+        warn "Конфиги telemt в /etc/telemt/ не найдены."
+        echo ""
+        echo -e "  ${BOLD}Чтобы прицепить VLESS к вашему telemt вручную, добавьте в TOML-конфиг:${RESET}"
+        echo ""
+        echo -e "  ${CYAN}[[upstreams]]${RESET}"
+        echo -e "  ${CYAN}type = \"socks5\"${RESET}"
+        echo -e "  ${CYAN}address = \"127.0.0.1:40000\"${RESET}"
+        echo -e "  ${CYAN}weight = 1${RESET}"
+        echo -e "  ${CYAN}enabled = true${RESET}"
+        echo ""
+        info "После этого перезапустите telemt: ${BOLD}systemctl restart <ваш telemt service>${RESET}"
+    fi
+
+    # Финал
+    echo ""
+    hdr "Готово"
+    echo ""
+    ok "xray-core установлен и активен"
+    [[ "$VLESS_TYPE" == "subscription" && "$VLESS_AUTO_REFRESH" == true ]] && \
+        ok "Авто-обновление подписки: каждые 6 часов"
+    echo ""
+    info "Управление через ${BOLD}mytelemtinfo${RESET} → 7. VLESS Reality upstream"
+    info "(если mytelemtinfo не установлен — запустите install.sh обычным образом)"
+    echo ""
+    info "Тест туннеля:"
+    echo -e "  ${DIM}curl --socks5 127.0.0.1:40000 https://api.ipify.org${RESET}"
+    echo ""
+    exit 0
+}
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 main() {
     # Перенаправляем stdin на /dev/tty — это нужно когда скрипт запускается через
@@ -1682,35 +1904,44 @@ main() {
     # Флаги командной строки
     [[ "${1:-}" == "--update" ]] && do_update
     [[ "${1:-}" == "--purge"  ]] && do_purge_only
+    [[ "${1:-}" == "--vless-only" ]] && do_vless_only_install
 
     echo -e "  Установка ${BOLD}telemt${RESET} — Telegram MTProxy на Rust."
     echo ""
 
     # Определяем что уже установлено
     local existing_install=false
+    local telemt_exists=false
     if [[ -f /bin/telemt ]] || [[ -d /etc/telemt ]] || [[ -f /usr/local/bin/mytelemtinfo ]]; then
         existing_install=true
     fi
+    # Проверяем, есть ли вообще telemt на сервере (мог быть установлен не нашим скриптом)
+    if command -v telemt &>/dev/null || [[ -x /bin/telemt ]] || [[ -x /usr/local/bin/telemt ]] || [[ -x /usr/bin/telemt ]]; then
+        telemt_exists=true
+    fi
 
-    # Если что-то уже установлено или передан флаг --clean — предлагаем меню режимов
-    if [[ "$existing_install" == true || "${1:-}" == "--clean" ]]; then
+    # Меню режимов показываем если: есть существующая установка ИЛИ есть telemt от другого
+    # установщика ИЛИ передан --clean
+    if [[ "$existing_install" == true || "$telemt_exists" == true || "${1:-}" == "--clean" ]]; then
         if [[ "$existing_install" == true ]]; then
             warn "Обнаружена существующая установка telemt-install."
-            echo ""
+        elif [[ "$telemt_exists" == true ]]; then
+            info "Обнаружен telemt установленный другим способом (не нашим скриптом)."
         fi
+        echo ""
         echo -e "  ${BOLD}Выберите режим:${RESET}"
         echo -e "  ${BOLD}1.${RESET} Установка поверх ${DIM}(обычная, существующие конфиги сохраняются)${RESET}"
         echo -e "  ${BOLD}2.${RESET} ${YELLOW}Чистая установка${RESET} ${DIM}(полная очистка + новая установка)${RESET}"
         echo -e "  ${BOLD}3.${RESET} ${RED}Только очистка${RESET} ${DIM}(удалить всё без новой установки)${RESET}"
+        echo -e "  ${BOLD}${CYAN}4.${RESET} ${CYAN}Только установить VLESS туннель${RESET} ${DIM}(xray поверх существующего telemt)${RESET}"
         echo -e "  ${BOLD}0.${RESET} Отмена"
         echo ""
         local mode
-        # Если передан --clean — сразу режим 2
         if [[ "${1:-}" == "--clean" ]]; then
             mode=2
             info "Режим --clean: чистая установка"
         else
-            read -rp "  Режим [1/2/3/0]: " mode
+            read -rp "  Режим [1/2/3/4/0]: " mode
         fi
         case "$mode" in
             1) info "Режим: установка поверх существующей" ;;
@@ -1725,6 +1956,7 @@ main() {
                 sleep 2
                 ;;
             3) do_purge_only ;;
+            4) do_vless_only_install ;;
             0|q|"") echo -e "${YELLOW}Отменено.${RESET}"; exit 0 ;;
             *) err "Неверный пункт"; exit 1 ;;
         esac
