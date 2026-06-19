@@ -259,6 +259,16 @@ select_components() {
         ok "Таймауты: tg_connect=$TM_TG client_handshake=$TM_HS client_keepalive=$TM_KA"
     fi
 
+    # --- client_mss = "tspu" — обход ТСПУ (специфично для РФ) ---
+    echo ""
+    echo -e "  ${BOLD}Обход ТСПУ (client_mss = \"tspu\")${RESET}"
+    echo -e "  Адаптирует MSS под фильтрацию ТСПУ (Технические Средства Противодействия Угрозам)."
+    echo -e "  ${DIM}Нужно если сервер в РФ или провайдер фильтрует MTProxy через MSS.${RESET}"
+    echo -e "  ${DIM}Если сервер вне РФ и нет проблем с подключением — можно отключить.${RESET}"
+    USE_TSPU=true
+    read -rp "$(echo -e "${YELLOW}?${RESET} Включить client_mss=\"tspu\"? [Y/n]: ")" ans
+    [[ "${ans,,}" =~ ^(n|no|н|нет)$ ]] && USE_TSPU=false
+
     # --- Свой домен вместо IP в ссылке для клиента ---
     echo ""
     echo -e "  ${BOLD}Свой домен в ссылке для клиента${RESET}"
@@ -550,6 +560,9 @@ step_configs() {
         # Базовый конфиг
         local tg_line=""
         [[ "${DO_TIMEOUTS:-false}" == true ]] && tg_line="tg_connect = ${TM_TG:-10}"
+        # client_mss = "tspu" — комментируем если отключено
+        local tspu_line='client_mss = "tspu"'
+        [[ "${USE_TSPU:-true}" == false ]] && tspu_line='#client_mss = "tspu"   # отключено: обход ТСПУ (РФ-фильтрация)'
         cat > "/etc/telemt/telemt${n}.toml" << TOML
 [general]
 fast_mode = true
@@ -573,7 +586,7 @@ prefer = 4
 [server]
 port = ${port}
 listen_addr_ipv4 = "0.0.0.0"
-client_mss = "tspu"
+${tspu_line}
 
 [server.api]
 enabled = true
@@ -1459,6 +1472,8 @@ print_summary() {
     [[ "${DO_NFT:-false}"      == true ]] && echo -e "  ${GREEN}✓${RESET} nft SYN limiter (${NFT_RATE} burst ${NFT_BURST})"
     [[ "${DO_TIMEOUTS:-false}" == true ]] && echo -e "  ${GREEN}✓${RESET} [timeouts]: tg_connect=${TM_TG} handshake=${TM_HS} keepalive=${TM_KA}"
     [[ "${USE_CUSTOM_DOMAIN:-false}" == true ]] && echo -e "  ${GREEN}✓${RESET} Свой домен в ссылках: ${BOLD}${CUSTOM_LINK_DOMAIN}${RESET}"
+    [[ "${USE_TSPU:-true}" == true ]] && echo -e "  ${GREEN}✓${RESET} client_mss=\"tspu\" ${DIM}— обход ТСПУ${RESET}"
+    [[ "${USE_TSPU:-true}" == false ]] && echo -e "  ${YELLOW}○${RESET} client_mss=\"tspu\" ${DIM}— отключён (закомментирован)${RESET}"
     [[ "${DO_VLESS:-false}"    == true ]] && echo -e "  ${GREEN}✓${RESET} VLESS Reality upstream (telemt → SOCKS5 → 3x-ui → Telegram DC)"
 
     echo ""
@@ -1978,6 +1993,7 @@ main() {
     echo -e "  nft limiter:     ${DO_NFT:-false}"
     echo -e "  Таймауты:        ${DO_TIMEOUTS:-false}"
     echo -e "  Свой домен:      ${USE_CUSTOM_DOMAIN:-false}${USE_CUSTOM_DOMAIN:+ (${CUSTOM_LINK_DOMAIN})}"
+    echo -e "  client_mss=tspu: ${USE_TSPU:-true}"
     echo -e "  VLESS Reality:   ${DO_VLESS:-false}"
     echo ""
     confirm "Всё верно — поехали?" exit
