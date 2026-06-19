@@ -2374,9 +2374,11 @@ menu_vless() {
 
 # Запрос ссылки/подписки. echo'ит обратно через stdout: type|link[|strategy]
 vless_ask_link_or_subscription() {
-    echo "  ${BOLD}Тип подключения:${RESET}" >&2
-    echo "  ${GREEN}1${RESET} — одна ${BOLD}vless://${RESET} ссылка" >&2
-    echo "  ${GREEN}2${RESET} — ${BOLD}подписка${RESET} 3x-ui (несколько узлов)" >&2
+    echo -e "" >&2
+    echo -e "  ${BOLD}Тип подключения:${RESET}" >&2
+    echo -e "  ${GREEN}1${RESET} — одна ${BOLD}vless://${RESET} ссылка ${DIM}(vless://uuid@server:port?...)${RESET}" >&2
+    echo -e "  ${GREEN}2${RESET} — ${BOLD}подписка${RESET} 3x-ui ${DIM}(https://server:port/path/sub-id)${RESET}" >&2
+    echo -e "" >&2
     local choice
     while true; do
         read -rp "  Тип [1/2]: " choice >&2
@@ -2390,7 +2392,7 @@ vless_ask_link_or_subscription() {
             if [[ "$lnk" == vless://*@*:*\?* ]] && [[ "$lnk" == *security=reality* ]] \
                && [[ "$lnk" == *pbk=* ]] && [[ "$lnk" == *sni=* ]]; then
                 if VL="$lnk" python3 -c "import os,urllib.parse as up,sys;p=up.urlparse(os.environ['VL']);q=up.parse_qs(p.query);sys.exit(0 if (p.username and p.hostname and p.port and 'pbk' in q and 'sni' in q) else 1)" 2>/dev/null; then
-                    echo "single|${lnk}"
+                    printf '%s\n' "single|${lnk}"
                     return 0
                 fi
             fi
@@ -2432,10 +2434,10 @@ PYT
                     ok "Подписка работает: найдено ${nodes_count} узлов" >&2
                     # Выбор стратегии
                     echo "" >&2
-                    echo "  ${BOLD}Стратегия балансировки:${RESET}" >&2
-                    echo "  ${GREEN}1${RESET} — leastPing (рекомендуется)" >&2
-                    echo "  ${GREEN}2${RESET} — roundRobin" >&2
-                    echo "  ${GREEN}3${RESET} — random" >&2
+                    echo -e "  ${BOLD}Стратегия балансировки:${RESET}" >&2
+                    echo -e "  ${GREEN}1${RESET} — leastPing (рекомендуется)" >&2
+                    echo -e "  ${GREEN}2${RESET} — roundRobin" >&2
+                    echo -e "  ${GREEN}3${RESET} — random" >&2
                     local stratch strat
                     while true; do
                         read -rp "  Стратегия [1/2/3]: " stratch >&2
@@ -2446,7 +2448,7 @@ PYT
                             *)    warn "1-3" >&2 ;;
                         esac
                     done
-                    echo "subscription|${sub}|${strat}"
+                    printf '%s\n' "subscription|${sub}|${strat}"
                     return 0
                 fi
                 warn "Не удалось извлечь узлы. Формат подписки base64-plain?" >&2
