@@ -112,6 +112,128 @@ BANNER
 }
 
 # ─── Определение SSH-порта ────────────────────────────────────────────────────
+# ─── Выбор сценария: Стандарт / Свой сайт ──────────────────────────────────
+select_scenario() {
+    INSTALL_SCENARIO="standard"  # стандарт по умолчанию
+
+    echo ""
+    echo -e "  ${BOLD}${CYAN}Что устанавливать?${RESET}"
+    echo ""
+    echo -e "  ${BOLD}1.${RESET} ${BOLD}Стандартная установка${RESET}"
+    echo -e "      MTProxy на нескольких портах (443/5223/8530) с маскировкой под SNI."
+    echo -e "      ${DIM}UFW, keepalive, BBR, nft, VLESS upstream, свой домен в ссылке.${RESET}"
+    echo ""
+    echo -e "  ${BOLD}2.${RESET} ${BOLD}Свой сайт${RESET} ${DIM}(домен с заглушкой + MTProxy на 443)${RESET}"
+    echo -e "      Поднимает реальный сайт через nginx + Let's Encrypt на порту 8443,"
+    echo -e "      MTProxy слушает 443. В ссылке клиента — домен сайта."
+    echo ""
+    local ch
+    while true; do
+        read -rp "  ${YELLOW}?${RESET} Сценарий [1/2]: " ch
+        case "$ch" in
+            1|"") INSTALL_SCENARIO="standard"; ok "Сценарий: Стандартная установка"; break ;;
+            2)    INSTALL_SCENARIO="site";     ok "Сценарий: Свой сайт";              break ;;
+            0|q)  echo -e "${YELLOW}Отменено.${RESET}"; exit 0 ;;
+            *)    warn "Введите 1, 2 или 0" ;;
+        esac
+    done
+    echo ""
+}
+
+# ─── Запрос параметров сайта (для сценария site) ────────────────────────────
+ask_site_details() {
+    SITE_DOMAIN=""
+    SITE_EMAIL=""
+    SITE_TEMPLATE_URL="https://github.com/vaalaav/Market-Terminal-Template"
+    SITE_PORT="8443"   # фиксированный порт для сайта
+
+    echo ""
+    hdr "Настройка сайта-заглушки"
+    echo ""
+    echo -e "  Сайт будет на ${BOLD}${SITE_PORT}${RESET} порту, MTProxy остаётся на ${BOLD}443${RESET}."
+    echo -e "  ${DIM}Требование: A-запись домен → IP этого сервера должна быть настроена.${RESET}"
+    echo ""
+
+    # 1) Домен с проверкой DNS
+    local server_ip resolved_ip
+    server_ip=$(get_public_ip)
+    [[ -n "$server_ip" ]] && info "IP этого сервера: ${BOLD}${server_ip}${RESET}"
+    echo ""
+
+    while true; do
+        read -rp "  Домен для сайта (например site.example.com): " SITE_DOMAIN
+        if [[ -z "$SITE_DOMAIN" ]]; then
+            warn "Домен обязателен"; continue
+        fi
+        if [[ "$SITE_DOMAIN" != *.* ]]; then
+            warn "Введите корректное FQDN (с точкой), например proxy.example.com"; continue
+        fi
+
+        # Проверка A-записи
+        info "Проверка DNS (резолв $SITE_DOMAIN)..."
+        resolved_ip=$(getent hosts "$SITE_DOMAIN" 2>/dev/null | awk '{print $1}' | head -1)
+        if [[ -z "$resolved_ip" ]]; then
+            err "Домен не резолвится. Настройте A-запись и подождите пока DNS обновится."
+            read -rp "  Попробовать ещё раз? [Y/n]: " r
+            [[ "${r,,}" =~ ^(n|no)$ ]] && { err "Установка прервана"; exit 1; }
+            continue
+        fi
+        if [[ -n "$server_ip" && "$resolved_ip" != "$server_ip" ]]; then
+            err "DNS-несовпадение: $SITE_DOMAIN → $resolved_ip, IP сервера → $server_ip"
+            warn "certbot не сможет выпустить сертификат — установка прервана"
+            read -rp "  Попробовать другой домен? [Y/n]: " r
+            [[ "${r,,}" =~ ^(n|no)$ ]] && { err "Установка прервана"; exit 1; }
+            continue
+        fi
+        ok "DNS корректен: $SITE_DOMAIN → $resolved_ip"
+        break
+    done
+
+    # 2) Email для Let's Encrypt
+    echo ""
+    while true; do
+        read -rp "  Email для Let's Encrypt (для уведомлений об истечении): " SITE_EMAIL
+        if [[ "$SITE_EMAIL" =~ ^[^@]+@[^@]+\.[^@]+$ ]]; then
+            ok "Email: $SITE_EMAIL"
+            break
+        fi
+        warn "Введите корректный email (например you@example.com)"
+    done
+
+    # 3) Шаблон сайта
+    echo ""
+    echo -e "  ${BOLD}Шаблон сайта:${RESET}"
+    echo -e "  ${GREEN}1${RESET} — ${BOLD}vaalaav/Market-Terminal-Template${RESET} ${DIM}(по умолчанию)${RESET}"
+    echo -e "  ${GREEN}2${RESET} — другой GitHub-репозиторий"
+    local tch
+    while true; do
+        read -rp "  Выбор [1/2]: " tch
+        case "$tch" in
+            1|"") SITE_TEMPLATE_URL="https://github.com/vaalaav/Market-Terminal-Template"; break ;;
+            2)
+                while true; do
+                    read -rp "  URL GitHub-репозитория: " SITE_TEMPLATE_URL
+                    if [[ "$SITE_TEMPLATE_URL" =~ ^https://github\.com/[^/]+/[^/]+/?$ ]]; then
+                        break
+                    fi
+                    warn "Формат: https://github.com/user/repo"
+                done
+                break
+                ;;
+            *) warn "1 или 2" ;;
+        esac
+    done
+    ok "Шаблон: $SITE_TEMPLATE_URL"
+
+    # Фиксируем параметры инстанса telemt для сценария site:
+    # один инстанс на 443, домен совпадает с реальным сайтом
+    INSTANCES=(1)
+    CUSTOM_PORTS[1]=443
+    CUSTOM_DOMAINS[1]="$SITE_DOMAIN"
+    CUSTOM_APIS[1]=9091
+    info "Сценарий site: создаётся 1 инстанс telemt на порту 443 с tls_domain=$SITE_DOMAIN"
+}
+
 detect_ssh_port() {
     SSH_PORT=$(ss -tlnp 2>/dev/null | awk '/sshd/{print $4}' | grep -oE '[0-9]+$' | head -1)
     SSH_PORT="${SSH_PORT:-22}"
@@ -126,26 +248,32 @@ select_components() {
     hdr "Шаг 0 — Выбор компонентов"
 
     # --- Инстансы ---
-    echo ""
-    echo -e "  ${BOLD}Инстансы telemt:${RESET}"
-    echo -e "  ${GREEN}1${RESET} — порт ${BOLD}443${RESET}   | ${CYAN}www.cloudflare.com${RESET}  (HTTPS/CDN)"
-    echo -e "  ${GREEN}2${RESET} — порт ${BOLD}5223${RESET}  | ${CYAN}www.apple.com${RESET}       (Apple Push / Anti-DPI)"
-    echo -e "  ${GREEN}3${RESET} — порт ${BOLD}8530${RESET}  | ${CYAN}www.microsoft.com${RESET}   (Windows Update)"
-    echo -e "  ${GREEN}4${RESET} — ${BOLD}свой инстанс${RESET} | ${DIM}задаются вручную SNI и порт${RESET}"
-    echo ""
-    echo -e "  Введите номера через пробел или ${BOLD}all${RESET} (1 2 3, без 4):"
-    while true; do
-        read -rp "$(echo -e "${YELLOW}?${RESET} Инстансы [all]: ")" sel
-        sel="${sel:-all}"
-        if [[ "$sel" == "all" ]]; then INSTANCES=(1 2 3); break; fi
-        INSTANCES=(); valid=true
-        for n in $sel; do
-            [[ "$n" =~ ^[1-4]$ ]] && INSTANCES+=("$n") || { warn "Неверный номер: $n (допустимо 1-4)"; valid=false; break; }
+    # В сценарии 'site' инстансы уже зафиксированы в ask_site_details (1 шт. на 443)
+    if [[ "${INSTALL_SCENARIO:-standard}" == "site" ]]; then
+        echo ""
+        info "Сценарий 'Свой сайт': инстанс telemt автоматически создаётся на порту 443"
+        info "с tls_domain=${SITE_DOMAIN} (для совпадения с доменом сайта)"
+    else
+        echo ""
+        echo -e "  ${BOLD}Инстансы telemt:${RESET}"
+        echo -e "  ${GREEN}1${RESET} — порт ${BOLD}443${RESET}   | ${CYAN}www.cloudflare.com${RESET}  (HTTPS/CDN)"
+        echo -e "  ${GREEN}2${RESET} — порт ${BOLD}5223${RESET}  | ${CYAN}www.apple.com${RESET}       (Apple Push / Anti-DPI)"
+        echo -e "  ${GREEN}3${RESET} — порт ${BOLD}8530${RESET}  | ${CYAN}www.microsoft.com${RESET}   (Windows Update)"
+        echo -e "  ${GREEN}4${RESET} — ${BOLD}свой инстанс${RESET} | ${DIM}задаются вручную SNI и порт${RESET}"
+        echo ""
+        echo -e "  Введите номера через пробел или ${BOLD}all${RESET} (1 2 3, без 4):"
+        while true; do
+            read -rp "$(echo -e "${YELLOW}?${RESET} Инстансы [all]: ")" sel
+            sel="${sel:-all}"
+            if [[ "$sel" == "all" ]]; then INSTANCES=(1 2 3); break; fi
+            INSTANCES=(); valid=true
+            for n in $sel; do
+                [[ "$n" =~ ^[1-4]$ ]] && INSTANCES+=("$n") || { warn "Неверный номер: $n (допустимо 1-4)"; valid=false; break; }
+            done
+            [[ "$valid" == true && ${#INSTANCES[@]} -gt 0 ]] && break
         done
-        [[ "$valid" == true && ${#INSTANCES[@]} -gt 0 ]] && break
-    done
 
-    # Если выбран кастомный инстанс — спрашиваем SNI и порт
+        # Если выбран кастомный инстанс — спрашиваем SNI и порт
     if [[ " ${INSTANCES[*]} " =~ " 4 " ]]; then
         echo ""
         echo -e "  ${BOLD}Настройка кастомного инстанса (№4)${RESET}"
@@ -185,6 +313,7 @@ select_components() {
         ok "Инстанс 4 (свой): порт=${BOLD}${CUSTOM_PORTS[4]}${RESET}  SNI=${CYAN}${CUSTOM_DOMAINS[4]}${RESET}"
     fi
     ok "Инстансы: ${INSTANCES[*]}"
+    fi   # конец else блока для INSTALL_SCENARIO != site
 
     # --- UFW ---
     echo ""
@@ -270,47 +399,59 @@ select_components() {
     [[ "${ans,,}" =~ ^(n|no|н|нет)$ ]] && USE_TSPU=false
 
     # --- Свой домен вместо IP в ссылке для клиента ---
-    echo ""
-    echo -e "  ${BOLD}Свой домен в ссылке для клиента${RESET}"
-    echo -e "  Вместо ${BOLD}server=РЕАЛЬНЫЙ_IP${RESET} в tg://proxy?... будет ${BOLD}server=твой.домен${RESET}"
-    echo -e "  ${DIM}Требование: A-запись твой.домен → IP этого сервера должна быть настроена в DNS.${RESET}"
-    echo -e "  ${DIM}Это чистая косметика — Telegram-клиент сам резолвит домен в IP перед коннектом.${RESET}"
-    USE_CUSTOM_DOMAIN=false
-    CUSTOM_LINK_DOMAIN=""
-    read -rp "$(echo -e "${YELLOW}?${RESET} Использовать свой домен? [y/N]: ")" ans
-    if [[ "${ans,,}" =~ ^(y|yes|д|да)$ ]]; then
-        while true; do
-            read -rp "$(echo -e "  ${YELLOW}→${RESET} Введите домен (например proxy.example.com): ")" inp_dom
-            if [[ -n "$inp_dom" && "$inp_dom" == *.* ]]; then
-                CUSTOM_LINK_DOMAIN="$inp_dom"
-                USE_CUSTOM_DOMAIN=true
-                # Проверяем что домен резолвится в IP этого сервера
-                local resolved_ip server_ip
-                resolved_ip=$(getent hosts "$inp_dom" 2>/dev/null | awk '{print $1}' | head -1)
-                server_ip=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null \
-                            || ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}')
-                if [[ -n "$resolved_ip" && -n "$server_ip" ]]; then
-                    if [[ "$resolved_ip" == "$server_ip" ]]; then
-                        ok "Домен резолвится в IP сервера ($server_ip) — всё верно"
-                    else
-                        warn "Внимание: домен резолвится в $resolved_ip, а IP сервера — $server_ip"
-                        warn "Возможно DNS ещё не обновился или A-запись указывает на другой хост"
-                        read -rp "  Продолжить с этим доменом? [Y/n]: " conf
-                        [[ "${conf,,}" =~ ^(n|no)$ ]] && { USE_CUSTOM_DOMAIN=false; CUSTOM_LINK_DOMAIN=""; continue; }
-                    fi
-                else
-                    warn "Не удалось проверить DNS — домен будет использован как есть"
-                fi
-                break
-            else
-                warn "Введите корректный домен (например proxy.example.com)"
-            fi
-        done
-        ok "В ссылках для клиентов будет: ${BOLD}${CUSTOM_LINK_DOMAIN}${RESET}"
-        # Сохраняем в файл состояния для mytelemtinfo
+    if [[ "${INSTALL_SCENARIO:-standard}" == "site" ]]; then
+        # В сценарии site домен берётся из SITE_DOMAIN автоматически
+        USE_CUSTOM_DOMAIN=true
+        CUSTOM_LINK_DOMAIN="${SITE_DOMAIN:-}"
         mkdir -p /etc/telemt
-        echo "$CUSTOM_LINK_DOMAIN" > /etc/telemt/.custom_domain
-        chmod 644 /etc/telemt/.custom_domain
+        if [[ -n "$CUSTOM_LINK_DOMAIN" ]]; then
+            echo "$CUSTOM_LINK_DOMAIN" > /etc/telemt/.custom_domain
+            chmod 644 /etc/telemt/.custom_domain
+            info "В ссылках клиентов будет домен сайта: ${BOLD}${CUSTOM_LINK_DOMAIN}${RESET}"
+        fi
+    else
+        echo ""
+        echo -e "  ${BOLD}Свой домен в ссылке для клиента${RESET}"
+        echo -e "  Вместо ${BOLD}server=РЕАЛЬНЫЙ_IP${RESET} в tg://proxy?... будет ${BOLD}server=твой.домен${RESET}"
+        echo -e "  ${DIM}Требование: A-запись твой.домен → IP этого сервера должна быть настроена в DNS.${RESET}"
+        echo -e "  ${DIM}Это чистая косметика — Telegram-клиент сам резолвит домен в IP перед коннектом.${RESET}"
+        USE_CUSTOM_DOMAIN=false
+        CUSTOM_LINK_DOMAIN=""
+        read -rp "$(echo -e "${YELLOW}?${RESET} Использовать свой домен? [y/N]: ")" ans
+        if [[ "${ans,,}" =~ ^(y|yes|д|да)$ ]]; then
+            while true; do
+                read -rp "$(echo -e "  ${YELLOW}→${RESET} Введите домен (например proxy.example.com): ")" inp_dom
+                if [[ -n "$inp_dom" && "$inp_dom" == *.* ]]; then
+                    CUSTOM_LINK_DOMAIN="$inp_dom"
+                    USE_CUSTOM_DOMAIN=true
+                    # Проверяем что домен резолвится в IP этого сервера
+                    local resolved_ip server_ip
+                    resolved_ip=$(getent hosts "$inp_dom" 2>/dev/null | awk '{print $1}' | head -1)
+                    server_ip=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null \
+                                || ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}')
+                    if [[ -n "$resolved_ip" && -n "$server_ip" ]]; then
+                        if [[ "$resolved_ip" == "$server_ip" ]]; then
+                            ok "Домен резолвится в IP сервера ($server_ip) — всё верно"
+                        else
+                            warn "Внимание: домен резолвится в $resolved_ip, а IP сервера — $server_ip"
+                            warn "Возможно DNS ещё не обновился или A-запись указывает на другой хост"
+                            read -rp "  Продолжить с этим доменом? [Y/n]: " conf
+                            [[ "${conf,,}" =~ ^(n|no)$ ]] && { USE_CUSTOM_DOMAIN=false; CUSTOM_LINK_DOMAIN=""; continue; }
+                        fi
+                    else
+                        warn "Не удалось проверить DNS — домен будет использован как есть"
+                    fi
+                    break
+                else
+                    warn "Введите корректный домен (например proxy.example.com)"
+                fi
+            done
+            ok "В ссылках для клиентов будет: ${BOLD}${CUSTOM_LINK_DOMAIN}${RESET}"
+            # Сохраняем в файл состояния для mytelemtinfo
+            mkdir -p /etc/telemt
+            echo "$CUSTOM_LINK_DOMAIN" > /etc/telemt/.custom_domain
+            chmod 644 /etc/telemt/.custom_domain
+        fi
     fi
 
     # --- VLESS Reality upstream для Telegram DC ---
@@ -692,6 +833,14 @@ step_ufw() {
         ufw allow "${port}/tcp"
         ok "Порт $port открыт"
     done
+
+    # В сценарии site открываем 80 (ACME) и SITE_PORT (сайт)
+    if [[ "${INSTALL_SCENARIO:-standard}" == "site" ]]; then
+        ufw allow 80/tcp
+        ok "Порт 80 открыт (Let's Encrypt ACME)"
+        ufw allow "${SITE_PORT:-8443}/tcp"
+        ok "Порт ${SITE_PORT:-8443} открыт (сайт-заглушка)"
+    fi
 
     if ufw --force enable; then
         ok "UFW включён"
@@ -1328,6 +1477,225 @@ TUNIT
     systemctl enable --now telemt-vless-refresh.timer 2>&1 | grep -v "Created symlink" || true
 }
 
+# ═════════════════════════════════════════════════════════════════════════════
+# Сайт-заглушка (для сценария INSTALL_SCENARIO=site)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Шаг: установка nginx, certbot, git
+step_install_site_deps() {
+    hdr "Сайт: установка nginx + certbot + git"
+    confirm "Установить?" skip || return 0
+
+    wait_apt
+    if ! apt-get install -y nginx certbot python3-certbot-nginx git curl 2>&1 | tail -3; then
+        err "Не удалось установить зависимости — пропуск сайта"
+        return 1
+    fi
+    ok "nginx + certbot + git установлены"
+    systemctl enable --now nginx 2>&1 | grep -v "Created symlink" || true
+    ok "nginx запущен"
+}
+
+# Шаг: клонирование шаблона из GitHub
+step_clone_site_template() {
+    hdr "Сайт: клонирование шаблона"
+    info "Шаблон: ${BOLD}${SITE_TEMPLATE_URL}${RESET}"
+    confirm "Клонировать в /var/www/telemt-site?" skip || return 0
+
+    # Чистим старое если есть
+    if [[ -d /var/www/telemt-site ]]; then
+        warn "Старая директория /var/www/telemt-site существует — будет заменена"
+        rm -rf /var/www/telemt-site
+    fi
+    mkdir -p /var/www
+
+    if ! git clone --depth 1 "$SITE_TEMPLATE_URL" /var/www/telemt-site 2>&1; then
+        err "Не удалось клонировать шаблон"
+        # Резерв: ставим простую страницу-заглушку
+        mkdir -p /var/www/telemt-site
+        cat > /var/www/telemt-site/index.html << 'HTMLFB'
+<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8"><title>Сайт в разработке</title>
+<style>body{font-family:sans-serif;text-align:center;padding:3em;background:#f4f4f4;color:#333}</style>
+</head><body><h1>Сайт в разработке</h1><p>Coming soon.</p></body></html>
+HTMLFB
+        warn "Создана резервная заглушка"
+    else
+        ok "Шаблон склонирован: $(ls /var/www/telemt-site | head -5 | tr '\\n' ' ')..."
+    fi
+
+    chown -R www-data:www-data /var/www/telemt-site
+    chmod -R o+rX /var/www/telemt-site
+}
+
+# Шаг: настройка nginx (HTTP для ACME + HTTPS-сайт на 8443)
+step_setup_nginx() {
+    hdr "Сайт: настройка nginx (HTTP для ACME + HTTPS на ${SITE_PORT})"
+    confirm "Создать конфиг nginx?" skip || return 0
+
+    mkdir -p /var/www/letsencrypt
+
+    # HTTP-блок (для certbot ACME challenge); основной HTTPS-блок создадим ПОСЛЕ certbot
+    cat > /etc/nginx/sites-available/telemt-site.conf << NGINX
+# Сайт-заглушка telemt-install
+# HTTP-блок — только для Let's Encrypt ACME challenge
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${SITE_DOMAIN};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+        default_type "text/plain";
+    }
+    location / {
+        return 444;   # тихо обрываем любые другие запросы по HTTP
+    }
+}
+NGINX
+
+    # Включаем
+    ln -sf /etc/nginx/sites-available/telemt-site.conf /etc/nginx/sites-enabled/telemt-site.conf
+
+    # Убираем default site чтобы не было конфликта
+    rm -f /etc/nginx/sites-enabled/default
+
+    if ! nginx -t 2>&1 | tail -3; then
+        err "nginx -t не прошёл"
+        return 1
+    fi
+    systemctl reload nginx
+    ok "nginx настроен (HTTP-блок для ACME)"
+}
+
+# Шаг: получение сертификата Let's Encrypt через webroot
+step_get_certbot_cert() {
+    hdr "Сайт: получение сертификата Let's Encrypt"
+    confirm "Запустить certbot?" skip || return 0
+
+    if [[ -z "${SITE_DOMAIN:-}" || -z "${SITE_EMAIL:-}" ]]; then
+        err "Не заданы SITE_DOMAIN или SITE_EMAIL"
+        return 1
+    fi
+
+    info "Запрос сертификата для $SITE_DOMAIN..."
+    if ! certbot certonly --webroot -w /var/www/letsencrypt \
+        -d "$SITE_DOMAIN" --email "$SITE_EMAIL" \
+        --agree-tos --non-interactive --no-eff-email 2>&1 | tail -10; then
+        err "certbot не смог выпустить сертификат"
+        warn "Проверьте: 1) DNS A-запись $SITE_DOMAIN указывает на сервер"
+        warn "          2) Порт 80 не блокируется фаерволом или другим сервисом"
+        warn "Сайт будет работать в режиме self-signed или его можно настроить вручную позже"
+        return 1
+    fi
+
+    ok "Сертификат получен: /etc/letsencrypt/live/$SITE_DOMAIN/"
+
+    # Теперь добавляем HTTPS-блок на $SITE_PORT
+    cat > /etc/nginx/sites-available/telemt-site.conf << NGINX
+# Сайт-заглушка telemt-install
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${SITE_DOMAIN};
+    location /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+        default_type "text/plain";
+    }
+    location / { return 444; }
+}
+
+server {
+    listen ${SITE_PORT} ssl http2;
+    listen [::]:${SITE_PORT} ssl http2;
+    server_name ${SITE_DOMAIN};
+
+    ssl_certificate     /etc/letsencrypt/live/${SITE_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${SITE_DOMAIN}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+
+    root /var/www/telemt-site;
+    index index.html index.htm;
+
+    server_tokens off;
+
+    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
+}
+NGINX
+
+    if ! nginx -t 2>&1 | tail -3; then
+        err "nginx -t (с HTTPS) не прошёл"
+        return 1
+    fi
+    systemctl reload nginx
+    ok "nginx переключён на HTTPS на порту ${SITE_PORT}"
+
+    # Автообновление сертификата — certbot ставит свой timer, проверим что он активен
+    if systemctl list-unit-files 2>/dev/null | grep -q "certbot.timer"; then
+        systemctl enable --now certbot.timer 2>&1 | grep -v "Created symlink" || true
+        ok "Автообновление сертификата: certbot.timer активен"
+    fi
+}
+
+# Шаг: проверка работоспособности сайта + telemt + связки
+step_site_health_check() {
+    hdr "Сайт: проверка работоспособности"
+
+    local issues=0
+
+    # 1. nginx active
+    if systemctl is-active --quiet nginx; then
+        ok "nginx: active"
+    else
+        err "nginx: НЕ active"
+        issues=$((issues+1))
+    fi
+
+    # 2. Сертификат существует и валиден
+    local cert="/etc/letsencrypt/live/${SITE_DOMAIN}/fullchain.pem"
+    if [[ -f "$cert" ]]; then
+        local exp_date
+        exp_date=$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)
+        ok "Сертификат: действителен до ${BOLD}${exp_date}${RESET}"
+    else
+        err "Сертификат не найден: $cert"
+        issues=$((issues+1))
+    fi
+
+    # 3. HTTPS на 8443 отвечает 200
+    sleep 2  # дать nginx время на reload
+    local http_code
+    http_code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
+        "https://${SITE_DOMAIN}:${SITE_PORT}/" 2>/dev/null || echo "000")
+    if [[ "$http_code" == "200" || "$http_code" == "30"* ]]; then
+        ok "Сайт отвечает: https://${SITE_DOMAIN}:${SITE_PORT}/ → ${http_code}"
+    else
+        warn "Сайт ответил кодом: ${http_code} (ожидался 200)"
+        issues=$((issues+1))
+    fi
+
+    # 4. tls_domain в telemt-конфиге совпадает с SITE_DOMAIN
+    if [[ -f /etc/telemt/telemt1.toml ]]; then
+        if grep -q "tls_domain = \"${SITE_DOMAIN}\"" /etc/telemt/telemt1.toml; then
+            ok "tls_domain в telemt совпадает с доменом сайта"
+        else
+            warn "tls_domain в /etc/telemt/telemt1.toml не равен ${SITE_DOMAIN}"
+            issues=$((issues+1))
+        fi
+    fi
+
+    echo ""
+    if [[ $issues -eq 0 ]]; then
+        ok "${BOLD}Сайт-заглушка работает корректно${RESET}"
+    else
+        warn "${BOLD}Найдено проблем: ${issues}${RESET}"
+    fi
+}
+
 # ─── ШАГ: Установка mytelemtinfo ─────────────────────────────────────────────
 step_install_mytelemtinfo() {
     hdr "Установка команды mytelemtinfo"
@@ -1431,6 +1799,26 @@ print_summary() {
                "$n" "$port" "$domain" "$status_disp"
     done
     echo -e "  ${CYAN}└──────┴───────┴────────────────────────┴───────────┘${RESET}"
+
+    # ── Блок про сайт-заглушку (только для сценария site) ──
+    if [[ "${INSTALL_SCENARIO:-standard}" == "site" && -n "${SITE_DOMAIN:-}" ]]; then
+        echo ""
+        echo -e "  ${BOLD}Сайт-заглушка:${RESET}"
+        local site_status; site_status=$(systemctl is-active nginx 2>/dev/null)
+        local site_st_disp
+        case "$site_status" in
+            active)   site_st_disp="${GREEN}▶ active${RESET}" ;;
+            *)        site_st_disp="${RED}■ ${site_status}${RESET}" ;;
+        esac
+        echo -e "  nginx:    ${site_st_disp}"
+        echo -e "  URL:      ${CYAN}https://${SITE_DOMAIN}:${SITE_PORT:-8443}/${RESET}"
+        local cert="/etc/letsencrypt/live/${SITE_DOMAIN}/fullchain.pem"
+        if [[ -f "$cert" ]]; then
+            local exp; exp=$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)
+            echo -e "  Сертификат: ${GREEN}валиден до ${exp}${RESET}"
+        fi
+        echo -e "  Шаблон:   ${DIM}${SITE_TEMPLATE_URL}${RESET}"
+    fi
 
     echo ""
 
@@ -1566,6 +1954,34 @@ do_purge_all() {
             info "Бинарник /usr/local/bin/xray не тронут (может использоваться другими сервисами)"
             info "Чтобы удалить вручную: rm -f /usr/local/bin/xray"
         fi
+    fi
+
+    # ── 4с) Удаляем сайт-заглушку (nginx config, шаблон, серт) ──
+    if [[ -f /etc/nginx/sites-enabled/telemt-site.conf ]] || [[ -d /var/www/telemt-site ]]; then
+        info "Удаление сайта-заглушки..."
+        rm -f /etc/nginx/sites-enabled/telemt-site.conf
+        rm -f /etc/nginx/sites-available/telemt-site.conf
+        rm -rf /var/www/telemt-site
+        rm -rf /var/www/letsencrypt
+        # Reload nginx если он установлен
+        if command -v nginx &>/dev/null && systemctl is-active --quiet nginx; then
+            nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
+        fi
+        # Сертификат — спросим у пользователя
+        # Извлекаем домен из бэкапа если он есть
+        local saved_dom=""
+        [[ -f /etc/telemt/.custom_domain ]] && saved_dom=$(cat /etc/telemt/.custom_domain)
+        if [[ -n "$saved_dom" && -d "/etc/letsencrypt/live/$saved_dom" ]]; then
+            warn "Найден сертификат Let's Encrypt для $saved_dom"
+            read -rp "  Удалить сертификат тоже? [y/N]: " ans
+            if [[ "${ans,,}" =~ ^(y|yes|д|да)$ ]]; then
+                certbot delete --cert-name "$saved_dom" --non-interactive 2>&1 | tail -2 || true
+                ok "Сертификат удалён"
+            else
+                info "Сертификат оставлен в /etc/letsencrypt/live/$saved_dom"
+            fi
+        fi
+        ok "Сайт-заглушка удалена"
     fi
 
     # ── 4b) WARP — на случай если был установлен в прошлых версиях скрипта ──
@@ -1979,20 +2395,37 @@ main() {
 
     echo -e "  На каждом шаге: ${GREEN}y${RESET} (выполнить), Enter/n (пропустить), ${RED}q${RESET} (выход)."
     echo ""
+
+    # Выбор сценария установки (Стандартная / Свой сайт)
+    select_scenario
+
     confirm "Начать установку?" exit
 
     detect_ssh_port
     select_components
 
+    # Сайт-заглушка — запрос параметров (только в сценарии site)
+    if [[ "${INSTALL_SCENARIO:-standard}" == "site" ]]; then
+        ask_site_details
+    fi
+
     echo ""
     echo -e "${BOLD}Итоговый план:${RESET}"
+    echo -e "  Сценарий:        ${INSTALL_SCENARIO:-standard}"
+    if [[ "${INSTALL_SCENARIO:-standard}" == "site" ]]; then
+        echo -e "  Сайт:            ${SITE_DOMAIN:-?} на порту ${SITE_PORT:-8443}"
+        echo -e "  Email Let's Encrypt: ${SITE_EMAIL:-?}"
+        echo -e "  Шаблон сайта:    ${SITE_TEMPLATE_URL:-?}"
+    fi
     echo -e "  Инстансы:        ${INSTANCES[*]}"
     echo -e "  UFW:             $DO_UFW | rate-limit: $DO_RATELIMIT"
     echo -e "  Keepalive:       ${DO_KEEPALIVE:-false}"
     echo -e "  BBR + fq:        ${DO_BBR:-false}"
     echo -e "  nft limiter:     ${DO_NFT:-false}"
     echo -e "  Таймауты:        ${DO_TIMEOUTS:-false}"
-    echo -e "  Свой домен:      ${USE_CUSTOM_DOMAIN:-false}${USE_CUSTOM_DOMAIN:+ (${CUSTOM_LINK_DOMAIN})}"
+    if [[ "${INSTALL_SCENARIO:-standard}" != "site" ]]; then
+        echo -e "  Свой домен:      ${USE_CUSTOM_DOMAIN:-false}${USE_CUSTOM_DOMAIN:+ (${CUSTOM_LINK_DOMAIN})}"
+    fi
     echo -e "  client_mss=tspu: ${USE_TSPU:-true}"
     echo -e "  VLESS Reality:   ${DO_VLESS:-false}"
     echo ""
@@ -2013,6 +2446,14 @@ main() {
     step_ratelimit
     step_keepalive
     step_nft_limiter
+    # Сайт-заглушка (только в сценарии site)
+    if [[ "${INSTALL_SCENARIO:-standard}" == "site" ]]; then
+        step_install_site_deps
+        step_clone_site_template
+        step_setup_nginx
+        step_get_certbot_cert
+        step_site_health_check
+    fi
     step_install_mytelemtinfo
     step_start
     print_summary
