@@ -30,7 +30,7 @@ sudo bash -c "curl -fsSL 'https://raw.githubusercontent.com/vaalaav/telemt-insta
 
 В диалоге можно включить или пропустить любой компонент:
 
-- **Инстансы telemt** — 3 пресета (cloudflare:443 / apple:5223 / microsoft:8530) или свой SNI и порт
+- **Инстансы telemt** — 3 пресета или свой SNI и порт
 - **UFW + rate-limit** — фаервол с защитой от DPI-зондирования
 - **TCP Keepalive** — фикс залипания iOS-клиентов после фона
 - **BBR + fq qdisc** — congestion control для нестабильных сетей
