@@ -241,6 +241,60 @@ health_check() {
         results+=("WARN\tWARP legacy\tобнаружен /etc/wireguard/warp.conf — удалите если не используется")
     fi
 
+    # 8. Сайт-заглушка (если установлена)
+    if [[ -f /etc/nginx/sites-enabled/telemt-site.conf ]]; then
+        # nginx active
+        if systemctl is-active --quiet nginx; then
+            results+=("OK\tnginx (сайт)\tactive")
+        else
+            results+=("FAIL\tnginx (сайт)\tне active")
+            issues=$((issues+1))
+        fi
+
+        # Сертификат + дата
+        local site_dom; site_dom=$(get_site_domain 2>/dev/null)
+        local cert="/etc/letsencrypt/live/${site_dom}/fullchain.pem"
+        if [[ -f "$cert" ]]; then
+            local exp_epoch now_epoch days
+            exp_epoch=$(date -d "$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)" +%s 2>/dev/null)
+            now_epoch=$(date +%s)
+            if [[ -n "$exp_epoch" ]]; then
+                days=$(( (exp_epoch - now_epoch) / 86400 ))
+                if [[ $days -gt 30 ]]; then
+                    results+=("OK\tSSL-сертификат\tвалиден ещё ${days} дней")
+                elif [[ $days -gt 0 ]]; then
+                    results+=("WARN\tSSL-сертификат\tистекает через ${days} дней — обновить через раздел 8")
+                else
+                    results+=("FAIL\tSSL-сертификат\tИСТЁК")
+                    issues=$((issues+1))
+                fi
+            fi
+        elif [[ -n "$site_dom" ]]; then
+            results+=("FAIL\tSSL-сертификат\tне найден для ${site_dom}")
+            issues=$((issues+1))
+        fi
+
+        # Тест URL (только в full)
+        if [[ "$mode" == "full" && -n "$site_dom" ]]; then
+            local site_port; site_port=$(get_site_port 2>/dev/null)
+            local code; code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 3 "https://${site_dom}:${site_port}/" 2>/dev/null)
+            if [[ "$code" == "200" || "$code" == "30"* ]]; then
+                results+=("OK\tСайт URL\thttps://${site_dom}:${site_port}/ → ${code}")
+            else
+                results+=("WARN\tСайт URL\tкод ${code:-—} (ожидался 200)")
+            fi
+        fi
+
+        # tls_domain в telemt совпадает
+        if [[ -f /etc/telemt/telemt1.toml && -n "$site_dom" ]]; then
+            if grep -q "tls_domain = \"${site_dom}\"" /etc/telemt/telemt1.toml; then
+                results+=("OK\ttls_domain telemt\tсовпадает с доменом сайта")
+            else
+                results+=("WARN\ttls_domain telemt\tне равен ${site_dom} в telemt1.toml")
+            fi
+        fi
+    fi
+
     # Печать результата
     echo ""
     echo -e "  ${BOLD}${CYAN}── Проверка состояния (${mode}) ──${RESET}"
@@ -436,6 +490,74 @@ status_vless() {
     fi
 }
 
+# ─── Сайт-заглушка ──────────────────────────────────────────────────────────
+SITE_CONFIG_FILE="/etc/nginx/sites-enabled/telemt-site.conf"
+SITE_WWW_DIR="/var/www/telemt-site"
+SITE_INFO_FILE="/etc/telemt/.site-info"  # хранит DOMAIN|EMAIL|TEMPLATE_URL|PORT
+
+# Получить сохранённые параметры сайта
+get_site_info() {
+    [[ -f "$SITE_INFO_FILE" ]] && cat "$SITE_INFO_FILE" 2>/dev/null
+}
+
+# Извлечь домен сайта из конфига nginx (резервно если .site-info нет)
+get_site_domain() {
+    local saved; saved=$(get_site_info)
+    if [[ -n "$saved" ]]; then
+        echo "$saved" | cut -d'|' -f1
+        return
+    fi
+    # Fallback: парсим из nginx-конфига
+    if [[ -f "$SITE_CONFIG_FILE" ]]; then
+        grep -m1 "server_name" "$SITE_CONFIG_FILE" 2>/dev/null | awk '{print $2}' | tr -d ';'
+    fi
+}
+
+get_site_port() {
+    local saved; saved=$(get_site_info)
+    if [[ -n "$saved" ]]; then
+        echo "$saved" | cut -d'|' -f4
+        return
+    fi
+    grep -m1 "listen" "$SITE_CONFIG_FILE" 2>/dev/null | grep -oE '[0-9]+' | head -1 || echo "8443"
+}
+
+status_site() {
+    if [[ ! -f "$SITE_CONFIG_FILE" ]] && [[ ! -d "$SITE_WWW_DIR" ]]; then
+        echo -e "${DIM}не установлен${RESET}"
+        return
+    fi
+    local nginx_st="inactive" domain="?" port="?" cert_status=""
+    systemctl is-active --quiet nginx && nginx_st="active"
+    domain=$(get_site_domain)
+    port=$(get_site_port)
+
+    local cert="/etc/letsencrypt/live/${domain}/fullchain.pem"
+    if [[ -f "$cert" ]]; then
+        local exp_epoch now_epoch days
+        exp_epoch=$(date -d "$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)" +%s 2>/dev/null)
+        now_epoch=$(date +%s)
+        if [[ -n "$exp_epoch" ]]; then
+            days=$(( (exp_epoch - now_epoch) / 86400 ))
+            if [[ $days -gt 30 ]]; then
+                cert_status="${GREEN}cert ${days}д${RESET}"
+            elif [[ $days -gt 0 ]]; then
+                cert_status="${YELLOW}cert ${days}д${RESET}"
+            else
+                cert_status="${RED}cert истёк${RESET}"
+            fi
+        fi
+    else
+        cert_status="${RED}нет cert${RESET}"
+    fi
+
+    if [[ "$nginx_st" == "active" ]]; then
+        echo -e "${GREEN}${domain}:${port}${RESET}  ${cert_status}"
+    else
+        echo -e "${YELLOW}nginx ${nginx_st}${RESET}  ${domain}:${port}"
+    fi
+}
+
 # ════════════════════════════════════════════════════════════════════════
 #  ГЛАВНОЕ МЕНЮ
 # ════════════════════════════════════════════════════════════════════════
@@ -444,23 +566,25 @@ main_menu() {
         draw_header
 
         echo -e "  ${BOLD}Состояние:${RESET}"
-        echo -e "  Прокси:    $(status_proxy)"
-        echo -e "  Keepalive: $(status_keepalive)"
-        echo -e "  BBR:       $(status_bbr)"
-        echo -e "  nft SYN:   $(status_nft)"
-        echo -e "  Таймауты:  $(status_timeouts)"
-        echo -e "  UFW:       $(status_ufw)"
+        echo -e "  Прокси:     $(status_proxy)"
+        echo -e "  Keepalive:  $(status_keepalive)"
+        echo -e "  BBR:        $(status_bbr)"
+        echo -e "  nft SYN:    $(status_nft)"
+        echo -e "  Таймауты:   $(status_timeouts)"
+        echo -e "  UFW:        $(status_ufw)"
         echo -e "  Свой домен: $(status_custom_domain)"
         echo -e "  VLESS:      $(status_vless)"
+        echo -e "  Сайт:       $(status_site)"
         echo ""
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
         echo -e "  ${BOLD}1.${RESET} Управление прокси"
         echo -e "  ${BOLD}2.${RESET} Сетевой тюнинг (Keepalive + BBR)"
         echo -e "  ${BOLD}3.${RESET} nft SYN Limiter"
-        echo -e "  ${BOLD}4.${RESET} Таймауты telemt"
+        echo -e "  ${BOLD}4.${RESET} Настройки конфигов telemt"
         echo -e "  ${BOLD}5.${RESET} UFW / Rate-limit"
         echo -e "  ${BOLD}6.${RESET} Свой домен в ссылках"
         echo -e "  ${BOLD}7.${RESET} VLESS Reality upstream"
+        echo -e "  ${BOLD}8.${RESET} Сайт-заглушка"
         echo -e "  ${BOLD}0.${RESET} Выход"
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
         echo ""
@@ -473,6 +597,7 @@ main_menu() {
             5) menu_ufw ;;
             6) menu_custom_domain ;;
             7) menu_vless ;;
+            8) menu_site ;;
             0|q) echo ""; exit 0 ;;
             *) warn "Неверный пункт" ; sleep 1 ;;
         esac
@@ -2280,6 +2405,18 @@ PYEOF
 #  6. СВОЙ ДОМЕН В ССЫЛКАХ
 # ════════════════════════════════════════════════════════════════════════
 menu_custom_domain() {
+    # Если установлен сайт-заглушка — домен управляется через раздел 8
+    if [[ -f "$SITE_CONFIG_FILE" ]]; then
+        draw_header
+        echo -e "  ${BOLD}Свой домен в ссылках для клиентов${RESET}\n"
+        warn "Установлена сайт-заглушка — домен ${BOLD}$(get_site_domain)${RESET} управляется автоматически"
+        info "Этот домен совпадает с доменом сайта и используется в ссылках клиентов."
+        info "Для смены домена удалите сайт (раздел 8 → пункт 5), затем настройте заново."
+        echo ""
+        pause
+        return
+    fi
+
     while true; do
         draw_header
         echo -e "  ${BOLD}Свой домен в ссылках для клиентов${RESET}\n"
@@ -2585,6 +2722,18 @@ vless_ask_link_or_subscription() {
             if [[ "$lnk" == vless://*@*:*\?* ]] && [[ "$lnk" == *security=reality* ]] \
                && [[ "$lnk" == *pbk=* ]] && [[ "$lnk" == *sni=* ]]; then
                 if VL="$lnk" python3 -c "import os,urllib.parse as up,sys;p=up.urlparse(os.environ['VL']);q=up.parse_qs(p.query);sys.exit(0 if (p.username and p.hostname and p.port and 'pbk' in q and 'sni' in q) else 1)" 2>/dev/null; then
+                    # Проверка петли: сервер в vless != наш публичный IP
+                    local vless_host vless_ip our_ip
+                    vless_host=$(VL="$lnk" python3 -c "import os,urllib.parse as up;print(up.urlparse(os.environ['VL']).hostname)" 2>/dev/null)
+                    vless_ip=$(getent hosts "$vless_host" 2>/dev/null | awk '{print $1}' | head -1)
+                    our_ip=$(get_public_ip)
+                    if [[ -n "$vless_ip" && -n "$our_ip" && "$vless_ip" == "$our_ip" ]]; then
+                        err "VLESS-сервер (${vless_host} → ${vless_ip}) совпадает с этим сервером!" >&2
+                        err "Это создаст петлю: telemt → xray → этот же сервер. Используйте VLESS от другого сервера." >&2
+                        read -rp "  Попробовать другую ссылку? [Y/n]: " r >&2
+                        [[ "${r,,}" =~ ^(n|no)$ ]] && return 1
+                        continue
+                    fi
                     printf '%s\n' "single|${lnk}"
                     return 0
                 fi
@@ -3078,6 +3227,389 @@ vless_remove() {
     if [[ -f /usr/local/bin/xray ]]; then
         info "Бинарник /usr/local/bin/xray остался — удалите вручную если не нужен"
     fi
+    health_check_brief
+    pause
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  8. САЙТ-ЗАГЛУШКА
+# ════════════════════════════════════════════════════════════════════════
+
+menu_site() {
+    while true; do
+        draw_header
+        echo -e "  ${BOLD}Сайт-заглушка${RESET}\n"
+
+        local installed=false
+        [[ -f "$SITE_CONFIG_FILE" ]] && installed=true
+
+        if [[ "$installed" == true ]]; then
+            local dom port saved
+            dom=$(get_site_domain)
+            port=$(get_site_port)
+            saved=$(get_site_info)
+            local template_url=""
+            [[ -n "$saved" ]] && template_url=$(echo "$saved" | cut -d'|' -f3)
+
+            local nginx_st; nginx_st=$(systemctl is-active nginx 2>/dev/null)
+            if [[ "$nginx_st" == "active" ]]; then
+                echo -e "  Статус nginx:  ${GREEN}active${RESET}"
+            else
+                echo -e "  Статус nginx:  ${RED}${nginx_st}${RESET}"
+            fi
+            echo -e "  Домен:         ${BOLD}${dom}${RESET}"
+            echo -e "  Порт:          ${BOLD}${port}${RESET}"
+            echo -e "  Шаблон:        ${DIM}${template_url:-?}${RESET}"
+
+            # Сертификат
+            local cert="/etc/letsencrypt/live/${dom}/fullchain.pem"
+            if [[ -f "$cert" ]]; then
+                local exp; exp=$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)
+                echo -e "  Сертификат:    ${GREEN}валиден до ${exp}${RESET}"
+            else
+                echo -e "  Сертификат:    ${RED}нет${RESET}"
+            fi
+
+            # Тест URL
+            local http_code
+            http_code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 3 \
+                "https://${dom}:${port}/" 2>/dev/null || echo "—")
+            echo -e "  Тест URL:      https://${dom}:${port}/ → ${BOLD}${http_code}${RESET}"
+            echo ""
+
+            echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+            echo -e "  ${BOLD}1.${RESET} Сменить шаблон сайта"
+            echo -e "  ${BOLD}2.${RESET} Обновить сертификат вручную"
+            echo -e "  ${BOLD}3.${RESET} Проверка работоспособности"
+            echo -e "  ${BOLD}4.${RESET} Просмотр логов nginx"
+            echo -e "  ${BOLD}5.${RESET} ${RED}Удалить сайт-заглушку${RESET}"
+            echo -e "  ${BOLD}0.${RESET} ← Назад"
+            echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+            echo ""
+            read -rp "  Выберите: " ch
+            case "$ch" in
+                1) site_change_template ;;
+                2) site_renew_cert ;;
+                3) site_health_check ;;
+                4) site_show_logs ;;
+                5) site_remove ;;
+                0|b) return ;;
+                *) warn "Неверный пункт"; sleep 1 ;;
+            esac
+        else
+            warn "Сайт-заглушка не установлена"
+            echo ""
+            echo -e "  Установка через mytelemtinfo требует ввести домен (с проверкой DNS),"
+            echo -e "  email для Let's Encrypt и URL шаблона из GitHub."
+            echo ""
+            echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+            echo -e "  ${BOLD}1.${RESET} ${GREEN}Установить сайт${RESET}"
+            echo -e "  ${BOLD}0.${RESET} ← Назад"
+            echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+            echo ""
+            read -rp "  Выберите: " ch
+            case "$ch" in
+                1) site_install ;;
+                0|b) return ;;
+                *) warn "Неверный пункт"; sleep 1 ;;
+            esac
+        fi
+    done
+}
+
+# Установка сайта из mytelemtinfo (повторяет логику step_* из install.sh)
+site_install() {
+    draw_header
+    echo -e "  ${BOLD}Установка сайта-заглушки${RESET}\n"
+
+    # 1. Запрос домена с проверкой DNS
+    local site_dom server_ip resolved_ip
+    server_ip=$(get_public_ip)
+    [[ -n "$server_ip" ]] && info "IP сервера: ${BOLD}${server_ip}${RESET}"
+    while true; do
+        read -rp "  Домен сайта: " site_dom
+        [[ -z "$site_dom" || "$site_dom" != *.* ]] && { warn "Введите FQDN (например site.example.com)"; continue; }
+        resolved_ip=$(getent hosts "$site_dom" 2>/dev/null | awk '{print $1}' | head -1)
+        if [[ -z "$resolved_ip" ]]; then
+            err "Домен не резолвится"
+            read -rp "  Попробовать другой? [Y/n]: " r
+            [[ "${r,,}" =~ ^(n|no)$ ]] && { info "Отменено"; pause; return; }
+            continue
+        fi
+        if [[ -n "$server_ip" && "$resolved_ip" != "$server_ip" ]]; then
+            err "DNS не совпадает: $site_dom → $resolved_ip, IP сервера → $server_ip"
+            read -rp "  Попробовать другой? [Y/n]: " r
+            [[ "${r,,}" =~ ^(n|no)$ ]] && { info "Отменено"; pause; return; }
+            continue
+        fi
+        ok "DNS корректен: $site_dom → $resolved_ip"
+        break
+    done
+
+    # 2. Email
+    local site_email
+    while true; do
+        read -rp "  Email для Let's Encrypt: " site_email
+        [[ "$site_email" =~ ^[^@]+@[^@]+\.[^@]+$ ]] && break
+        warn "Введите корректный email"
+    done
+
+    # 3. Шаблон
+    local site_template_url
+    echo -e "  Шаблон:"
+    echo -e "  ${GREEN}1${RESET} — vaalaav/Market-Terminal-Template ${DIM}(по умолчанию)${RESET}"
+    echo -e "  ${GREEN}2${RESET} — другой GitHub-репозиторий"
+    local tc
+    read -rp "  Выбор [1/2]: " tc
+    case "$tc" in
+        2) read -rp "  URL: " site_template_url ;;
+        *) site_template_url="https://github.com/vaalaav/Market-Terminal-Template" ;;
+    esac
+
+    local site_port="8443"
+
+    # Сохраняем параметры
+    mkdir -p /etc/telemt
+    echo "${site_dom}|${site_email}|${site_template_url}|${site_port}" > "$SITE_INFO_FILE"
+    chmod 644 "$SITE_INFO_FILE"
+
+    info "Установка зависимостей..."
+    apt-get install -y nginx certbot python3-certbot-nginx git curl 2>&1 | tail -3 || { err "Ошибка apt"; pause; return; }
+    ok "nginx + certbot + git установлены"
+
+    info "Клонирование шаблона..."
+    rm -rf "$SITE_WWW_DIR"
+    if ! git clone --depth 1 "$site_template_url" "$SITE_WWW_DIR" 2>&1 | tail -3; then
+        warn "Шаблон не клонировался — создаю простую заглушку"
+        mkdir -p "$SITE_WWW_DIR"
+        echo "<h1>Сайт в разработке</h1>" > "$SITE_WWW_DIR/index.html"
+    fi
+    chown -R www-data:www-data "$SITE_WWW_DIR"
+    chmod -R o+rX "$SITE_WWW_DIR"
+
+    info "Настройка nginx (HTTP для ACME)..."
+    mkdir -p /var/www/letsencrypt
+    cat > /etc/nginx/sites-available/telemt-site.conf << NGINX
+server {
+    listen 80;
+    server_name ${site_dom};
+    location /.well-known/acme-challenge/ { root /var/www/letsencrypt; default_type "text/plain"; }
+    location / { return 444; }
+}
+NGINX
+    ln -sf /etc/nginx/sites-available/telemt-site.conf "$SITE_CONFIG_FILE"
+    rm -f /etc/nginx/sites-enabled/default
+    nginx -t 2>&1 | tail -3 && systemctl reload nginx
+
+    info "Получение сертификата Let's Encrypt..."
+    if ! certbot certonly --webroot -w /var/www/letsencrypt \
+        -d "$site_dom" --email "$site_email" \
+        --agree-tos --non-interactive --no-eff-email 2>&1 | tail -5; then
+        err "certbot не смог выпустить сертификат"
+        warn "Проверьте: A-запись, порт 80 не заблокирован, не превышен rate-limit Let's Encrypt"
+        pause; return
+    fi
+    ok "Сертификат получен"
+
+    # Дописываем HTTPS-блок
+    cat > /etc/nginx/sites-available/telemt-site.conf << NGINX
+server {
+    listen 80;
+    server_name ${site_dom};
+    location /.well-known/acme-challenge/ { root /var/www/letsencrypt; default_type "text/plain"; }
+    location / { return 444; }
+}
+
+server {
+    listen ${site_port} ssl http2;
+    server_name ${site_dom};
+    ssl_certificate     /etc/letsencrypt/live/${site_dom}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${site_dom}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    root ${SITE_WWW_DIR};
+    index index.html index.htm;
+    server_tokens off;
+    location / { try_files \$uri \$uri/ /index.html; }
+}
+NGINX
+    nginx -t 2>&1 | tail -3 && systemctl reload nginx
+    ok "nginx переключён на HTTPS на порту ${site_port}"
+
+    # UFW открыть порты
+    if ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow 80/tcp 2>/dev/null && info "UFW: открыт 80"
+        ufw allow "${site_port}/tcp" 2>/dev/null && info "UFW: открыт ${site_port}"
+    fi
+
+    # Сохраняем кастомный домен (он будет использоваться в ссылках telemt)
+    echo "$site_dom" > /etc/telemt/.custom_domain
+    chmod 644 /etc/telemt/.custom_domain
+
+    # Если есть инстансы telemt — обновить tls_domain первого инстанса на site_dom
+    if [[ -f /etc/telemt/telemt1.toml ]]; then
+        sed -i "s|^tls_domain = .*|tls_domain = \"${site_dom}\"|" /etc/telemt/telemt1.toml
+        systemctl restart telemt1 2>/dev/null && ok "telemt1 перезапущен с tls_domain=${site_dom}"
+    fi
+
+    ok "${BOLD}Сайт-заглушка установлена${RESET}"
+    health_check_brief
+    pause
+}
+
+site_change_template() {
+    draw_header
+    echo -e "  ${BOLD}Смена шаблона сайта${RESET}\n"
+    local saved; saved=$(get_site_info)
+    local cur_template; cur_template=$(echo "$saved" | cut -d'|' -f3)
+    echo -e "  Текущий шаблон: ${DIM}${cur_template}${RESET}\n"
+
+    local new_url
+    read -rp "  Новый URL GitHub-репо: " new_url
+    [[ -z "$new_url" || ! "$new_url" =~ ^https://github\.com/ ]] && { warn "Неверный URL"; pause; return; }
+
+    # Бэкап старого
+    local backup="/tmp/telemt-site.backup.$(date +%s)"
+    if [[ -d "$SITE_WWW_DIR" ]]; then
+        cp -a "$SITE_WWW_DIR" "$backup"
+        info "Бэкап старого шаблона: $backup"
+    fi
+
+    rm -rf "$SITE_WWW_DIR"
+    if ! git clone --depth 1 "$new_url" "$SITE_WWW_DIR" 2>&1 | tail -3; then
+        err "Не удалось клонировать новый шаблон"
+        if [[ -d "$backup" ]]; then
+            info "Восстанавливаем старый..."
+            mv "$backup" "$SITE_WWW_DIR"
+        fi
+        pause; return
+    fi
+    chown -R www-data:www-data "$SITE_WWW_DIR"
+    chmod -R o+rX "$SITE_WWW_DIR"
+
+    # Обновить URL в .site-info
+    local dom email port
+    dom=$(echo "$saved" | cut -d'|' -f1)
+    email=$(echo "$saved" | cut -d'|' -f2)
+    port=$(echo "$saved" | cut -d'|' -f4)
+    echo "${dom}|${email}|${new_url}|${port}" > "$SITE_INFO_FILE"
+
+    systemctl reload nginx 2>/dev/null
+    ok "Шаблон заменён"
+    health_check_brief
+    pause
+}
+
+site_renew_cert() {
+    draw_header
+    echo -e "  ${BOLD}Обновление сертификата${RESET}\n"
+    local dom; dom=$(get_site_domain)
+    info "Запуск certbot renew для $dom..."
+    if certbot renew --cert-name "$dom" --force-renewal --non-interactive 2>&1 | tail -5; then
+        ok "Сертификат обновлён"
+        systemctl reload nginx 2>/dev/null
+    else
+        err "Обновление не удалось"
+    fi
+    pause
+}
+
+site_health_check() {
+    draw_header
+    echo -e "  ${BOLD}Проверка работоспособности сайта${RESET}\n"
+
+    local dom port; dom=$(get_site_domain); port=$(get_site_port)
+    local issues=0
+
+    if systemctl is-active --quiet nginx; then
+        ok "nginx: active"
+    else
+        err "nginx: НЕ active"; issues=$((issues+1))
+    fi
+
+    local cert="/etc/letsencrypt/live/${dom}/fullchain.pem"
+    if [[ -f "$cert" ]]; then
+        local exp; exp=$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)
+        ok "Сертификат: до ${exp}"
+    else
+        err "Сертификат отсутствует"; issues=$((issues+1))
+    fi
+
+    local code
+    code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 "https://${dom}:${port}/" 2>/dev/null)
+    if [[ "$code" == "200" || "$code" == "30"* ]]; then
+        ok "URL отвечает: https://${dom}:${port}/ → ${code}"
+    else
+        err "URL отвечает кодом: ${code}"; issues=$((issues+1))
+    fi
+
+    # tls_domain в telemt
+    if [[ -f /etc/telemt/telemt1.toml ]]; then
+        if grep -q "tls_domain = \"${dom}\"" /etc/telemt/telemt1.toml; then
+            ok "tls_domain в telemt = ${dom}"
+        else
+            warn "tls_domain в /etc/telemt/telemt1.toml не равен ${dom}"
+        fi
+    fi
+
+    echo ""
+    [[ $issues -eq 0 ]] && ok "${BOLD}Всё работает${RESET}" || warn "${BOLD}Проблем: $issues${RESET}"
+    pause
+}
+
+site_show_logs() {
+    draw_header
+    echo -e "  ${BOLD}Логи nginx${RESET}\n"
+    echo -e "  ${DIM}── access log (последние 30):${RESET}"
+    tail -30 /var/log/nginx/access.log 2>/dev/null | sed 's/^/    /'
+    echo ""
+    echo -e "  ${DIM}── error log (последние 20):${RESET}"
+    tail -20 /var/log/nginx/error.log 2>/dev/null | sed 's/^/    /'
+    pause
+}
+
+site_remove() {
+    draw_header
+    echo -e "  ${BOLD}${RED}Удаление сайта-заглушки${RESET}\n"
+    warn "Будут удалены: nginx-конфиг сайта, /var/www/telemt-site, опционально серт"
+    warn "nginx сам НЕ удаляется. telemt и его конфиги тоже остаются."
+    read -rp "  Подтвердить? [y/N]: " ans
+    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
+
+    local dom; dom=$(get_site_domain)
+
+    rm -f /etc/nginx/sites-enabled/telemt-site.conf
+    rm -f /etc/nginx/sites-available/telemt-site.conf
+    rm -rf "$SITE_WWW_DIR" /var/www/letsencrypt
+    rm -f "$SITE_INFO_FILE"
+
+    if systemctl is-active --quiet nginx; then
+        nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null
+    fi
+    ok "Конфиги сайта удалены"
+
+    # Сертификат
+    if [[ -n "$dom" && -d "/etc/letsencrypt/live/$dom" ]]; then
+        echo ""
+        warn "Найден сертификат Let's Encrypt для ${dom}"
+        read -rp "  Удалить сертификат? [y/N]: " ans
+        if [[ "${ans,,}" =~ ^(y|yes|д|да)$ ]]; then
+            certbot delete --cert-name "$dom" --non-interactive 2>&1 | tail -2 || true
+            ok "Сертификат удалён"
+        fi
+    fi
+
+    # UFW закрыть 80 и порт сайта (если они были открыты только для сайта)
+    if ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw delete allow 80/tcp 2>/dev/null && info "UFW: закрыт 80"
+        # Порт сайта — может быть в .site-info, но мы его уже стёрли. Не трогаем 8443 явно
+    fi
+
+    # Кастомный домен — оставляем (он может использоваться отдельно), но предупреждаем
+    if [[ -f /etc/telemt/.custom_domain ]]; then
+        warn "Файл /etc/telemt/.custom_domain не удалён — снимите домен через меню 6, если нужно"
+    fi
+
+    ok "Сайт-заглушка удалена"
     health_check_brief
     pause
 }
