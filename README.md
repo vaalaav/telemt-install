@@ -1,4 +1,4 @@
-# telemt-install
+# Установка telemt proxy на VPS + примочки.
 
 Автоустановка **[telemt](https://github.com/telemt/telemt)** — Telegram MTProxy на Rust — на Ubuntu VPS, с интерактивным менеджером `mytelemtinfo`.
 
