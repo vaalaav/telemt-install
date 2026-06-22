@@ -42,6 +42,8 @@ journalctl -u telemt1 -f  # Просмотр логов инстанса
 
 ## 🇬🇧 English
 
+# Installing telemt proxy on VPS + utilities
+
 ### What is this
 
 A modular auto-installer for **telemt** on Ubuntu — deploys a proxy server on a VPS with a single command. Supports multiple instances with individual ports and domains, optional VLESS Reality, a camouflage website with TLS, and DPI probing protection.
