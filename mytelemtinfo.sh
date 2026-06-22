@@ -1435,6 +1435,15 @@ proxy_remove() {
     done
     systemctl daemon-reload
 
+    # Убиваем осиротевшие процессы telemt
+    if pgrep -x telemt >/dev/null 2>&1; then
+        warn "Найдены orphan-процессы telemt — завершаю..."
+        pkill -x telemt 2>/dev/null || true
+        sleep 1
+        pgrep -x telemt >/dev/null 2>&1 && kill -9 $(pgrep -x telemt) 2>/dev/null || true
+        ok "Orphan-процессы завершены"
+    fi
+
     # Конфиги и бинарник
     rm -rf /etc/telemt /opt/telemt
     rm -f  /bin/telemt

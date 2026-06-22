@@ -1721,7 +1721,7 @@ NGINX
         SITE_SETUP_FAILED=true
         return 1
     fi
-    systemctl reload nginx
+    systemctl restart nginx
     ok "nginx переключён на HTTPS на порту ${SITE_PORT}"
 
     # Deploy-hook: после renewal сертификата перезагружаем nginx,
@@ -1826,6 +1826,13 @@ step_install_mytelemtinfo() {
 step_start() {
     hdr "Шаг 10 — Запуск сервисов"
     confirm "Запустить и включить telemt в автозагрузку?" skip || return 0
+
+    # Убиваем старые процессы если остались от предыдущей установки
+    if pgrep -x telemt >/dev/null 2>&1; then
+        warn "Обнаружены старые процессы telemt — завершаю..."
+        pkill -x telemt 2>/dev/null; sleep 1
+        pkill -9 -x telemt 2>/dev/null || true
+    fi
 
     local units=()
     for n in "${INSTANCES[@]}"; do units+=("telemt${n}"); done
