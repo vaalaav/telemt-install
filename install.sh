@@ -93,6 +93,47 @@ check_root() {
     fi
 }
 
+# ─── Хелпер: публичный IP сервера (с кэшем) ────────────────────────────────
+_OUR_PUB_IP_CACHE=""
+get_public_ip_cached() {
+    if [[ -z "$_OUR_PUB_IP_CACHE" ]]; then
+        _OUR_PUB_IP_CACHE=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null) || true
+        [[ -z "$_OUR_PUB_IP_CACHE" ]] && _OUR_PUB_IP_CACHE=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}')
+        [[ -z "$_OUR_PUB_IP_CACHE" ]] && _OUR_PUB_IP_CACHE=$(hostname -I 2>/dev/null | awk '{print $1}')
+    fi
+    echo "$_OUR_PUB_IP_CACHE"
+}
+
+# ─── Хелпер: проверка vless-ссылки на петлю (vless server != наш IP) ────────
+check_vless_not_self() {
+    local link="$1"
+    local vless_host vless_ip our_ip
+    vless_host=$(VL="$link" python3 -c "import os,urllib.parse as up;print(up.urlparse(os.environ['VL']).hostname)" 2>/dev/null)
+    [[ -z "$vless_host" ]] && return 0
+    vless_ip=$(getent hosts "$vless_host" 2>/dev/null | awk '{print $1}' | head -1)
+    our_ip=$(get_public_ip_cached)
+    if [[ -n "$vless_ip" && -n "$our_ip" && "$vless_ip" == "$our_ip" ]]; then
+        err "VLESS-сервер (${vless_host} → ${vless_ip}) совпадает с этим сервером!"
+        err "Это создаст петлю. Нужен VLESS на ДРУГОМ сервере."
+        return 1
+    fi
+    return 0
+}
+
+# ─── Хелпер: проверка что порт 80 свободен (для certbot ACME) ──────────────
+check_port_80_free() {
+    if ! ss -tlnp 2>/dev/null | grep -qE ':80\s'; then
+        return 0
+    fi
+    local listener; listener=$(ss -tlnp 2>/dev/null | grep -E ':80\s' | grep -oE 'users:\(\("[^"]+' | head -1 | cut -d'"' -f2)
+    if [[ "$listener" == "nginx" ]]; then
+        return 0  # nginx уже запущен — это нормально
+    fi
+    err "Порт 80 занят процессом: ${listener:-unknown}"
+    err "certbot ACME challenge не сможет работать. Освободите порт 80."
+    return 1
+}
+
 # ─── Баннер ───────────────────────────────────────────────────────────────────
 print_banner() {
     clear
@@ -129,7 +170,7 @@ select_scenario() {
     echo ""
     local ch
     while true; do
-        read -rp "  ${YELLOW}?${RESET} Сценарий [1/2]: " ch
+        read -rp "$(echo -e "  ${YELLOW}?${RESET} Сценарий [1/2]: ")" ch
         case "$ch" in
             1|"") INSTALL_SCENARIO="standard"; ok "Сценарий: Стандартная установка"; break ;;
             2)    INSTALL_SCENARIO="site";     ok "Сценарий: Свой сайт";              break ;;
@@ -489,6 +530,13 @@ select_components() {
                 if [[ "$VLESS_LINK" == vless://*@*:*\?* ]] && [[ "$VLESS_LINK" == *security=reality* ]] \
                    && [[ "$VLESS_LINK" == *pbk=* ]] && [[ "$VLESS_LINK" == *sni=* ]]; then
                     if VL="$VLESS_LINK" python3 -c "import os,urllib.parse as up,sys;p=up.urlparse(os.environ['VL']);q=up.parse_qs(p.query);sys.exit(0 if (p.username and p.hostname and p.port and 'pbk' in q and 'sni' in q) else 1)" 2>/dev/null; then
+                        # Защита от петли
+                        if ! check_vless_not_self "$VLESS_LINK"; then
+                            VLESS_LINK=""
+                            read -rp "  Попробовать другую ссылку? [Y/n]: " retry
+                            [[ "${retry,,}" =~ ^(n|no)$ ]] && { DO_VLESS=false; break; }
+                            continue
+                        fi
                         DO_VLESS=true
                         ok "VLESS ссылка принята (Reality)"
                         break
@@ -516,13 +564,13 @@ select_components() {
                 if [[ "$VLESS_LINK" =~ ^https?:// ]]; then
                     # Пробуем скачать и распарсить
                     info "Получение и парсинг подписки..."
-                    local nodes
-                    nodes=$(SUB_URL="$VLESS_LINK" python3 << 'PYTEST'
-import os, sys, urllib.request, base64, ssl
+                    local parse_out
+                    parse_out=$(SUB_URL="$VLESS_LINK" python3 << 'PYTEST'
+import os, sys, urllib.request, base64, ssl, urllib.parse as up
 url = os.environ['SUB_URL']
 ctx = ssl.create_default_context()
 ctx.check_hostname = False
-ctx.verify_mode = ssl.CERT_NONE  # 3x-ui часто с self-signed
+ctx.verify_mode = ssl.CERT_NONE
 try:
     req = urllib.request.Request(url, headers={'User-Agent': 'v2rayN/6.0'})
     with urllib.request.urlopen(req, context=ctx, timeout=15) as r:
@@ -530,7 +578,6 @@ try:
 except Exception as e:
     print(f"ERROR: {e}", file=sys.stderr)
     sys.exit(1)
-# Пробуем декодировать как base64
 decoded = data
 try:
     pad = '=' * (-len(data) % 4)
@@ -541,12 +588,40 @@ nodes = [ln.strip() for ln in decoded.split('\n') if ln.strip().startswith('vles
 if not nodes:
     print("ERROR: VLESS Reality узлы не найдены в подписке", file=sys.stderr)
     sys.exit(2)
+# Первая строка — кол-во узлов. Дальше — host:port каждого
 print(len(nodes))
+for n in nodes:
+    p = up.urlparse(n)
+    print(f"{p.hostname}:{p.port or 443}")
 PYTEST
 )
-                    if [[ -n "$nodes" && "$nodes" =~ ^[0-9]+$ ]]; then
+                    local nodes_count; nodes_count=$(echo "$parse_out" | head -1)
+                    if [[ -n "$nodes_count" && "$nodes_count" =~ ^[0-9]+$ ]]; then
+                        # Проверяем каждый узел на петлю
+                        local our_ip; our_ip=$(get_public_ip_cached)
+                        local loop_host=""
+                        if [[ -n "$our_ip" ]]; then
+                            while IFS= read -r hostline; do
+                                [[ -z "$hostline" ]] && continue
+                                local h="${hostline%:*}"
+                                local hip; hip=$(getent hosts "$h" 2>/dev/null | awk '{print $1}' | head -1)
+                                if [[ -n "$hip" && "$hip" == "$our_ip" ]]; then
+                                    loop_host="$hostline"; break
+                                fi
+                            done < <(echo "$parse_out" | tail -n +2)
+                        fi
+                        if [[ -n "$loop_host" ]]; then
+                            err "В подписке найден узел ${loop_host} с IP этого сервера — петля!"
+                            err "Уберите этот узел из 3x-ui и попробуйте снова."
+                            read -rp "  Попробовать другой URL? [Y/n]: " retry
+                            if [[ "${retry,,}" =~ ^(n|no)$ ]]; then
+                                DO_VLESS=false; VLESS_LINK=""; VLESS_TYPE=""
+                                break
+                            fi
+                            continue
+                        fi
                         DO_VLESS=true
-                        ok "Подписка работает: найдено ${BOLD}${nodes}${RESET} VLESS Reality узлов"
+                        ok "Подписка работает: найдено ${BOLD}${nodes_count}${RESET} VLESS Reality узлов"
                         break
                     else
                         warn "Не удалось извлечь узлы из подписки. Проверь URL и что 3x-ui отдаёт base64-формат"
@@ -1533,6 +1608,14 @@ step_setup_nginx() {
     hdr "Сайт: настройка nginx (HTTP для ACME + HTTPS на ${SITE_PORT})"
     confirm "Создать конфиг nginx?" skip || return 0
 
+    # Проверяем что порт 80 не занят чужим процессом (нужен для ACME challenge)
+    if ! check_port_80_free; then
+        warn "Установка сайта прервана. Сценарий 'Свой сайт' не может продолжаться без 80 порта."
+        warn "После освобождения порта 80 запустите: sudo mytelemtinfo → 8 → 1 (установить сайт)"
+        SITE_SETUP_FAILED=true
+        return 1
+    fi
+
     mkdir -p /var/www/letsencrypt
 
     # HTTP-блок (для certbot ACME challenge); основной HTTPS-блок создадим ПОСЛЕ certbot
@@ -1583,10 +1666,16 @@ step_get_certbot_cert() {
     if ! certbot certonly --webroot -w /var/www/letsencrypt \
         -d "$SITE_DOMAIN" --email "$SITE_EMAIL" \
         --agree-tos --non-interactive --no-eff-email 2>&1 | tail -10; then
-        err "certbot не смог выпустить сертификат"
-        warn "Проверьте: 1) DNS A-запись $SITE_DOMAIN указывает на сервер"
-        warn "          2) Порт 80 не блокируется фаерволом или другим сервисом"
-        warn "Сайт будет работать в режиме self-signed или его можно настроить вручную позже"
+        err "certbot не смог выпустить сертификат для $SITE_DOMAIN"
+        warn "Возможные причины:"
+        warn "  1) DNS A-запись $SITE_DOMAIN ещё не пропагировалась"
+        warn "  2) Порт 80 заблокирован UFW/iptables или другим хостом по дороге"
+        warn "  3) Достигнут rate-limit Let's Encrypt (5 неудач за час)"
+        echo ""
+        warn "Откатываем nginx-конфиг сайта (HTTP-блок останется для повторной попытки)..."
+        # Не удаляем nginx-конфиг полностью — он нужен для повторной попытки
+        # Но помечаем что установка сайта провалилась
+        SITE_SETUP_FAILED=true
         return 1
     fi
 
@@ -1629,10 +1718,22 @@ NGINX
 
     if ! nginx -t 2>&1 | tail -3; then
         err "nginx -t (с HTTPS) не прошёл"
+        SITE_SETUP_FAILED=true
         return 1
     fi
     systemctl reload nginx
     ok "nginx переключён на HTTPS на порту ${SITE_PORT}"
+
+    # Deploy-hook: после renewal сертификата перезагружаем nginx,
+    # чтобы он подхватил новые ssl-файлы в памяти
+    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+    cat > /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh << 'HOOK'
+#!/bin/sh
+# Авто-reload nginx после обновления сертификата certbot
+systemctl reload nginx 2>/dev/null || true
+HOOK
+    chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+    ok "Deploy-hook установлен (nginx будет reload'иться после каждого renewal)"
 
     # Автообновление сертификата — certbot ставит свой timer, проверим что он активен
     if systemctl list-unit-files 2>/dev/null | grep -q "certbot.timer"; then
@@ -1644,6 +1745,18 @@ NGINX
 # Шаг: проверка работоспособности сайта + telemt + связки
 step_site_health_check() {
     hdr "Сайт: проверка работоспособности"
+
+    if [[ "${SITE_SETUP_FAILED:-false}" == true ]]; then
+        echo ""
+        err "${BOLD}Установка сайта НЕ завершилась успешно${RESET}"
+        warn "Что работает: telemt на 443 (по обычным MTProxy ссылкам)"
+        warn "Что НЕ работает: сайт-заглушка на ${SITE_DOMAIN:-?}:${SITE_PORT:-8443}"
+        echo ""
+        info "Чтобы попробовать установить сайт повторно после устранения проблемы:"
+        info "  sudo mytelemtinfo → 8. Сайт-заглушка → 1. Установить"
+        echo ""
+        return 0  # не падаем, чтобы остальной pipeline продолжился (mytelemtinfo, summary)
+    fi
 
     local issues=0
 
@@ -2156,6 +2269,11 @@ do_vless_only_install() {
             if [[ "$VLESS_LINK" == vless://*@*:*\?* ]] && [[ "$VLESS_LINK" == *security=reality* ]] \
                && [[ "$VLESS_LINK" == *pbk=* ]] && [[ "$VLESS_LINK" == *sni=* ]]; then
                 if VL="$VLESS_LINK" python3 -c "import os,urllib.parse as up,sys;p=up.urlparse(os.environ['VL']);q=up.parse_qs(p.query);sys.exit(0 if (p.username and p.hostname and p.port and 'pbk' in q and 'sni' in q) else 1)" 2>/dev/null; then
+                    if ! check_vless_not_self "$VLESS_LINK"; then
+                        read -rp "  Попробовать другую ссылку? [Y/n]: " retry
+                        [[ "${retry,,}" =~ ^(n|no)$ ]] && { info "Отменено"; exit 0; }
+                        continue
+                    fi
                     ok "VLESS ссылка принята"
                     break
                 fi
@@ -2170,9 +2288,9 @@ do_vless_only_install() {
             read -rp "  URL подписки: " VLESS_LINK
             if [[ "$VLESS_LINK" =~ ^https?:// ]]; then
                 info "Получение и парсинг подписки..."
-                local nodes
-                nodes=$(SUB_URL="$VLESS_LINK" python3 << 'PYTEST'
-import os, sys, urllib.request, base64, ssl
+                local parse_out
+                parse_out=$(SUB_URL="$VLESS_LINK" python3 << 'PYTEST'
+import os, sys, urllib.request, base64, ssl, urllib.parse as up
 url = os.environ["SUB_URL"]
 ctx = ssl.create_default_context()
 ctx.check_hostname = False
@@ -2192,10 +2310,33 @@ nodes = [ln.strip() for ln in decoded.split("\n") if ln.strip().startswith("vles
 if not nodes:
     print("ERROR: VLESS Reality узлы не найдены", file=sys.stderr); sys.exit(2)
 print(len(nodes))
+for n in nodes:
+    p = up.urlparse(n)
+    print(f"{p.hostname}:{p.port or 443}")
 PYTEST
 )
-                if [[ -n "$nodes" && "$nodes" =~ ^[0-9]+$ ]]; then
-                    ok "Подписка работает: найдено ${BOLD}${nodes}${RESET} узлов"
+                local nodes_count; nodes_count=$(echo "$parse_out" | head -1)
+                if [[ -n "$nodes_count" && "$nodes_count" =~ ^[0-9]+$ ]]; then
+                    # Проверка узлов на петлю
+                    local our_ip; our_ip=$(get_public_ip_cached)
+                    local loop_host=""
+                    if [[ -n "$our_ip" ]]; then
+                        while IFS= read -r hostline; do
+                            [[ -z "$hostline" ]] && continue
+                            local h="${hostline%:*}"
+                            local hip; hip=$(getent hosts "$h" 2>/dev/null | awk '{print $1}' | head -1)
+                            if [[ -n "$hip" && "$hip" == "$our_ip" ]]; then
+                                loop_host="$hostline"; break
+                            fi
+                        done < <(echo "$parse_out" | tail -n +2)
+                    fi
+                    if [[ -n "$loop_host" ]]; then
+                        err "В подписке узел ${loop_host} с IP этого сервера — петля!"
+                        read -rp "  Попробовать другой URL? [Y/n]: " retry
+                        [[ "${retry,,}" =~ ^(n|no)$ ]] && { info "Отменено"; exit 0; }
+                        continue
+                    fi
+                    ok "Подписка работает: найдено ${BOLD}${nodes_count}${RESET} узлов"
                     break
                 fi
                 warn "Не удалось извлечь узлы из подписки"
@@ -2402,12 +2543,14 @@ main() {
     confirm "Начать установку?" exit
 
     detect_ssh_port
-    select_components
 
-    # Сайт-заглушка — запрос параметров (только в сценарии site)
+    # Сайт-заглушка — запрос параметров ДО select_components,
+    # потому что select_components читает SITE_DOMAIN
     if [[ "${INSTALL_SCENARIO:-standard}" == "site" ]]; then
         ask_site_details
     fi
+
+    select_components
 
     echo ""
     echo -e "${BOLD}Итоговый план:${RESET}"
@@ -2448,10 +2591,18 @@ main() {
     step_nft_limiter
     # Сайт-заглушка (только в сценарии site)
     if [[ "${INSTALL_SCENARIO:-standard}" == "site" ]]; then
-        step_install_site_deps
-        step_clone_site_template
-        step_setup_nginx
-        step_get_certbot_cert
+        SITE_SETUP_FAILED=false
+        step_install_site_deps || SITE_SETUP_FAILED=true
+        if [[ "$SITE_SETUP_FAILED" != true ]]; then
+            step_clone_site_template || SITE_SETUP_FAILED=true
+        fi
+        if [[ "$SITE_SETUP_FAILED" != true ]]; then
+            step_setup_nginx || SITE_SETUP_FAILED=true
+        fi
+        if [[ "$SITE_SETUP_FAILED" != true ]]; then
+            step_get_certbot_cert || SITE_SETUP_FAILED=true
+        fi
+        # health_check всегда вызываем — он сам поймёт нужно ли отчитываться об ошибке
         step_site_health_check
     fi
     step_install_mytelemtinfo
