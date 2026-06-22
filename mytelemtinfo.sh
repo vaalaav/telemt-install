@@ -565,7 +565,8 @@ main_menu() {
     while true; do
         draw_header
 
-        echo -e "  ${BOLD}Состояние:${RESET}"
+        [[ -z "$_PUBLIC_IP_CACHE" ]] && _PUBLIC_IP_CACHE=$(get_public_ip)
+        echo -e "  ${BOLD}Состояние:${RESET}  ${DIM}IP: ${_PUBLIC_IP_CACHE:-не определён}${RESET}"
         echo -e "  Прокси:     $(status_proxy)"
         echo -e "  Keepalive:  $(status_keepalive)"
         echo -e "  BBR:        $(status_bbr)"
