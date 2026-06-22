@@ -1435,15 +1435,6 @@ proxy_remove() {
     done
     systemctl daemon-reload
 
-    # Убиваем осиротевшие процессы telemt
-    if pgrep -x telemt >/dev/null 2>&1; then
-        warn "Найдены orphan-процессы telemt — завершаю..."
-        pkill -x telemt 2>/dev/null || true
-        sleep 1
-        pgrep -x telemt >/dev/null 2>&1 && kill -9 $(pgrep -x telemt) 2>/dev/null || true
-        ok "Orphan-процессы завершены"
-    fi
-
     # Конфиги и бинарник
     rm -rf /etc/telemt /opt/telemt
     rm -f  /bin/telemt
@@ -1952,6 +1943,64 @@ nft_remove() {
     pause
 }
 
+config_edit_nano() {
+    draw_header
+    echo -e "  ${BOLD}Редактирование конфига в nano${RESET}\n"
+
+    local insts; read -ra insts <<< "$(active_instances)"
+    if [[ ${#insts[@]} -eq 0 ]]; then
+        warn "Нет активных инстансов"; pause; return
+    fi
+
+    echo -e "  ${DIM}Доступные инстансы:${RESET}"
+    for n in "${insts[@]}"; do
+        local st; st=$(svc_status "$n")
+        echo -e "  ${BOLD}${n}${RESET}) telemt${n}.toml  $(svc_status_color "$st")  :${INSTANCE_PORTS[$n]}"
+    done
+    echo -e "  ${BOLD}0${RESET}) ← Назад"
+    echo ""
+    read -rp "  Выберите инстанс: " pick
+    [[ "$pick" == "0" || -z "$pick" ]] && return
+
+    # Проверяем, что выбранный инстанс существует
+    local valid=false
+    for n in "${insts[@]}"; do [[ "$n" == "$pick" ]] && valid=true && break; done
+    if [[ "$valid" != true ]]; then
+        warn "Инстанс $pick не найден"; pause; return
+    fi
+
+    local conf="/etc/telemt/telemt${pick}.toml"
+    if [[ ! -f "$conf" ]]; then
+        err "Файл $conf не существует"; pause; return
+    fi
+
+    # Бэкап перед редактированием
+    cp "$conf" "${conf}.bak.$(date +%s)"
+    info "Бэкап сохранён: ${conf}.bak.*"
+
+    nano "$conf"
+
+    # После выхода из nano — предложить рестарт
+    echo ""
+    read -rp "  Перезапустить telemt${pick}? [Y/n]: " ans
+    if [[ ! "${ans,,}" =~ ^(n|no|н|нет)$ ]]; then
+        systemctl restart "telemt${pick}" 2>/dev/null
+        local new_st; new_st=$(svc_status "$pick")
+        if [[ "$new_st" == "active" ]]; then
+            ok "telemt${pick} перезапущен"
+        else
+            err "telemt${pick} не запустился (статус: $new_st)"
+            warn "Проверьте конфиг или восстановите бэкап"
+        fi
+    else
+        info "Сервис не перезапущен — изменения применятся после рестарта"
+    fi
+    # Перечитать порты/домены из обновлённого конфига
+    load_instance_config
+    health_check_brief
+    pause
+}
+
 # ════════════════════════════════════════════════════════════════════════
 #  4. ТАЙМАУТЫ TELEMT
 # ════════════════════════════════════════════════════════════════════════
@@ -2004,6 +2053,9 @@ menu_timeouts() {
         echo -e "  ${BOLD}── client_mss=\"tspu\" (обход ТСПУ для РФ):${RESET}"
         echo -e "  ${BOLD}3.${RESET} ${GREEN}Включить${RESET} (раскомментировать или добавить во все конфиги)"
         echo -e "  ${BOLD}4.${RESET} ${YELLOW}Отключить${RESET} (закомментировать во всех конфигах)"
+        echo ""
+        echo -e "  ${BOLD}── Редактирование:${RESET}"
+        echo -e "  ${BOLD}5.${RESET} Открыть конфиг инстанса в nano"
         echo -e "  ${BOLD}0.${RESET} ← Назад"
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
         echo ""
@@ -2013,6 +2065,7 @@ menu_timeouts() {
             2) timeouts_reset ;;
             3) tspu_enable ;;
             4) tspu_disable ;;
+            5) config_edit_nano ;;
             0|b) return ;;
             *) warn "Неверный пункт"; sleep 1 ;;
         esac
