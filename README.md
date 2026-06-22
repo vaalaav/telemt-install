@@ -1,73 +1,149 @@
-# Установка telemt proxy на VPS + примочки.
+# Установка telemt proxy на VPS + примочки
 
-Автоустановка **[telemt](https://github.com/telemt/telemt)** — Telegram MTProxy на Rust — на Ubuntu VPS, с интерактивным менеджером `mytelemtinfo`.
-
----
-
-## Установка
-
-Рекомендуемый способ (надёжно работает всегда):
-
-```bash
-curl -fsSL -o install.sh https://raw.githubusercontent.com/vaalaav/telemt-install/main/install.sh
-chmod +x install.sh
-sudo bash install.sh
-```
-
-Однострочный вариант (может не сработать с первого раза из-за CDN-кэша — тогда используйте способ выше):
-
-```bash
-sudo bash -c "curl -fsSL 'https://raw.githubusercontent.com/vaalaav/telemt-install/main/install.sh?v=$(date +%s)' | bash"
-```
-
-> Требуется root. Ubuntu 20.04 / 22.04 / 24.04, x86_64.
-
-После установки управление — командой `sudo mytelemtinfo`.
+🇷🇺 [Русский](#-русский) | 🇬🇧 [English](#-english)
 
 ---
 
-## Сценарии установки
+## 🇷🇺 Русский
 
-При запуске установщика первым шагом выбирается сценарий:
+### Что это
 
-### 1. Стандартная установка
-MTProxy на нескольких портах с маскировкой под чужие SNI (готовые пресеты или ваши собственные). Доступны все опции: фаервол, тюнинг сети, VLESS upstream, свой домен в ссылке клиента.
+Модульный автоустановщик **telemt** для Ubuntu — разворачивает прокси-сервер на VPS в одну команду. Поддерживает несколько инстансов с индивидуальными портами и доменами, опциональный VLESS Reality, камуфляжный сайт с TLS и защиту от DPI-зондирования.
 
-### 2. Свой сайт
-Поднимает реальный сайт через nginx + Let's Encrypt, MTProxy + опции: фаервол, тюнинг сети, VLESS upstream. Сертификат обновляется автоматически.
+### Возможности
+
+- **Мультиинстанс** — до 4 параллельных прокси (443, 5223, 8530…) с отдельными секретами
+- **VLESS Reality** — интеграция с xray-core для дополнительного транспорта
+- **Камуфляжный сайт** — Nginx + Certbot, автоматический TLS-сертификат
+- **Защита от DPI** — rate-limit через xt_recent и nftables SYN-лимитер
+- **Тюнинг ядра** — BBR, TCP Keepalive
+- **Файрвол** — автонастройка UFW
+- **systemd-сервисы** — автозапуск, обновление (`--update`) и полная очистка (`--purge`)
+
+### Структура проекта
+
+```
+├── main.sh              # Оркестратор
+├── config.env           # Переменные и настройки
+├── utils/
+│   └── helpers.sh       # Логирование, утилиты
+└── lib/
+    ├── 01_prepare.sh    # Подготовка системы
+    ├── 02_binary.sh     # Скачивание бинарника
+    ├── 03_vless.sh      # VLESS Reality
+    ├── 04_configs.sh    # Генерация секретов и .toml
+    ├── 05_network.sh    # UFW, rate-limit, keepalive
+    ├── 06_site.sh       # Nginx + Certbot
+    └── 07_lifecycle.sh  # systemd, update, purge
+```
+
+### Быстрый старт
+
+```bash
+# Запуск от root на чистой Ubuntu 20.04+
+git clone https://github.com/vaalaav/telemt-install.git
+cd telemt-install
+chmod +x main.sh
+sudo ./main.sh
+```
+
+### Управление
+
+```bash
+sudo ./main.sh --update   # Обновление бинарника и перезапуск
+sudo ./main.sh --purge    # Полное удаление всех компонентов
+journalctl -u telemt1 -f  # Просмотр логов инстанса
+```
+
+### Настройка
+
+Отредактируйте `config.env` перед запуском:
+
+| Параметр | Описание |
+|---|---|
+| `CUSTOM_PORTS` | Порты для каждого инстанса |
+| `CUSTOM_DOMAINS` | Домены-маскировки |
+| `DO_VLESS` | Включить VLESS Reality (`true`/`false`) |
+| `DO_UFW` | Настроить файрвол (`true`/`false`) |
+| `DO_RATELIMIT` | Защита от DPI-зондирования |
+| `DO_NFT` | nftables SYN-лимитер |
+| `INSTALL_SCENARIO` | `standard` или `site` (с Nginx) |
+
+### Требования
+
+- Ubuntu 20.04+
+- Права root
+- Свободный порт 443 (или другие из `CUSTOM_PORTS`)
 
 ---
 
-## mytelemtinfo — управление после установки
+## 🇬🇧 English
 
-```bash
-sudo mytelemtinfo
+### What is this
+
+A modular auto-installer for **telemt** on Ubuntu — deploys a proxy server on a VPS with a single command. Supports multiple instances with individual ports and domains, optional VLESS Reality, a camouflage website with TLS, and DPI probing protection.
+
+### Features
+
+- **Multi-instance** — up to 4 parallel proxies (443, 5223, 8530…) with separate secrets
+- **VLESS Reality** — xray-core integration for an additional transport layer
+- **Camouflage site** — Nginx + Certbot with automatic TLS certificates
+- **DPI protection** — rate-limiting via xt_recent and nftables SYN limiter
+- **Kernel tuning** — BBR, TCP Keepalive
+- **Firewall** — automatic UFW configuration
+- **systemd services** — auto-start, update (`--update`), and full removal (`--purge`)
+
+### Project structure
+
+```
+├── main.sh              # Orchestrator
+├── config.env           # Variables and settings
+├── utils/
+│   └── helpers.sh       # Logging, utilities
+└── lib/
+    ├── 01_prepare.sh    # System preparation
+    ├── 02_binary.sh     # Binary download
+    ├── 03_vless.sh      # VLESS Reality
+    ├── 04_configs.sh    # Secret generation & .toml configs
+    ├── 05_network.sh    # UFW, rate-limit, keepalive
+    ├── 06_site.sh       # Nginx + Certbot
+    └── 07_lifecycle.sh  # systemd, update, purge
 ```
 
-## Режимы запуска install.sh
-
-При повторном запуске на уже установленной системе (или если найден telemt установленный другим способом) скрипт предлагает выбор:
-
-- **Установка поверх** — оставляет существующие конфиги
-- **Чистая установка** — полная очистка + новая установка
-- **Только очистка** — удалить всё без новой установки
-- **Только установить VLESS туннель** — поставить xray + VLESS upstream поверх существующего telemt (своего или чужого), автоматически прицепить ко всем найденным `/etc/telemt/telemt*.toml` или вывести инструкцию для ручной интеграции
-
-Флаги командной строки:
+### Quick start
 
 ```bash
-sudo bash install.sh --update       # обновить только бинарник telemt
-sudo bash install.sh --clean        # чистая установка без интерактивного выбора режима
-sudo bash install.sh --purge        # только полная очистка
-sudo bash install.sh --vless-only   # установить только VLESS туннель
+# Run as root on a clean Ubuntu 20.04+
+git clone https://github.com/vaalaav/telemt-install.git
+cd telemt-install
+chmod +x main.sh
+sudo ./main.sh
 ```
 
----
+### Management
 
-## Источники
+```bash
+sudo ./main.sh --update   # Update binary and restart
+sudo ./main.sh --purge    # Complete removal of all components
+journalctl -u telemt1 -f  # View instance logs
+```
 
-- Основной гайд: https://assyoucandy.github.io/telemt-server-guide/
-- Keepalive: https://assyoucandy.github.io/telemt-server-guide/telemt-keepalive-guide.html
-- nft tune: https://h1de0x.github.io/telemt-tune/
-- telemt releases: https://github.com/telemt/telemt/releases
-- xray-core: https://github.com/XTLS/Xray-core
+### Configuration
+
+Edit `config.env` before running:
+
+| Parameter | Description |
+|---|---|
+| `CUSTOM_PORTS` | Ports for each instance |
+| `CUSTOM_DOMAINS` | Masquerade domains |
+| `DO_VLESS` | Enable VLESS Reality (`true`/`false`) |
+| `DO_UFW` | Configure firewall (`true`/`false`) |
+| `DO_RATELIMIT` | DPI probing protection |
+| `DO_NFT` | nftables SYN limiter |
+| `INSTALL_SCENARIO` | `standard` or `site` (with Nginx) |
+
+### Requirements
+
+- Ubuntu 20.04+
+- Root privileges
+- Port 443 available (or others from `CUSTOM_PORTS`)
