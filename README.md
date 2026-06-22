@@ -36,6 +36,7 @@ sudo ./main.sh
 sudo ./main.sh --update   # Обновление бинарника и перезапуск
 sudo ./main.sh --purge    # Полное удаление всех компонентов
 journalctl -u telemt1 -f  # Просмотр логов инстанса
+mytelemtinfo              # Интерактивный менеджер инстансов
 ```
 
 ---
@@ -75,4 +76,5 @@ sudo ./main.sh
 sudo ./main.sh --update   # Update binary and restart
 sudo ./main.sh --purge    # Complete removal of all components
 journalctl -u telemt1 -f  # View instance logs
+mytelemtinfo              # Interactive instance manager
 ```
