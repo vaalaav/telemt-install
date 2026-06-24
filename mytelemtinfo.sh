@@ -3851,10 +3851,15 @@ panel_install() {
         info "Конфиг уже существует: ${PANEL_CFG}"
     else
         echo ""
-        local telemt_url telemt_auth admin_user admin_pass
-        read -rp "  Telemt API URL [http://127.0.0.1:9091]: " telemt_url
-        telemt_url="${telemt_url:-http://127.0.0.1:9091}"
-        read -rp "  Telemt API auth header (пусто если нет): " telemt_auth
+        # Автоопределение API URL по первому активному инстансу
+        local first_inst telemt_url telemt_auth=""
+        read -ra _tmp_insts <<< "$(active_instances)"
+        first_inst="${_tmp_insts[0]:-1}"
+        local api_port="${INSTANCE_APIS[$first_inst]:-9091}"
+        telemt_url="http://127.0.0.1:${api_port}"
+        info "Telemt API: ${telemt_url} (инстанс ${first_inst})"
+
+        local admin_user admin_pass
         read -rp "  Admin логин [admin]: " admin_user
         admin_user="${admin_user:-admin}"
         read -rsp "  Admin пароль: " admin_pass; echo ""
