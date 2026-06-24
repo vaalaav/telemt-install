@@ -26,8 +26,8 @@
 # Запуск от root на чистой Ubuntu 20.04+
 git clone https://github.com/vaalaav/telemt-install.git
 cd telemt-install
-chmod +x main.sh
-sudo ./main.sh
+chmod +x install.sh
+sudo ./install.sh
 ```
 
 ### Интерактивный менеджер управления
@@ -71,8 +71,8 @@ A modular auto-installer for **telemt** on Ubuntu — deploys a proxy server on 
 # Run as root on a clean Ubuntu 20.04+
 git clone https://github.com/vaalaav/telemt-install.git
 cd telemt-install
-chmod +x main.sh
-sudo ./main.sh
+chmod +x install.sh
+sudo ./install.sh
 ```
 
 ### Interactive Management Manager
