@@ -295,6 +295,17 @@ health_check() {
         fi
     fi
 
+    # 9. Панель управления (если установлена)
+    if [[ -x "$PANEL_BIN" ]]; then
+        if systemctl is-active --quiet "$PANEL_SVC" 2>/dev/null; then
+            local panel_ver; panel_ver=$("$PANEL_BIN" version 2>/dev/null | head -1 || echo "?")
+            results+=("OK\tПанель telemt_panel\t${panel_ver}, сервис active")
+        else
+            results+=("FAIL\tПанель telemt_panel\tустановлена, но сервис не active")
+            issues=$((issues+1))
+        fi
+    fi
+
     # Печать результата
     echo ""
     echo -e "  ${BOLD}${CYAN}── Проверка состояния (${mode}) ──${RESET}"
@@ -558,6 +569,29 @@ status_site() {
     fi
 }
 
+# ─── Панель управления (telemt_panel) ────────────────────────────────────
+PANEL_REPO="amirotin/telemt_panel"
+PANEL_BIN="/usr/local/bin/telemt-panel"
+PANEL_CFG_DIR="/etc/telemt-panel"
+PANEL_CFG="${PANEL_CFG_DIR}/config.toml"
+PANEL_DATA="/var/lib/telemt-panel"
+PANEL_SVC="telemt-panel"
+PANEL_USER="telemt-panel"
+
+status_panel() {
+    if [[ ! -x "$PANEL_BIN" ]]; then
+        echo -e "${DIM}не установлена${RESET}"
+        return
+    fi
+    local ver; ver=$("$PANEL_BIN" version 2>/dev/null | head -1 || echo "?")
+    if systemctl is-active --quiet "$PANEL_SVC" 2>/dev/null; then
+        local port; port=$(grep -m1 '^\s*listen' "$PANEL_CFG" 2>/dev/null | grep -oE '[0-9]+' || echo "8080")
+        echo -e "${GREEN}активна${RESET}  :${BOLD}${port}${RESET}  ${DIM}${ver}${RESET}"
+    else
+        echo -e "${YELLOW}установлена, не запущена${RESET}  ${DIM}${ver}${RESET}"
+    fi
+}
+
 # ════════════════════════════════════════════════════════════════════════
 #  ГЛАВНОЕ МЕНЮ
 # ════════════════════════════════════════════════════════════════════════
@@ -576,6 +610,7 @@ main_menu() {
         echo -e "  Свой домен: $(status_custom_domain)"
         echo -e "  VLESS:      $(status_vless)"
         echo -e "  Сайт:       $(status_site)"
+        echo -e "  Панель:     $(status_panel)"
         echo ""
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
         echo -e "  ${BOLD}1.${RESET} Управление прокси"
@@ -586,6 +621,7 @@ main_menu() {
         echo -e "  ${BOLD}6.${RESET} Свой домен в ссылках"
         echo -e "  ${BOLD}7.${RESET} VLESS Reality upstream"
         echo -e "  ${BOLD}8.${RESET} Сайт-заглушка"
+        echo -e "  ${BOLD}9.${RESET} Панель управления (telemt_panel)"
         echo -e "  ${BOLD}0.${RESET} Выход"
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
         echo ""
@@ -599,6 +635,7 @@ main_menu() {
             6) menu_custom_domain ;;
             7) menu_vless ;;
             8) menu_site ;;
+            9) menu_panel ;;
             0|q) echo ""; exit 0 ;;
             *) warn "Неверный пункт" ; sleep 1 ;;
         esac
@@ -3745,6 +3782,261 @@ site_remove() {
     ok "Сайт-заглушка удалена"
     health_check_brief
     pause
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  9. ПАНЕЛЬ УПРАВЛЕНИЯ (telemt_panel)
+# ════════════════════════════════════════════════════════════════════════
+_panel_detect_arch() {
+    local arch; arch=$(uname -m)
+    case "$arch" in
+        x86_64)  echo "x86_64"  ;;
+        aarch64) echo "aarch64" ;;
+        *)       err "Архитектура $arch не поддерживается"; return 1 ;;
+    esac
+}
+
+panel_install() {
+    draw_header
+    echo -e "  ${BOLD}Установка telemt_panel${RESET}\n"
+
+    if [[ -x "$PANEL_BIN" ]]; then
+        warn "Панель уже установлена: $($PANEL_BIN version 2>/dev/null | head -1)"
+        read -rp "  Переустановить/обновить? [y/N]: " ans
+        [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
+    fi
+
+    # Архитектура
+    local arch
+    arch=$(_panel_detect_arch) || { pause; return; }
+
+    # Последний релиз
+    info "Определение последней версии..."
+    local tag
+    tag=$(curl -fsSL "https://api.github.com/repos/${PANEL_REPO}/releases/latest" 2>/dev/null \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('tag_name',''))" 2>/dev/null)
+    [[ -z "$tag" ]] && { err "Не удалось получить версию"; pause; return; }
+    info "Версия: $tag"
+
+    # Скачивание
+    local tarball="telemt-panel-${arch}-linux-gnu.tar.gz"
+    local url="https://github.com/${PANEL_REPO}/releases/download/${tag}/${tarball}"
+    local tmp_dir; tmp_dir=$(mktemp -d)
+    info "Скачивание ${tarball}..."
+    if ! curl -fSL "$url" -o "${tmp_dir}/${tarball}" 2>&1 | tail -3; then
+        err "Ошибка загрузки"; rm -rf "$tmp_dir"; pause; return
+    fi
+    tar -xzf "${tmp_dir}/${tarball}" -C "$tmp_dir"
+    install -m 0755 "${tmp_dir}/telemt-panel-${arch}-linux" "$PANEL_BIN"
+    rm -rf "$tmp_dir"
+    ok "Бинарник: ${PANEL_BIN} (${tag})"
+
+    # Системный пользователь
+    if ! id "$PANEL_USER" &>/dev/null; then
+        useradd --system --shell /usr/sbin/nologin --home /nonexistent "$PANEL_USER" 2>/dev/null \
+            || adduser --system --shell /usr/sbin/nologin --home /nonexistent --disabled-password "$PANEL_USER" 2>/dev/null
+        ok "Создан пользователь ${PANEL_USER}"
+    fi
+    # Доступ к группе telemt
+    if getent group telemt &>/dev/null; then
+        usermod -aG telemt "$PANEL_USER" 2>/dev/null || true
+    fi
+
+    # Директории
+    mkdir -p "$PANEL_CFG_DIR" "$PANEL_DATA/staging"
+    chown "$PANEL_USER:$PANEL_USER" "$PANEL_CFG_DIR" "$PANEL_DATA" "$PANEL_DATA/staging"
+
+    # Конфиг
+    if [[ -f "$PANEL_CFG" ]]; then
+        info "Конфиг уже существует: ${PANEL_CFG}"
+    else
+        echo ""
+        local telemt_url telemt_auth admin_user admin_pass
+        read -rp "  Telemt API URL [http://127.0.0.1:9091]: " telemt_url
+        telemt_url="${telemt_url:-http://127.0.0.1:9091}"
+        read -rp "  Telemt API auth header (пусто если нет): " telemt_auth
+        read -rp "  Admin логин [admin]: " admin_user
+        admin_user="${admin_user:-admin}"
+        read -rsp "  Admin пароль: " admin_pass; echo ""
+        [[ -z "$admin_pass" ]] && { err "Пароль не может быть пустым"; pause; return; }
+
+        info "Генерация хеша пароля..."
+        local pass_hash
+        pass_hash=$(printf '%s\n' "$admin_pass" | "$PANEL_BIN" hash-password 2>/dev/null)
+        [[ -z "$pass_hash" ]] && { err "Не удалось создать хеш пароля"; pause; return; }
+
+        local jwt_secret; jwt_secret=$(openssl rand -hex 32)
+        local telemt_path; telemt_path=$(command -v telemt 2>/dev/null || echo "/bin/telemt")
+
+        cat > "$PANEL_CFG" <<TOML
+listen = "0.0.0.0:8080"
+data_dir = "${PANEL_DATA}"
+
+[telemt]
+url = "${telemt_url}"
+$([ -n "$telemt_auth" ] && echo "auth_header = \"${telemt_auth}\"")
+binary_path = "${telemt_path}"
+service_name = "telemt1"
+
+[panel]
+binary_path = "${PANEL_BIN}"
+service_name = "${PANEL_SVC}"
+
+[auth]
+username = "${admin_user}"
+password_hash = "${pass_hash}"
+jwt_secret = "${jwt_secret}"
+session_ttl = "24h"
+TOML
+        chown "$PANEL_USER:$PANEL_USER" "$PANEL_CFG"
+        chmod 600 "$PANEL_CFG"
+        ok "Конфиг: ${PANEL_CFG}"
+    fi
+
+    # Sudoers drop-in
+    local sudoers="/etc/sudoers.d/${PANEL_SVC}"
+    local cp_bin mv_bin chmod_bin rm_bin systemctl_bin
+    cp_bin=$(command -v cp); mv_bin=$(command -v mv)
+    chmod_bin=$(command -v chmod); rm_bin=$(command -v rm)
+    systemctl_bin=$(command -v systemctl)
+    cat > "$sudoers" <<SUDO
+${PANEL_USER} ALL=(root) NOPASSWD: ${cp_bin} -f ${PANEL_BIN} ${PANEL_DATA}/staging/telemt-panel.bak
+${PANEL_USER} ALL=(root) NOPASSWD: ${cp_bin} -f ${PANEL_DATA}/staging/telemt-panel ${PANEL_BIN}.tmp
+${PANEL_USER} ALL=(root) NOPASSWD: ${chmod_bin} 0755 ${PANEL_BIN}.tmp
+${PANEL_USER} ALL=(root) NOPASSWD: ${mv_bin} -f ${PANEL_BIN}.tmp ${PANEL_BIN}
+${PANEL_USER} ALL=(root) NOPASSWD: ${rm_bin} -f ${PANEL_BIN}.tmp
+${PANEL_USER} ALL=(root) NOPASSWD: ${systemctl_bin} restart ${PANEL_SVC}
+${PANEL_USER} ALL=(root) NOPASSWD: ${systemctl_bin} restart telemt*
+${PANEL_USER} ALL=(root) NOPASSWD: ${systemctl_bin} start ${PANEL_SVC}
+SUDO
+    chmod 0440 "$sudoers"
+    ok "Sudoers: ${sudoers}"
+
+    # Systemd
+    cat > "/etc/systemd/system/${PANEL_SVC}.service" <<SVC
+[Unit]
+Description=Telemt Panel
+After=network.target
+
+[Service]
+Type=simple
+User=${PANEL_USER}
+ExecStart=${PANEL_BIN} --config ${PANEL_CFG}
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=${PANEL_CFG_DIR} ${PANEL_DATA}
+
+[Install]
+WantedBy=multi-user.target
+SVC
+    systemctl daemon-reload
+    systemctl enable "${PANEL_SVC}"
+    systemctl start "${PANEL_SVC}"
+    ok "Сервис ${PANEL_SVC} запущен"
+
+    # UFW
+    if ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow 8080/tcp 2>/dev/null && info "UFW: открыт 8080"
+    fi
+
+    echo ""
+    [[ -z "$_PUBLIC_IP_CACHE" ]] && _PUBLIC_IP_CACHE=$(get_public_ip)
+    ok "${BOLD}Панель доступна: http://${_PUBLIC_IP_CACHE:-<IP>}:8080${RESET}"
+    health_check_brief
+    pause
+}
+
+panel_remove_full() {
+    draw_header
+    echo -e "  ${BOLD}${RED}Удаление telemt_panel${RESET}\n"
+    warn "Будут удалены: бинарник, конфиг, данные, systemd-сервис, пользователь"
+    read -rp "  Подтвердить? [y/N]: " ans
+    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
+
+    systemctl stop "$PANEL_SVC" 2>/dev/null || true
+    systemctl disable "$PANEL_SVC" 2>/dev/null || true
+    rm -f "/etc/systemd/system/${PANEL_SVC}.service"
+    rm -f "/etc/sudoers.d/${PANEL_SVC}"
+    rm -f "$PANEL_BIN"
+    rm -rf "$PANEL_CFG_DIR" "$PANEL_DATA"
+    if id "$PANEL_USER" &>/dev/null; then
+        userdel "$PANEL_USER" 2>/dev/null || true
+    fi
+    systemctl daemon-reload
+
+    # UFW
+    if ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw delete allow 8080/tcp 2>/dev/null && info "UFW: закрыт 8080"
+    fi
+
+    ok "Панель полностью удалена"
+    health_check_brief
+    pause
+}
+
+panel_show_logs() {
+    draw_header
+    echo -e "  ${BOLD}Логи telemt-panel${RESET}\n"
+    journalctl -u "$PANEL_SVC" -n 40 --no-pager 2>/dev/null | sed 's/^/    /'
+    pause
+}
+
+menu_panel() {
+    while true; do
+        draw_header
+        echo -e "  ${BOLD}Панель управления (telemt_panel)${RESET}\n"
+
+        if [[ -x "$PANEL_BIN" ]]; then
+            local ver st port
+            ver=$("$PANEL_BIN" version 2>/dev/null | head -1 || echo "?")
+            st=$(systemctl is-active "$PANEL_SVC" 2>/dev/null || echo "не установлен")
+            port=$(grep -m1 '^\s*listen' "$PANEL_CFG" 2>/dev/null | grep -oE '[0-9]+' || echo "8080")
+            echo -e "  Версия:  ${BOLD}${ver}${RESET}"
+            echo -e "  Статус:  $(svc_status_color "$st")"
+            echo -e "  Порт:    ${BOLD}${port}${RESET}"
+            echo -e "  Конфиг:  ${DIM}${PANEL_CFG}${RESET}"
+        else
+            warn "Панель не установлена"
+        fi
+
+        echo ""
+        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+        if [[ -x "$PANEL_BIN" ]]; then
+            echo -e "  ${BOLD}1.${RESET} Перезапустить панель"
+            echo -e "  ${BOLD}2.${RESET} Остановить панель"
+            echo -e "  ${BOLD}3.${RESET} Запустить панель"
+            echo -e "  ${BOLD}4.${RESET} Просмотр логов"
+            echo -e "  ${BOLD}5.${RESET} Переустановить / обновить"
+            echo -e "  ${RED}${BOLD}6.${RESET} ${RED}Удалить панель${RESET}"
+        else
+            echo -e "  ${GREEN}${BOLD}1.${RESET} ${GREEN}Установить панель${RESET}"
+        fi
+        echo -e "  ${BOLD}0.${RESET} ← Назад"
+        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
+        echo ""
+        read -rp "  Выберите: " ch
+        if [[ -x "$PANEL_BIN" ]]; then
+            case "$ch" in
+                1) systemctl restart "$PANEL_SVC" && ok "Перезапущена" || err "Ошибка"; pause ;;
+                2) systemctl stop "$PANEL_SVC" && ok "Остановлена" || err "Ошибка"; pause ;;
+                3) systemctl start "$PANEL_SVC" && ok "Запущена" || err "Ошибка"; pause ;;
+                4) panel_show_logs ;;
+                5) panel_install ;;
+                6) panel_remove_full ;;
+                0|b) return ;;
+                *) warn "Неверный пункт"; sleep 1 ;;
+            esac
+        else
+            case "$ch" in
+                1) panel_install ;;
+                0|b) return ;;
+                *) warn "Неверный пункт"; sleep 1 ;;
+            esac
+        fi
+    done
 }
 
 # ════════════════════════════════════════════════════════════════════════
