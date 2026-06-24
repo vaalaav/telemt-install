@@ -530,7 +530,7 @@ get_site_port() {
         echo "$saved" | cut -d'|' -f4
         return
     fi
-    grep -m1 "listen" "$SITE_CONFIG_FILE" 2>/dev/null | grep -oE '[0-9]+' | head -1 || echo "8443"
+    grep "listen" "$SITE_CONFIG_FILE" 2>/dev/null | grep "ssl" | grep -oE '[0-9]+' | head -1 || echo "8443"
 }
 
 status_site() {
