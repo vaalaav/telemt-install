@@ -345,6 +345,29 @@ draw_header() {
 }
 
 # ─── Статус-строки для главного меню ─────────────────────────────────────────
+status_version() {
+    if [[ ! -x /bin/telemt ]]; then
+        echo -e "${DIM}не установлен${RESET}"
+        return
+    fi
+    local installed; installed=$(/bin/telemt --version 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "")
+    if [[ -z "$installed" ]]; then
+        echo -e "${YELLOW}? (не удалось определить)${RESET}"
+        return
+    fi
+    local latest=""
+    latest=$(curl -fsSL --connect-timeout 3 --max-time 5 \
+        -H "Accept: application/json" \
+        "https://github.com/telemt/telemt/releases/latest" 2>/dev/null \
+        | grep -oE '"tag_name"\s*:\s*"[^"]+"' | head -1 \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+    if [[ -n "$latest" && "$latest" != "$installed" ]]; then
+        echo -e "${GREEN}${installed}${RESET}  ${YELLOW}⬆ доступна ${BOLD}${latest}${RESET}"
+    else
+        echo -e "${GREEN}${installed}${RESET}"
+    fi
+}
+
 status_proxy() {
     local insts; read -ra insts <<< "$(active_instances)"
     if [[ ${#insts[@]} -eq 0 ]]; then
@@ -601,6 +624,7 @@ main_menu() {
 
         [[ -z "$_PUBLIC_IP_CACHE" ]] && _PUBLIC_IP_CACHE=$(get_public_ip)
         echo -e "  ${BOLD}Состояние:${RESET}  ${DIM}IP: ${_PUBLIC_IP_CACHE:-не определён}${RESET}"
+        echo -e "  Версия:     $(status_version)"
         echo -e "  Прокси:     $(status_proxy)"
         echo -e "  Keepalive:  $(status_keepalive)"
         echo -e "  BBR:        $(status_bbr)"
