@@ -606,12 +606,14 @@ status_panel() {
         echo -e "${DIM}не установлена${RESET}"
         return
     fi
-    local ver; ver=$("$PANEL_BIN" version 2>/dev/null | head -1 || echo "?")
+    local ver; ver=$("$PANEL_BIN" version 2>/dev/null | awk '{print $NF; exit}' || echo "?")
     if systemctl is-active --quiet "$PANEL_SVC" 2>/dev/null; then
-        local port; port=$(grep -m1 '^\s*listen' "$PANEL_CFG" 2>/dev/null | grep -oE '[0-9]+' || echo "8080")
-        echo -e "${GREEN}активна${RESET}  :${BOLD}${port}${RESET}  ${DIM}${ver}${RESET}"
+        local port; port=$(grep -m1 '^\s*listen' "$PANEL_CFG" 2>/dev/null | grep -oE ':[0-9]+' | tr -d ':')
+        port="${port:-8080}"
+        [[ -z "$_PUBLIC_IP_CACHE" ]] && _PUBLIC_IP_CACHE=$(get_public_ip)
+        echo -e "${GREEN}активна${RESET}  ${DIM}v${ver}${RESET}  http://${_PUBLIC_IP_CACHE:-<IP>}:${port}"
     else
-        echo -e "${YELLOW}установлена, не запущена${RESET}  ${DIM}${ver}${RESET}"
+        echo -e "${YELLOW}не запущена${RESET}  ${DIM}v${ver}${RESET}"
     fi
 }
 
@@ -4035,9 +4037,10 @@ menu_panel() {
 
         if [[ -x "$PANEL_BIN" ]]; then
             local ver st port
-            ver=$("$PANEL_BIN" version 2>/dev/null | head -1 || echo "?")
+            ver=$("$PANEL_BIN" version 2>/dev/null | awk '{print $NF; exit}' || echo "?")
             st=$(systemctl is-active "$PANEL_SVC" 2>/dev/null || echo "не установлен")
-            port=$(grep -m1 '^\s*listen' "$PANEL_CFG" 2>/dev/null | grep -oE '[0-9]+' || echo "8080")
+            port=$(grep -m1 '^\s*listen' "$PANEL_CFG" 2>/dev/null | grep -oE ':[0-9]+' | tr -d ':')
+            port="${port:-8080}"
             echo -e "  Версия:  ${BOLD}${ver}${RESET}"
             echo -e "  Статус:  $(svc_status_color "$st")"
             echo -e "  Порт:    ${BOLD}${port}${RESET}"
