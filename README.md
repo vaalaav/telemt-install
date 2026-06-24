@@ -1,90 +1,188 @@
-# Установка telemt proxy на VPS + примочки
+<div align="center">
 
-🇷🇺 [Русский](#-русский) | 🇬🇧 [English](#-english)
+# telemt-install
+
+**Модульный автоустановщик telemt для Ubuntu**
+
+[![OS](https://img.shields.io/badge/Ubuntu-20.04+-E95420?logo=ubuntu&logoColor=white)](#)
+[![Shell](https://img.shields.io/badge/Bash-5.0+-4EAA25?logo=gnubash&logoColor=white)](#)
+[![License](https://img.shields.io/badge/license-MIT-blue)](#)
+
+Разворачивает Telegram MTProxy на VPS в одну команду.\
+Полная автоматизация — от бинарника до TLS-сертификата.
+
+🇷🇺 [Русский](#-русский) &nbsp;|&nbsp; 🇬🇧 [English](#-english)
+
+</div>
 
 ---
 
 ## 🇷🇺 Русский
 
-### Что это
-
-Модульный автоустановщик **telemt** для Ubuntu — разворачивает прокси-сервер на VPS в одну команду. Поддерживает несколько инстансов с индивидуальными портами и доменами, опциональный VLESS Reality, камуфляжный сайт с TLS и защиту от DPI-зондирования.
-
-### Возможности
-
-- **Мультиинстанс** — до 4 параллельных прокси с отдельными секретами
-- **VLESS Reality** — интеграция с xray-core для дополнительного транспорта
-- **Камуфляжный сайт** — Nginx + Certbot, автоматический TLS-сертификат
-- **Защита от DPI** — rate-limit через xt_recent и nftables SYN-лимитер
-- **Тюнинг ядра** — BBR, TCP Keepalive
-- **Файрвол** — автонастройка UFW
-- **systemd-сервисы** — автозапуск, обновление (`--update`) и полная очистка (`--purge`)
-
-### Быстрый старт
+### ⚡ Быстрый старт
 
 ```bash
-# Запуск от root на чистой Ubuntu 20.04+
 git clone https://github.com/vaalaav/telemt-install.git
-cd telemt-install
-chmod +x install.sh
+cd telemt-install && chmod +x install.sh
 sudo ./install.sh
 ```
 
-### Интерактивный менеджер управления
+> После подтверждения установка идёт полностью автоматически.\
+> В конце — таблица статуса и готовые клиентские ссылки.
+
+---
+
+### 🧩 Возможности
+
+| | Функция | Описание |
+|:--:|---|---|
+| 🔀 | **Мультиинстанс** | До 10 параллельных прокси с индивидуальными параметрами |
+| 🛡️ | **VLESS Reality** | Интеграция xray-core — одиночные ссылки, подписки 3x-ui, балансировка, авто-обновление |
+| 🌐 | **Свой сайт** | Nginx + Let's Encrypt — полноценный фронтенд с автоматическим TLS |
+| 🔍 | **Защита от DPI** | Rate-limit через xt_recent, nftables SYN-лимитер, поддержка TSPU-режима |
+| ⚙️ | **Тюнинг ядра** | BBR, TCP Keepalive, настройка таймаутов |
+| 🧱 | **Файрвол** | Автонастройка UFW с синхронизацией при добавлении/удалении инстансов |
+| 🔄 | **Жизненный цикл** | systemd-сервисы, обновление бинарника, чистая переустановка, полное удаление |
+| 🏷️ | **Свой домен** | Кастомный домен в клиентских ссылках с проверкой DNS |
+
+---
+
+### 🖥️ mytelemtinfo — интерактивный менеджер
 
 ```bash
 sudo mytelemtinfo
 ```
 
-### Управление
+TUI-панель для управления всеми аспектами после установки:
+
+- Управление инстансами — старт, стоп, рестарт, добавление, удаление, ссылки, логи
+- Настройка сети — Keepalive, BBR, nft SYN-лимитер, таймауты
+- Безопасность — UFW, rate-limit, TSPU
+- VLESS Reality — смена ссылки, привязка/отвязка от инстансов, тест IP
+- Сайт — установка, удаление, управление Nginx и сертификатами
+
+---
+
+### 🔧 Режимы запуска
 
 ```bash
-sudo ./main.sh --update   # Обновление бинарника и перезапуск
-sudo ./main.sh --purge    # Полное удаление всех компонентов
-journalctl -u telemt1 -f  # Просмотр логов инстанса
+sudo ./install.sh              # Интерактивная установка
+sudo ./install.sh --update     # Обновить бинарник telemt
+sudo ./install.sh --purge      # Полное удаление всех компонентов
+```
+
+При повторном запуске — выбор: установка поверх, чистая установка или только очистка.
+
+---
+
+### 📁 Структура проекта
+
+```
+telemt-install/
+├── install.sh          # Точка входа
+├── main.sh             # Оркестратор модулей
+├── config.env          # Переменные конфигурации
+├── lib/
+│   ├── 01_prepare.sh   # Подготовка окружения
+│   ├── 02_binary.sh    # Загрузка бинарника
+│   ├── 03_vless.sh     # VLESS Reality
+│   ├── 04_configs.sh   # Генерация конфигов
+│   ├── 05_network.sh   # Сеть и файрвол
+│   ├── 06_site.sh      # Nginx + Certbot
+│   └── 07_lifecycle.sh # systemd и запуск
+├── utils/
+│   └── helpers.sh      # Утилиты и логирование
+└── mytelemtinfo.sh     # TUI-менеджер
 ```
 
 ---
 
 ## 🇬🇧 English
 
-# Installing telemt proxy on VPS + utilities
-
-### What is this
-
-A modular auto-installer for **telemt** on Ubuntu — deploys a proxy server on a VPS with a single command. Supports multiple instances with individual ports and domains, optional VLESS Reality, a camouflage website with TLS, and DPI probing protection.
-
-### Features
-
-- **Multi-instance** — up to 4 parallel proxies (443, 5223, 8530…) with separate secrets
-- **VLESS Reality** — xray-core integration for an additional transport layer
-- **Camouflage site** — Nginx + Certbot with automatic TLS certificates
-- **DPI protection** — rate-limiting via xt_recent and nftables SYN limiter
-- **Kernel tuning** — BBR, TCP Keepalive
-- **Firewall** — automatic UFW configuration
-- **systemd services** — auto-start, update (`--update`), and full removal (`--purge`)
-
-
-### Quick start
+### ⚡ Quick Start
 
 ```bash
-# Run as root on a clean Ubuntu 20.04+
 git clone https://github.com/vaalaav/telemt-install.git
-cd telemt-install
-chmod +x install.sh
+cd telemt-install && chmod +x install.sh
 sudo ./install.sh
 ```
 
-### Interactive Management Manager
+> After confirmation the installation runs fully automatically.\
+> Finishes with a status table and ready-to-share client links.
+
+---
+
+### 🧩 Features
+
+| | Feature | Description |
+|:--:|---|---|
+| 🔀 | **Multi-instance** | Up to 10 parallel proxies with individual settings |
+| 🛡️ | **VLESS Reality** | xray-core integration — single links, 3x-ui subscriptions, load balancing, auto-refresh |
+| 🌐 | **Own Website** | Nginx + Let's Encrypt — full frontend with automatic TLS |
+| 🔍 | **DPI Protection** | Rate-limiting via xt_recent, nftables SYN limiter, TSPU mode support |
+| ⚙️ | **Kernel Tuning** | BBR, TCP Keepalive, timeout configuration |
+| 🧱 | **Firewall** | Automatic UFW setup synced with instance changes |
+| 🔄 | **Lifecycle** | systemd services, binary updates, clean reinstall, full removal |
+| 🏷️ | **Custom Domain** | Custom domain in client links with DNS validation |
+
+---
+
+### 🖥️ mytelemtinfo — Interactive Manager
 
 ```bash
 sudo mytelemtinfo
 ```
 
-### Management
+TUI panel for post-install management:
+
+- Instance control — start, stop, restart, add, remove, links, logs
+- Network tuning — Keepalive, BBR, nft SYN limiter, timeouts
+- Security — UFW, rate-limit, TSPU
+- VLESS Reality — change link, bind/unbind to instances, IP test
+- Website — install, remove, manage Nginx and certificates
+
+---
+
+### 🔧 Run Modes
 
 ```bash
-sudo ./main.sh --update   # Update binary and restart
-sudo ./main.sh --purge    # Complete removal of all components
-journalctl -u telemt1 -f  # View instance logs
+sudo ./install.sh              # Interactive installation
+sudo ./install.sh --update     # Update telemt binary
+sudo ./install.sh --purge      # Full removal of all components
 ```
+
+On re-run — choose: install over existing, clean install, or removal only.
+
+---
+
+### 📁 Project Structure
+
+```
+telemt-install/
+├── install.sh          # Entry point
+├── main.sh             # Module orchestrator
+├── config.env          # Configuration variables
+├── lib/
+│   ├── 01_prepare.sh   # Environment setup
+│   ├── 02_binary.sh    # Binary download
+│   ├── 03_vless.sh     # VLESS Reality
+│   ├── 04_configs.sh   # Config generation
+│   ├── 05_network.sh   # Network & firewall
+│   ├── 06_site.sh      # Nginx + Certbot
+│   └── 07_lifecycle.sh # systemd & startup
+├── utils/
+│   └── helpers.sh      # Utilities & logging
+└── mytelemtinfo.sh     # TUI manager
+```
+
+---
+
+<div align="center">
+
+### 📚 Источники / References
+
+[telemt server guide](https://assyoucandy.github.io/telemt-server-guide/) · [keepalive guide](https://assyoucandy.github.io/telemt-server-guide/telemt-keepalive-guide.html) · [nft tune](https://h1de0x.github.io/telemt-tune/) · [telemt releases](https://github.com/telemt/telemt/releases)
+
+Часть кода написана с помощью Claude (Anthropic)
+
+</div>
