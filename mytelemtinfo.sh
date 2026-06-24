@@ -295,17 +295,6 @@ health_check() {
         fi
     fi
 
-    # 9. Панель управления (если установлена)
-    if [[ -x "$PANEL_BIN" ]]; then
-        if systemctl is-active --quiet "$PANEL_SVC" 2>/dev/null; then
-            local panel_ver; panel_ver=$("$PANEL_BIN" version 2>/dev/null | head -1 || echo "?")
-            results+=("OK\tПанель telemt_panel\t${panel_ver}, сервис active")
-        else
-            results+=("FAIL\tПанель telemt_panel\tустановлена, но сервис не active")
-            issues=$((issues+1))
-        fi
-    fi
-
     # Печать результата
     echo ""
     echo -e "  ${BOLD}${CYAN}── Проверка состояния (${mode}) ──${RESET}"
@@ -345,29 +334,6 @@ draw_header() {
 }
 
 # ─── Статус-строки для главного меню ─────────────────────────────────────────
-status_version() {
-    if [[ ! -x /bin/telemt ]]; then
-        echo -e "${DIM}не установлен${RESET}"
-        return
-    fi
-    local installed; installed=$(/bin/telemt --version 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "")
-    if [[ -z "$installed" ]]; then
-        echo -e "${YELLOW}? (не удалось определить)${RESET}"
-        return
-    fi
-    local latest=""
-    latest=$(curl -fsSL --connect-timeout 3 --max-time 5 \
-        -H "Accept: application/json" \
-        "https://github.com/telemt/telemt/releases/latest" 2>/dev/null \
-        | grep -oE '"tag_name"\s*:\s*"[^"]+"' | head -1 \
-        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-    if [[ -n "$latest" && "$latest" != "$installed" ]]; then
-        echo -e "${GREEN}${installed}${RESET}  ${YELLOW}⬆ доступна ${BOLD}${latest}${RESET}"
-    else
-        echo -e "${GREEN}${installed}${RESET}"
-    fi
-}
-
 status_proxy() {
     local insts; read -ra insts <<< "$(active_instances)"
     if [[ ${#insts[@]} -eq 0 ]]; then
@@ -592,28 +558,54 @@ status_site() {
     fi
 }
 
-# ─── Панель управления (telemt_panel) ────────────────────────────────────
-PANEL_REPO="amirotin/telemt_panel"
-PANEL_BIN="/usr/local/bin/telemt-panel"
-PANEL_CFG_DIR="/etc/telemt-panel"
-PANEL_CFG="${PANEL_CFG_DIR}/config.toml"
-PANEL_DATA="/var/lib/telemt-panel"
-PANEL_SVC="telemt-panel"
-PANEL_USER="telemt-panel"
+status_server_ip() {
+    [[ -z "$_PUBLIC_IP_CACHE" ]] && _PUBLIC_IP_CACHE=$(get_public_ip)
+    if [[ -n "$_PUBLIC_IP_CACHE" ]]; then
+        echo -e "${GREEN}${_PUBLIC_IP_CACHE}${RESET}"
+    else
+        echo -e "${RED}не определён${RESET}"
+    fi
+}
+
+status_version() {
+    local ver
+    ver=$(/bin/telemt --version 2>&1 | head -1) || ver=""
+    if [[ -n "$ver" ]]; then
+        echo -e "${GREEN}${ver}${RESET}"
+    else
+        echo -e "${DIM}не установлен${RESET}"
+    fi
+}
 
 status_panel() {
-    if [[ ! -x "$PANEL_BIN" ]]; then
-        echo -e "${DIM}не установлена${RESET}"
-        return
-    fi
-    local ver; ver=$("$PANEL_BIN" version 2>/dev/null | awk '{print $NF; exit}' || echo "?")
-    if systemctl is-active --quiet "$PANEL_SVC" 2>/dev/null; then
-        local port; port=$(grep -m1 '^\s*listen' "$PANEL_CFG" 2>/dev/null | grep -oE ':[0-9]+' | tr -d ':')
-        port="${port:-8080}"
+    if systemctl is-active --quiet x-ui 2>/dev/null; then
+        local pver=""
+        pver=$(x-ui version 2>/dev/null | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1) || true
         [[ -z "$_PUBLIC_IP_CACHE" ]] && _PUBLIC_IP_CACHE=$(get_public_ip)
-        echo -e "${GREEN}активна${RESET}  ${DIM}v${ver}${RESET}  http://${_PUBLIC_IP_CACHE:-<IP>}:${port}"
+        local url="http://${_PUBLIC_IP_CACHE:-???}:8080"
+        if [[ -n "$pver" ]]; then
+            echo -e "${GREEN}активна${RESET}  v${pver}  ${url}"
+        else
+            echo -e "${GREEN}активна${RESET}  ${url}"
+        fi
+    elif [[ -f /usr/local/x-ui/x-ui ]]; then
+        echo -e "${YELLOW}установлена, не запущена${RESET}"
     else
-        echo -e "${YELLOW}не запущена${RESET}  ${DIM}v${ver}${RESET}"
+        echo -e "${DIM}не установлена${RESET}"
+    fi
+}
+
+status_link() {
+    local insts; read -ra insts <<< "$(active_instances)"
+    [[ ${#insts[@]} -eq 0 ]] && { echo -e "${DIM}нет инстансов${RESET}"; return; }
+    local first="${insts[0]}"
+    local api="${INSTANCE_APIS[$first]:-}"
+    [[ -z "$api" ]] && { echo -e "${DIM}API не найден${RESET}"; return; }
+    local link; link=$(get_link "$api")
+    if [[ -n "$link" ]]; then
+        echo -e "${GREEN}${link}${RESET}"
+    else
+        echo -e "${DIM}не удалось получить${RESET}"
     fi
 }
 
@@ -624,19 +616,19 @@ main_menu() {
     while true; do
         draw_header
 
-        [[ -z "$_PUBLIC_IP_CACHE" ]] && _PUBLIC_IP_CACHE=$(get_public_ip)
-        echo -e "  ${BOLD}Состояние:${RESET}  ${DIM}IP: ${_PUBLIC_IP_CACHE:-не определён}${RESET}"
-        echo -e "  Версия:     $(status_version)"
+        echo -e "  ${BOLD}Состояние:${RESET} IP: $(status_server_ip)"
+        echo -e "  Свой домен: $(status_custom_domain)"
         echo -e "  Прокси:     $(status_proxy)"
+        echo -e "  Версия:     $(status_version)"
         echo -e "  Keepalive:  $(status_keepalive)"
         echo -e "  BBR:        $(status_bbr)"
         echo -e "  nft SYN:    $(status_nft)"
         echo -e "  Таймауты:   $(status_timeouts)"
         echo -e "  UFW:        $(status_ufw)"
-        echo -e "  Свой домен: $(status_custom_domain)"
         echo -e "  VLESS:      $(status_vless)"
         echo -e "  Сайт:       $(status_site)"
         echo -e "  Панель:     $(status_panel)"
+        echo -e "  Ссылка:     $(status_link)"
         echo ""
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
         echo -e "  ${BOLD}1.${RESET} Управление прокси"
@@ -647,7 +639,6 @@ main_menu() {
         echo -e "  ${BOLD}6.${RESET} Свой домен в ссылках"
         echo -e "  ${BOLD}7.${RESET} VLESS Reality upstream"
         echo -e "  ${BOLD}8.${RESET} Сайт-заглушка"
-        echo -e "  ${BOLD}9.${RESET} Панель управления (telemt_panel)"
         echo -e "  ${BOLD}0.${RESET} Выход"
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
         echo ""
@@ -661,7 +652,6 @@ main_menu() {
             6) menu_custom_domain ;;
             7) menu_vless ;;
             8) menu_site ;;
-            9) menu_panel ;;
             0|q) echo ""; exit 0 ;;
             *) warn "Неверный пункт" ; sleep 1 ;;
         esac
@@ -898,21 +888,6 @@ proxy_update() {
     echo -e "  ${BOLD}Обновление бинарника telemt${RESET}\n"
     local ver_before; ver_before=$(/bin/telemt --version 2>&1 | head -1 || echo "неизвестна")
     info "Текущая версия: ${BOLD}${ver_before}${RESET}"
-
-    local ver_latest=""
-    ver_latest=$(wget -qO- --timeout=5 "https://api.github.com/repos/telemt/telemt/releases/latest" 2>/dev/null \
-        | python3 -c "import sys,json; print(json.load(sys.stdin).get('tag_name',''))" 2>/dev/null) || true
-
-    if [[ -n "$ver_latest" ]]; then
-        if [[ "$ver_before" == *"$ver_latest"* || "$ver_latest" == *"$ver_before"* ]]; then
-            ok "Уже установлена последняя версия (${ver_latest})"
-        else
-            info "Новая версия: ${BOLD}${ver_latest}${RESET}"
-        fi
-    else
-        warn "Не удалось проверить наличие обновлений"
-    fi
-
     echo ""
     read -rp "  Скачать и установить новую версию? [y/N]: " ans
     [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
@@ -1946,80 +1921,10 @@ nft_apply_rules() {
 nft_install() {
     draw_header
     echo -e "  ${BOLD}Установка nft SYN Limiter${RESET}\n"
-
-    # 1. Проверка инстансов
-    local ports=()
-    for f in /etc/telemt/telemt*.toml; do
-        [[ ! -f "$f" ]] && continue
-        local p; p=$(grep -m1 '^\s*port\s*=' "$f" 2>/dev/null | grep -oE '[0-9]+')
-        [[ -n "$p" ]] && ports+=("$p")
-    done
-    if [[ ${#ports[@]} -eq 0 ]]; then
-        warn "Нет активных telemt-инстансов — сначала добавьте прокси"
-        pause; return
-    fi
-
-    # 2. Установка nftables
-    if ! command -v nft &>/dev/null; then
-        info "Установка пакета nftables..."
-        apt-get update -qq && apt-get install -y -qq nftables || {
-            err "Не удалось установить nftables"; pause; return
-        }
-        ok "nftables установлен"
-    else
-        ok "nftables уже установлен"
-    fi
-
-    # 3. Параметры
-    echo ""
-    echo -e "  ${DIM}Варианты rate:    1/second (жёстко) | 2/second (мягче)${RESET}"
-    echo -e "  ${DIM}Варианты burst:   1 (строго) | 3 (мягче для многих клиентов)${RESET}"
-    echo -e "  ${DIM}Варианты timeout: 30s (быстрее) | 60s (дефолт) | 120s (дольше)${RESET}\n"
-
-    local rate burst timeout
-    read -rp "  RATE        [1/second]: " rate;    rate="${rate:-1/second}"
-    read -rp "  BURST       [1]: " burst;          burst="${burst:-1}"
-    read -rp "  TIMEOUT     [60s]: " timeout;      timeout="${timeout:-60s}"
-
-    # 4. IP сервера
-    local ip
-    ip=$(get_public_ip)
-    [[ -z "$ip" ]] && ip=$(hostname -I | awk '{print $1}')
-
-    # 5. Генерируем скрипт
-    {
-        echo '#!/bin/bash'
-        echo '# telemt nft inbound SYN per-client limiter'
-        echo 'set -eu'
-        echo ''
-        echo 'TABLE="telemt_limit"'
-        echo "SERVER_IP=\"${ip}\""
-        echo "RATE=\"${rate}\""
-        echo "BURST=\"${burst}\""
-        echo "METER_TIMEOUT=\"${timeout}\""
-        echo ''
-        echo 'nft delete table inet "$TABLE" 2>/dev/null || true'
-        echo 'nft add table inet "$TABLE"'
-        echo 'nft "add chain inet $TABLE input { type filter hook input priority 0; policy accept; }"'
-        echo ''
-        for p in "${ports[@]}"; do
-            echo "nft \"add rule inet \$TABLE input ip daddr \$SERVER_IP tcp dport ${p} tcp flags & (syn | ack) == syn meter telemt_in_syn_p${p} { ip saddr timeout \$METER_TIMEOUT limit rate over \$RATE burst \$BURST packets } counter drop comment \\\"telemt_syn_p${p}\\\"\""
-            echo "echo \"Правило применено: порт ${p}\""
-        done
-        echo ''
-        echo 'echo "=== Применённые правила ==="'
-        echo 'nft list chain inet telemt_limit input'
-    } > /usr/local/sbin/telemt-nft-limit.sh
-    chmod +x /usr/local/sbin/telemt-nft-limit.sh
-    ok "Скрипт создан: /usr/local/sbin/telemt-nft-limit.sh"
-
-    # 6. Применяем
-    echo ""
-    if /usr/local/sbin/telemt-nft-limit.sh; then
-        ok "nft SYN limiter активен для портов: ${ports[*]}"
-    else
-        err "Ошибка применения правил"
-    fi
+    info "Запустите установщик для настройки nft limiter:"
+    echo -e "  ${CYAN}bash <(curl -fsSL https://raw.githubusercontent.com/vaalaav/telemt-install/main/install.sh)${RESET}"
+    echo -e "\n  Или установите nftables и создайте скрипт вручную по гайду:"
+    echo -e "  ${CYAN}https://h1de0x.github.io/telemt-tune/${RESET}"
     pause
 }
 
@@ -2092,64 +1997,6 @@ nft_remove() {
     pause
 }
 
-config_edit_nano() {
-    draw_header
-    echo -e "  ${BOLD}Редактирование конфига в nano${RESET}\n"
-
-    local insts; read -ra insts <<< "$(active_instances)"
-    if [[ ${#insts[@]} -eq 0 ]]; then
-        warn "Нет активных инстансов"; pause; return
-    fi
-
-    echo -e "  ${DIM}Доступные инстансы:${RESET}"
-    for n in "${insts[@]}"; do
-        local st; st=$(svc_status "$n")
-        echo -e "  ${BOLD}${n}${RESET}) telemt${n}.toml  $(svc_status_color "$st")  :${INSTANCE_PORTS[$n]}"
-    done
-    echo -e "  ${BOLD}0${RESET}) ← Назад"
-    echo ""
-    read -rp "  Выберите инстанс: " pick
-    [[ "$pick" == "0" || -z "$pick" ]] && return
-
-    # Проверяем, что выбранный инстанс существует
-    local valid=false
-    for n in "${insts[@]}"; do [[ "$n" == "$pick" ]] && valid=true && break; done
-    if [[ "$valid" != true ]]; then
-        warn "Инстанс $pick не найден"; pause; return
-    fi
-
-    local conf="/etc/telemt/telemt${pick}.toml"
-    if [[ ! -f "$conf" ]]; then
-        err "Файл $conf не существует"; pause; return
-    fi
-
-    # Бэкап перед редактированием
-    cp "$conf" "${conf}.bak.$(date +%s)"
-    info "Бэкап сохранён: ${conf}.bak.*"
-
-    nano "$conf"
-
-    # После выхода из nano — предложить рестарт
-    echo ""
-    read -rp "  Перезапустить telemt${pick}? [Y/n]: " ans
-    if [[ ! "${ans,,}" =~ ^(n|no|н|нет)$ ]]; then
-        systemctl restart "telemt${pick}" 2>/dev/null
-        local new_st; new_st=$(svc_status "$pick")
-        if [[ "$new_st" == "active" ]]; then
-            ok "telemt${pick} перезапущен"
-        else
-            err "telemt${pick} не запустился (статус: $new_st)"
-            warn "Проверьте конфиг или восстановите бэкап"
-        fi
-    else
-        info "Сервис не перезапущен — изменения применятся после рестарта"
-    fi
-    # Перечитать порты/домены из обновлённого конфига
-    load_instance_config
-    health_check_brief
-    pause
-}
-
 # ════════════════════════════════════════════════════════════════════════
 #  4. ТАЙМАУТЫ TELEMT
 # ════════════════════════════════════════════════════════════════════════
@@ -2202,9 +2049,6 @@ menu_timeouts() {
         echo -e "  ${BOLD}── client_mss=\"tspu\" (обход ТСПУ для РФ):${RESET}"
         echo -e "  ${BOLD}3.${RESET} ${GREEN}Включить${RESET} (раскомментировать или добавить во все конфиги)"
         echo -e "  ${BOLD}4.${RESET} ${YELLOW}Отключить${RESET} (закомментировать во всех конфигах)"
-        echo ""
-        echo -e "  ${BOLD}── Редактирование:${RESET}"
-        echo -e "  ${BOLD}5.${RESET} Открыть конфиг инстанса в nano"
         echo -e "  ${BOLD}0.${RESET} ← Назад"
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
         echo ""
@@ -2214,7 +2058,6 @@ menu_timeouts() {
             2) timeouts_reset ;;
             3) tspu_enable ;;
             4) tspu_disable ;;
-            5) config_edit_nano ;;
             0|b) return ;;
             *) warn "Неверный пункт"; sleep 1 ;;
         esac
@@ -3823,267 +3666,6 @@ site_remove() {
     ok "Сайт-заглушка удалена"
     health_check_brief
     pause
-}
-
-# ════════════════════════════════════════════════════════════════════════
-#  9. ПАНЕЛЬ УПРАВЛЕНИЯ (telemt_panel)
-# ════════════════════════════════════════════════════════════════════════
-_panel_detect_arch() {
-    local arch; arch=$(uname -m)
-    case "$arch" in
-        x86_64)  echo "x86_64"  ;;
-        aarch64) echo "aarch64" ;;
-        *)       err "Архитектура $arch не поддерживается"; return 1 ;;
-    esac
-}
-
-panel_install() {
-    draw_header
-    echo -e "  ${BOLD}Установка telemt_panel${RESET}\n"
-
-    if [[ -x "$PANEL_BIN" ]]; then
-        warn "Панель уже установлена: $($PANEL_BIN version 2>/dev/null | head -1)"
-        read -rp "  Переустановить/обновить? [y/N]: " ans
-        [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
-    fi
-
-    # Архитектура
-    local arch
-    arch=$(_panel_detect_arch) || { pause; return; }
-
-    # Последний релиз
-    info "Определение последней версии..."
-    local tag
-    tag=$(curl -fsSL "https://api.github.com/repos/${PANEL_REPO}/releases/latest" 2>/dev/null \
-        | python3 -c "import sys,json; print(json.load(sys.stdin).get('tag_name',''))" 2>/dev/null)
-    [[ -z "$tag" ]] && { err "Не удалось получить версию"; pause; return; }
-    info "Версия: $tag"
-
-    # Скачивание
-    local tarball="telemt-panel-${arch}-linux-gnu.tar.gz"
-    local url="https://github.com/${PANEL_REPO}/releases/download/${tag}/${tarball}"
-    local tmp_dir; tmp_dir=$(mktemp -d)
-    info "Скачивание ${tarball}..."
-    if ! curl -fSL "$url" -o "${tmp_dir}/${tarball}" 2>&1 | tail -3; then
-        err "Ошибка загрузки"; rm -rf "$tmp_dir"; pause; return
-    fi
-    tar -xzf "${tmp_dir}/${tarball}" -C "$tmp_dir"
-    install -m 0755 "${tmp_dir}/telemt-panel-${arch}-linux" "$PANEL_BIN"
-    rm -rf "$tmp_dir"
-    ok "Бинарник: ${PANEL_BIN} (${tag})"
-
-    # Системный пользователь
-    if ! id "$PANEL_USER" &>/dev/null; then
-        useradd --system --shell /usr/sbin/nologin --home /nonexistent "$PANEL_USER" 2>/dev/null \
-            || adduser --system --shell /usr/sbin/nologin --home /nonexistent --disabled-password "$PANEL_USER" 2>/dev/null
-        ok "Создан пользователь ${PANEL_USER}"
-    fi
-    # Доступ к группе telemt
-    if getent group telemt &>/dev/null; then
-        usermod -aG telemt "$PANEL_USER" 2>/dev/null || true
-    fi
-
-    # Директории
-    mkdir -p "$PANEL_CFG_DIR" "$PANEL_DATA/staging"
-    chown "$PANEL_USER:$PANEL_USER" "$PANEL_CFG_DIR" "$PANEL_DATA" "$PANEL_DATA/staging"
-
-    # Конфиг
-    if [[ -f "$PANEL_CFG" ]]; then
-        info "Конфиг уже существует: ${PANEL_CFG}"
-    else
-        echo ""
-        # Автоопределение API URL по первому активному инстансу
-        local first_inst telemt_url telemt_auth=""
-        read -ra _tmp_insts <<< "$(active_instances)"
-        first_inst="${_tmp_insts[0]:-1}"
-        local api_port="${INSTANCE_APIS[$first_inst]:-9091}"
-        telemt_url="http://127.0.0.1:${api_port}"
-        info "Telemt API: ${telemt_url} (инстанс ${first_inst})"
-
-        local admin_user admin_pass
-        read -rp "  Admin логин [admin]: " admin_user
-        admin_user="${admin_user:-admin}"
-        read -rsp "  Admin пароль: " admin_pass; echo ""
-        [[ -z "$admin_pass" ]] && { err "Пароль не может быть пустым"; pause; return; }
-
-        info "Генерация хеша пароля..."
-        local pass_hash
-        pass_hash=$(printf '%s\n' "$admin_pass" | "$PANEL_BIN" hash-password 2>/dev/null)
-        [[ -z "$pass_hash" ]] && { err "Не удалось создать хеш пароля"; pause; return; }
-
-        local jwt_secret; jwt_secret=$(openssl rand -hex 32)
-        local telemt_path; telemt_path=$(command -v telemt 2>/dev/null || echo "/bin/telemt")
-
-        cat > "$PANEL_CFG" <<TOML
-listen = "0.0.0.0:8080"
-data_dir = "${PANEL_DATA}"
-
-[telemt]
-url = "${telemt_url}"
-$([ -n "$telemt_auth" ] && echo "auth_header = \"${telemt_auth}\"")
-binary_path = "${telemt_path}"
-service_name = "telemt1"
-
-[panel]
-binary_path = "${PANEL_BIN}"
-service_name = "${PANEL_SVC}"
-
-[auth]
-username = "${admin_user}"
-password_hash = "${pass_hash}"
-jwt_secret = "${jwt_secret}"
-session_ttl = "24h"
-TOML
-        chown "$PANEL_USER:$PANEL_USER" "$PANEL_CFG"
-        chmod 600 "$PANEL_CFG"
-        ok "Конфиг: ${PANEL_CFG}"
-    fi
-
-    # Sudoers drop-in
-    local sudoers="/etc/sudoers.d/${PANEL_SVC}"
-    local cp_bin mv_bin chmod_bin rm_bin systemctl_bin
-    cp_bin=$(command -v cp); mv_bin=$(command -v mv)
-    chmod_bin=$(command -v chmod); rm_bin=$(command -v rm)
-    systemctl_bin=$(command -v systemctl)
-    cat > "$sudoers" <<SUDO
-${PANEL_USER} ALL=(root) NOPASSWD: ${cp_bin} -f ${PANEL_BIN} ${PANEL_DATA}/staging/telemt-panel.bak
-${PANEL_USER} ALL=(root) NOPASSWD: ${cp_bin} -f ${PANEL_DATA}/staging/telemt-panel ${PANEL_BIN}.tmp
-${PANEL_USER} ALL=(root) NOPASSWD: ${chmod_bin} 0755 ${PANEL_BIN}.tmp
-${PANEL_USER} ALL=(root) NOPASSWD: ${mv_bin} -f ${PANEL_BIN}.tmp ${PANEL_BIN}
-${PANEL_USER} ALL=(root) NOPASSWD: ${rm_bin} -f ${PANEL_BIN}.tmp
-${PANEL_USER} ALL=(root) NOPASSWD: ${systemctl_bin} restart ${PANEL_SVC}
-${PANEL_USER} ALL=(root) NOPASSWD: ${systemctl_bin} restart telemt*
-${PANEL_USER} ALL=(root) NOPASSWD: ${systemctl_bin} start ${PANEL_SVC}
-SUDO
-    chmod 0440 "$sudoers"
-    ok "Sudoers: ${sudoers}"
-
-    # Systemd
-    cat > "/etc/systemd/system/${PANEL_SVC}.service" <<SVC
-[Unit]
-Description=Telemt Panel
-After=network.target
-
-[Service]
-Type=simple
-User=${PANEL_USER}
-ExecStart=${PANEL_BIN} --config ${PANEL_CFG}
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=65536
-ProtectHome=true
-PrivateTmp=true
-ReadWritePaths=${PANEL_CFG_DIR} ${PANEL_DATA}
-
-[Install]
-WantedBy=multi-user.target
-SVC
-    systemctl daemon-reload
-    systemctl enable "${PANEL_SVC}"
-    systemctl start "${PANEL_SVC}"
-    ok "Сервис ${PANEL_SVC} запущен"
-
-    # UFW
-    if ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw allow 8080/tcp 2>/dev/null && info "UFW: открыт 8080"
-    fi
-
-    echo ""
-    [[ -z "$_PUBLIC_IP_CACHE" ]] && _PUBLIC_IP_CACHE=$(get_public_ip)
-    ok "${BOLD}Панель доступна: http://${_PUBLIC_IP_CACHE:-<IP>}:8080${RESET}"
-    health_check_brief
-    pause
-}
-
-panel_remove_full() {
-    draw_header
-    echo -e "  ${BOLD}${RED}Удаление telemt_panel${RESET}\n"
-    warn "Будут удалены: бинарник, конфиг, данные, systemd-сервис, пользователь"
-    read -rp "  Подтвердить? [y/N]: " ans
-    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
-
-    systemctl stop "$PANEL_SVC" 2>/dev/null || true
-    systemctl disable "$PANEL_SVC" 2>/dev/null || true
-    rm -f "/etc/systemd/system/${PANEL_SVC}.service"
-    rm -f "/etc/sudoers.d/${PANEL_SVC}"
-    rm -f "$PANEL_BIN"
-    rm -rf "$PANEL_CFG_DIR" "$PANEL_DATA"
-    if id "$PANEL_USER" &>/dev/null; then
-        userdel "$PANEL_USER" 2>/dev/null || true
-    fi
-    systemctl daemon-reload
-
-    # UFW
-    if ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw delete allow 8080/tcp 2>/dev/null && info "UFW: закрыт 8080"
-    fi
-
-    ok "Панель полностью удалена"
-    health_check_brief
-    pause
-}
-
-panel_show_logs() {
-    draw_header
-    echo -e "  ${BOLD}Логи telemt-panel${RESET}\n"
-    journalctl -u "$PANEL_SVC" -n 40 --no-pager 2>/dev/null | sed 's/^/    /'
-    pause
-}
-
-menu_panel() {
-    while true; do
-        draw_header
-        echo -e "  ${BOLD}Панель управления (telemt_panel)${RESET}\n"
-
-        if [[ -x "$PANEL_BIN" ]]; then
-            local ver st port
-            ver=$("$PANEL_BIN" version 2>/dev/null | awk '{print $NF; exit}' || echo "?")
-            st=$(systemctl is-active "$PANEL_SVC" 2>/dev/null || echo "не установлен")
-            port=$(grep -m1 '^\s*listen' "$PANEL_CFG" 2>/dev/null | grep -oE ':[0-9]+' | tr -d ':')
-            port="${port:-8080}"
-            echo -e "  Версия:  ${BOLD}${ver}${RESET}"
-            echo -e "  Статус:  $(svc_status_color "$st")"
-            echo -e "  Порт:    ${BOLD}${port}${RESET}"
-            echo -e "  Конфиг:  ${DIM}${PANEL_CFG}${RESET}"
-        else
-            warn "Панель не установлена"
-        fi
-
-        echo ""
-        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
-        if [[ -x "$PANEL_BIN" ]]; then
-            echo -e "  ${BOLD}1.${RESET} Перезапустить панель"
-            echo -e "  ${BOLD}2.${RESET} Остановить панель"
-            echo -e "  ${BOLD}3.${RESET} Запустить панель"
-            echo -e "  ${BOLD}4.${RESET} Просмотр логов"
-            echo -e "  ${BOLD}5.${RESET} Переустановить / обновить"
-            echo -e "  ${RED}${BOLD}6.${RESET} ${RED}Удалить панель${RESET}"
-        else
-            echo -e "  ${GREEN}${BOLD}1.${RESET} ${GREEN}Установить панель${RESET}"
-        fi
-        echo -e "  ${BOLD}0.${RESET} ← Назад"
-        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
-        echo ""
-        read -rp "  Выберите: " ch
-        if [[ -x "$PANEL_BIN" ]]; then
-            case "$ch" in
-                1) systemctl restart "$PANEL_SVC" && ok "Перезапущена" || err "Ошибка"; pause ;;
-                2) systemctl stop "$PANEL_SVC" && ok "Остановлена" || err "Ошибка"; pause ;;
-                3) systemctl start "$PANEL_SVC" && ok "Запущена" || err "Ошибка"; pause ;;
-                4) panel_show_logs ;;
-                5) panel_install ;;
-                6) panel_remove_full ;;
-                0|b) return ;;
-                *) warn "Неверный пункт"; sleep 1 ;;
-            esac
-        else
-            case "$ch" in
-                1) panel_install ;;
-                0|b) return ;;
-                *) warn "Неверный пункт"; sleep 1 ;;
-            esac
-        fi
-    done
 }
 
 # ════════════════════════════════════════════════════════════════════════
