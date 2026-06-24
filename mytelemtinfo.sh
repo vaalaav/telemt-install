@@ -578,20 +578,18 @@ status_version() {
 }
 
 status_panel() {
-    if systemctl is-active --quiet x-ui 2>/dev/null; then
-        local pver=""
-        pver=$(x-ui version 2>/dev/null | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1) || true
-        [[ -z "$_PUBLIC_IP_CACHE" ]] && _PUBLIC_IP_CACHE=$(get_public_ip)
-        local url="http://${_PUBLIC_IP_CACHE:-???}:8080"
-        if [[ -n "$pver" ]]; then
-            echo -e "${GREEN}активна${RESET}  v${pver}  ${url}"
-        else
-            echo -e "${GREEN}активна${RESET}  ${url}"
-        fi
-    elif [[ -f /usr/local/x-ui/x-ui ]]; then
-        echo -e "${YELLOW}установлена, не запущена${RESET}"
-    else
+    if [[ ! -x /usr/local/bin/telemt-panel ]]; then
         echo -e "${DIM}не установлена${RESET}"
+        return
+    fi
+    local ver; ver=$(/usr/local/bin/telemt-panel version 2>/dev/null | awk '{print $NF; exit}' || echo "?")
+    if systemctl is-active --quiet telemt-panel 2>/dev/null; then
+        local port; port=$(grep -m1 '^\s*listen' /etc/telemt-panel/config.toml 2>/dev/null | grep -oE ':[0-9]+' | tr -d ':')
+        port="${port:-8080}"
+        [[ -z "$_PUBLIC_IP_CACHE" ]] && _PUBLIC_IP_CACHE=$(get_public_ip)
+        echo -e "${GREEN}активна${RESET}  ${DIM}v${ver}${RESET}  http://${_PUBLIC_IP_CACHE:-<IP>}:${port}"
+    else
+        echo -e "${YELLOW}не запущена${RESET}  ${DIM}v${ver}${RESET}"
     fi
 }
 
