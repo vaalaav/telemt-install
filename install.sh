@@ -800,6 +800,11 @@ step_configs() {
         # client_mss = "tspu" — комментируем если отключено
         local tspu_line='client_mss = "tspu"'
         [[ "${USE_TSPU:-true}" == false ]] && tspu_line='#client_mss = "tspu"   # отключено: обход ТСПУ (РФ-фильтрация)'
+
+        # mask_port: в сценарии site пересылаем на локальный nginx (8443)
+        local mask_port_val=443
+        [[ "${INSTALL_SCENARIO:-standard}" == "site" ]] && mask_port_val=8443
+
         cat > "/etc/telemt/telemt${n}.toml" << TOML
 [general]
 fast_mode = true
@@ -833,7 +838,7 @@ whitelist = ["127.0.0.1/32"]
 [censorship]
 tls_domain = "${domain}"
 mask = true
-mask_port = 443
+mask_port = ${mask_port_val}
 tls_emulation = true
 unknown_sni_action = "reject_handshake"
 fake_cert_len = 2048
@@ -1589,7 +1594,7 @@ step_install_site_deps() {
     confirm "Установить?" skip || return 0
 
     wait_apt
-    if ! apt-get install -y nginx libnginx-mod-stream certbot python3-certbot-nginx git curl 2>&1 | tail -3; then
+    if ! apt-get install -y nginx certbot python3-certbot-nginx git curl 2>&1 | tail -3; then
         err "Не удалось установить зависимости — пропуск сайта"
         return 1
     fi
@@ -1708,7 +1713,7 @@ step_get_certbot_cert() {
 
     ok "Сертификат получен: /etc/letsencrypt/live/$SITE_DOMAIN/"
 
-    # Теперь добавляем HTTPS-блок на 127.0.0.1:8443 (за stream-прокси)
+    # Теперь добавляем HTTPS-блок на 8443 (доступен для telemt mask через публичный IP)
     cat > /etc/nginx/sites-available/telemt-site.conf << NGINX
 # Сайт-заглушка telemt-install
 server {
@@ -1723,7 +1728,8 @@ server {
 }
 
 server {
-    listen 127.0.0.1:8443 ssl http2;
+    listen 8443 ssl http2;
+    listen [::]:8443 ssl http2;
     server_name ${SITE_DOMAIN};
 
     ssl_certificate     /etc/letsencrypt/live/${SITE_DOMAIN}/fullchain.pem;
@@ -1748,7 +1754,7 @@ NGINX
         return 1
     fi
     systemctl restart nginx
-    ok "nginx переключён на HTTPS (127.0.0.1:8443, за stream-прокси)"
+    ok "nginx переключён на HTTPS (порт 8443, доступен через telemt mask на 443)"
 
     # Deploy-hook: после renewal сертификата перезагружаем nginx,
     # чтобы он подхватил новые ssl-файлы в памяти
@@ -1766,51 +1772,6 @@ HOOK
         systemctl enable --now certbot.timer 2>&1 | grep -v "Created symlink" || true
         ok "Автообновление сертификата: certbot.timer активен"
     fi
-}
-
-# Шаг: проверка работоспособности сайта + telemt + связки
-step_setup_sni_routing() {
-    hdr "Сайт: SNI-роутинг (порт 443)"
-    local pub_ip; pub_ip=$(get_public_ip_cached)
-    [[ -z "$pub_ip" ]] && { err "Не удалось определить публичный IP"; return 1; }
-
-    # Перебиндить telemt-инстансы с порта 443 на 127.0.0.1
-    local toml matched=false
-    for toml in /etc/telemt/telemt[0-9]*.toml; do
-        [[ -f "$toml" ]] || continue
-        grep -qE '^\s*port\s*=\s*443\b' "$toml" || continue
-        sed -i 's/^\(\s*listen_addr_ipv4\s*=\s*\)"0\.0\.0\.0"/\1"127.0.0.1"/' "$toml"
-        local svc; svc=$(basename "$toml" .toml)
-        systemctl restart "$svc" 2>/dev/null || warn "Не удалось перезапустить $svc"
-        ok "$(basename "$toml"): listen → 127.0.0.1:443"
-        matched=true
-    done
-    $matched || { err "Не найден telemt-инстанс на порту 443"; return 1; }
-
-    # stream-блок: SNI → сайт или telemt
-    cat > /etc/nginx/modules-enabled/90-stream-sni.conf << STREAM
-stream {
-    map \$ssl_preread_server_name \$backend {
-        ${SITE_DOMAIN}    site_https;
-        default           telemt_tls;
-    }
-    upstream site_https  { server 127.0.0.1:8443; }
-    upstream telemt_tls  { server 127.0.0.1:443;  }
-
-    server {
-        listen ${pub_ip}:443;
-        ssl_preread on;
-        proxy_pass \$backend;
-    }
-}
-STREAM
-
-    if ! nginx -t 2>&1 | tail -3; then
-        err "nginx -t (stream SNI) не прошёл"
-        return 1
-    fi
-    systemctl restart nginx
-    ok "SNI: ${SITE_DOMAIN} → сайт, остальное → telemt"
 }
 
 # Шаг: проверка работоспособности сайта + telemt + связки
@@ -1853,7 +1814,7 @@ step_site_health_check() {
     # 3. HTTPS отвечает 200
     sleep 2  # дать nginx время на restart
     local site_url
-    [[ "${SITE_PORT}" == "443" || -f /etc/nginx/modules-enabled/90-stream-sni.conf ]] \
+    [[ "${INSTALL_SCENARIO:-standard}" == "site" ]] \
         && site_url="https://${SITE_DOMAIN}" \
         || site_url="https://${SITE_DOMAIN}:${SITE_PORT}"
     local http_code
@@ -2867,9 +2828,6 @@ main() {
         fi
         if [[ "$SITE_SETUP_FAILED" != true ]]; then
             step_get_certbot_cert || SITE_SETUP_FAILED=true
-        fi
-        if [[ "$SITE_SETUP_FAILED" != true ]]; then
-            step_setup_sni_routing || SITE_SETUP_FAILED=true
         fi
         # health_check всегда вызываем — он сам поймёт нужно ли отчитываться об ошибке
         step_site_health_check

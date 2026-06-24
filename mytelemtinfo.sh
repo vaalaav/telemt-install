@@ -526,8 +526,18 @@ get_site_domain() {
 }
 
 get_site_port() {
-    # SNI-роутинг активен — внешний порт 443
-    [[ -f /etc/nginx/modules-enabled/90-stream-sni.conf ]] && { echo "443"; return; }
+    # telemt mask-режим: сайт доступен на 443 через telemt
+    local dom; dom=$(get_site_domain 2>/dev/null)
+    if [[ -n "$dom" ]]; then
+        local toml
+        for toml in /etc/telemt/telemt[0-9]*.toml; do
+            [[ -f "$toml" ]] || continue
+            grep -qE '^\s*port\s*=\s*443\b' "$toml" || continue
+            grep -qE "^\s*tls_domain\s*=\s*\"${dom}\"" "$toml" || continue
+            grep -qE '^\s*mask\s*=\s*true' "$toml" || continue
+            echo "443"; return
+        done
+    fi
     local saved; saved=$(get_site_info)
     if [[ -n "$saved" ]]; then
         echo "$saved" | cut -d'|' -f4
@@ -1313,6 +1323,11 @@ proxy_add() {
         info "Публичный IP сервера: ${BOLD}${pub_ip}${RESET}"
     fi
 
+    # mask_port: если tls_domain совпадает с доменом сайта, пересылаем на nginx 8443
+    local _mask_port_val=443
+    local _site_dom; _site_dom=$(get_site_domain 2>/dev/null)
+    [[ -n "$_site_dom" && "$new_sni" == "$_site_dom" ]] && _mask_port_val=8443
+
     cat > "/etc/telemt/telemt${slot}.toml" << TOML
 [general]
 fast_mode = true
@@ -1346,7 +1361,7 @@ whitelist = ["127.0.0.1/32"]
 [censorship]
 tls_domain = "${new_sni}"
 mask = true
-mask_port = 443
+mask_port = ${_mask_port_val}
 tls_emulation = true
 unknown_sni_action = "reject_handshake"
 fake_cert_len = 2048
@@ -3481,7 +3496,7 @@ server {
     listen 80;
     server_name ${site_dom};
     location /.well-known/acme-challenge/ { root /var/www/letsencrypt; default_type "text/plain"; }
-    location / { return 444; }
+    location / { return 301 https://\$host\$request_uri; }
 }
 NGINX
     ln -sf /etc/nginx/sites-available/telemt-site.conf "$SITE_CONFIG_FILE"
@@ -3504,7 +3519,7 @@ server {
     listen 80;
     server_name ${site_dom};
     location /.well-known/acme-challenge/ { root /var/www/letsencrypt; default_type "text/plain"; }
-    location / { return 444; }
+    location / { return 301 https://\$host\$request_uri; }
 }
 
 server {
@@ -3519,7 +3534,7 @@ server {
     location / { try_files \$uri \$uri/ /index.html; }
 }
 NGINX
-    nginx -t 2>&1 | tail -3 && systemctl reload nginx
+    nginx -t 2>&1 | tail -3 && systemctl restart nginx
     ok "nginx переключён на HTTPS на порту ${site_port}"
 
     # UFW открыть порты
@@ -3532,10 +3547,11 @@ NGINX
     echo "$site_dom" > /etc/telemt/.custom_domain
     chmod 644 /etc/telemt/.custom_domain
 
-    # Если есть инстансы telemt — обновить tls_domain первого инстанса на site_dom
+    # Если есть инстансы telemt — обновить tls_domain и mask_port первого инстанса
     if [[ -f /etc/telemt/telemt1.toml ]]; then
         sed -i "s|^tls_domain = .*|tls_domain = \"${site_dom}\"|" /etc/telemt/telemt1.toml
-        systemctl restart telemt1 2>/dev/null && ok "telemt1 перезапущен с tls_domain=${site_dom}"
+        sed -i "s|^mask_port = .*|mask_port = 8443|" /etc/telemt/telemt1.toml
+        systemctl restart telemt1 2>/dev/null && ok "telemt1 перезапущен с tls_domain=${site_dom}, mask_port=8443"
     fi
 
     ok "${BOLD}Сайт-заглушка установлена${RESET}"
