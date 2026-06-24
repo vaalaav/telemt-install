@@ -1868,10 +1868,80 @@ nft_apply_rules() {
 nft_install() {
     draw_header
     echo -e "  ${BOLD}Установка nft SYN Limiter${RESET}\n"
-    info "Запустите установщик для настройки nft limiter:"
-    echo -e "  ${CYAN}bash <(curl -fsSL https://raw.githubusercontent.com/vaalaav/telemt-install/main/install.sh)${RESET}"
-    echo -e "\n  Или установите nftables и создайте скрипт вручную по гайду:"
-    echo -e "  ${CYAN}https://h1de0x.github.io/telemt-tune/${RESET}"
+
+    # 1. Проверка инстансов
+    local ports=()
+    for f in /etc/telemt/telemt*.toml; do
+        [[ ! -f "$f" ]] && continue
+        local p; p=$(grep -m1 '^\s*port\s*=' "$f" 2>/dev/null | grep -oE '[0-9]+')
+        [[ -n "$p" ]] && ports+=("$p")
+    done
+    if [[ ${#ports[@]} -eq 0 ]]; then
+        warn "Нет активных telemt-инстансов — сначала добавьте прокси"
+        pause; return
+    fi
+
+    # 2. Установка nftables
+    if ! command -v nft &>/dev/null; then
+        info "Установка пакета nftables..."
+        apt-get update -qq && apt-get install -y -qq nftables || {
+            err "Не удалось установить nftables"; pause; return
+        }
+        ok "nftables установлен"
+    else
+        ok "nftables уже установлен"
+    fi
+
+    # 3. Параметры
+    echo ""
+    echo -e "  ${DIM}Варианты rate:    1/second (жёстко) | 2/second (мягче)${RESET}"
+    echo -e "  ${DIM}Варианты burst:   1 (строго) | 3 (мягче для многих клиентов)${RESET}"
+    echo -e "  ${DIM}Варианты timeout: 30s (быстрее) | 60s (дефолт) | 120s (дольше)${RESET}\n"
+
+    local rate burst timeout
+    read -rp "  RATE        [1/second]: " rate;    rate="${rate:-1/second}"
+    read -rp "  BURST       [1]: " burst;          burst="${burst:-1}"
+    read -rp "  TIMEOUT     [60s]: " timeout;      timeout="${timeout:-60s}"
+
+    # 4. IP сервера
+    local ip
+    ip=$(get_public_ip)
+    [[ -z "$ip" ]] && ip=$(hostname -I | awk '{print $1}')
+
+    # 5. Генерируем скрипт
+    {
+        echo '#!/bin/bash'
+        echo '# telemt nft inbound SYN per-client limiter'
+        echo 'set -eu'
+        echo ''
+        echo 'TABLE="telemt_limit"'
+        echo "SERVER_IP=\"${ip}\""
+        echo "RATE=\"${rate}\""
+        echo "BURST=\"${burst}\""
+        echo "METER_TIMEOUT=\"${timeout}\""
+        echo ''
+        echo 'nft delete table inet "$TABLE" 2>/dev/null || true'
+        echo 'nft add table inet "$TABLE"'
+        echo 'nft "add chain inet $TABLE input { type filter hook input priority 0; policy accept; }"'
+        echo ''
+        for p in "${ports[@]}"; do
+            echo "nft \"add rule inet \$TABLE input ip daddr \$SERVER_IP tcp dport ${p} tcp flags & (syn | ack) == syn meter telemt_in_syn_p${p} { ip saddr timeout \$METER_TIMEOUT limit rate over \$RATE burst \$BURST packets } counter drop comment \\\"telemt_syn_p${p}\\\"\""
+            echo "echo \"Правило применено: порт ${p}\""
+        done
+        echo ''
+        echo 'echo "=== Применённые правила ==="'
+        echo 'nft list chain inet telemt_limit input'
+    } > /usr/local/sbin/telemt-nft-limit.sh
+    chmod +x /usr/local/sbin/telemt-nft-limit.sh
+    ok "Скрипт создан: /usr/local/sbin/telemt-nft-limit.sh"
+
+    # 6. Применяем
+    echo ""
+    if /usr/local/sbin/telemt-nft-limit.sh; then
+        ok "nft SYN limiter активен для портов: ${ports[*]}"
+    else
+        err "Ошибка применения правил"
+    fi
     pause
 }
 
