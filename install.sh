@@ -666,6 +666,27 @@ PYTEST
             fi
         fi
     fi
+
+    # --- Web-панель telemt_panel ---
+    echo ""
+    echo -e "  ${BOLD}Web-панель управления (telemt_panel)${RESET}"
+    echo -e "  Мониторинг, управление пользователями, обновления — через браузер."
+    echo -e "  ${DIM}Панель слушает порт ${PANEL_PORT:-8080}, подключается к API первого инстанса.${RESET}"
+    DO_PANEL=false
+    PANEL_ADMIN_PASS=""
+    read -rp "$(echo -e "${YELLOW}?${RESET} Установить web-панель? [y/N]: ")" ans
+    if [[ "${ans,,}" =~ ^(y|yes|д|да)$ ]]; then
+        DO_PANEL=true
+        read -rp "$(echo -e "  ${YELLOW}?${RESET} Логин администратора [${PANEL_ADMIN_USER:-admin}]: ")" inp_user
+        [[ -n "$inp_user" ]] && PANEL_ADMIN_USER="$inp_user"
+        while true; do
+            read -rsp "$(echo -e "  ${YELLOW}?${RESET} Пароль администратора: ")" PANEL_ADMIN_PASS
+            echo
+            if [[ -n "$PANEL_ADMIN_PASS" ]]; then break; fi
+            warn "Пароль не может быть пустым"
+        done
+        ok "Панель: логин=${BOLD}${PANEL_ADMIN_USER}${RESET}, порт=${BOLD}${PANEL_PORT:-8080}${RESET}"
+    fi
 }
 
 # ─── Вспомогательные функции инстансов ───────────────────────────────────────
@@ -915,6 +936,12 @@ step_ufw() {
         ok "Порт 80 открыт (Let's Encrypt ACME)"
         ufw allow "${SITE_PORT:-8443}/tcp"
         ok "Порт ${SITE_PORT:-8443} открыт (сайт-заглушка)"
+    fi
+
+    # Web-панель
+    if [[ "${DO_PANEL:-false}" == true ]]; then
+        ufw allow "${PANEL_PORT:-8080}/tcp"
+        ok "Порт ${PANEL_PORT:-8080} открыт (web-панель)"
     fi
 
     if ufw --force enable; then
@@ -1823,6 +1850,176 @@ step_install_mytelemtinfo() {
 }
 
 # ─── ШАГ 10: Запуск сервисов ──────────────────────────────────────────────────
+# ─── ШАГ: Web-панель telemt_panel ────────────────────────────────────────────
+PANEL_REPO="amirotin/telemt_panel"
+PANEL_BIN="/usr/local/bin/telemt-panel"
+PANEL_CFG_DIR="/etc/telemt-panel"
+PANEL_CFG="${PANEL_CFG_DIR}/config.toml"
+PANEL_DATA="/var/lib/telemt-panel"
+PANEL_SVC="telemt-panel"
+PANEL_USER="telemt-panel"
+PANEL_PORT="${PANEL_PORT:-8080}"
+PANEL_ADMIN_USER="${PANEL_ADMIN_USER:-admin}"
+
+step_panel() {
+    [[ "${DO_PANEL:-false}" != true ]] && return 0
+    hdr "Шаг — Установка web-панели (telemt_panel)"
+
+    # Архитектура
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)  arch="x86_64"  ;;
+        aarch64) arch="aarch64" ;;
+        *)       err "Архитектура $arch не поддерживается панелью"; return 1 ;;
+    esac
+
+    # Системный пользователь
+    if ! id "$PANEL_USER" &>/dev/null; then
+        useradd --system --shell /usr/sbin/nologin --home /nonexistent "$PANEL_USER"
+        ok "Создан пользователь ${PANEL_USER}"
+    fi
+    if getent group telemt &>/dev/null; then
+        usermod -aG telemt "$PANEL_USER" 2>/dev/null || true
+    fi
+
+    # Директории
+    mkdir -p "$PANEL_CFG_DIR" "$PANEL_DATA/staging"
+    chown "${PANEL_USER}:${PANEL_USER}" "$PANEL_CFG_DIR" "$PANEL_DATA" "$PANEL_DATA/staging"
+
+    # Скачивание бинарника
+    info "Определение последней версии панели..."
+    local tag
+    tag=$(curl -fsSL "https://api.github.com/repos/${PANEL_REPO}/releases/latest" \
+        | jq -r '.tag_name') || { err "Не удалось получить версию панели"; return 1; }
+    [[ -z "$tag" || "$tag" == "null" ]] && { err "Пустой tag_name"; return 1; }
+    info "Версия: $tag"
+
+    local tarball="telemt-panel-${arch}-linux-gnu.tar.gz"
+    local url="https://github.com/${PANEL_REPO}/releases/download/${tag}/${tarball}"
+    local tmp_dir; tmp_dir=$(mktemp -d)
+
+    info "Скачивание ${tarball}..."
+    if curl -fSL "$url" -o "${tmp_dir}/${tarball}"; then
+        tar -xzf "${tmp_dir}/${tarball}" -C "$tmp_dir"
+        install -m 0755 "${tmp_dir}/telemt-panel-${arch}-linux" "$PANEL_BIN"
+        rm -rf "$tmp_dir"
+        ok "Бинарник: ${PANEL_BIN} (${tag})"
+    else
+        rm -rf "$tmp_dir"
+        err "Ошибка загрузки панели"; return 1
+    fi
+
+    # Конфиг
+    if [[ ! -f "$PANEL_CFG" ]]; then
+        local api_port
+        api_port=$(instance_api "${INSTANCES[0]}")
+
+        local jwt_secret pass_hash
+        jwt_secret=$(openssl rand -hex 32)
+        pass_hash=$(printf '%s\n' "$PANEL_ADMIN_PASS" | "$PANEL_BIN" hash-password) \
+            || { err "Не удалось сгенерировать хеш пароля"; return 1; }
+
+        cat > "$PANEL_CFG" <<TOML
+listen = "0.0.0.0:${PANEL_PORT}"
+data_dir = "${PANEL_DATA}"
+
+[telemt]
+url = "http://127.0.0.1:${api_port}"
+binary_path = "/bin/telemt"
+service_name = "telemt${INSTANCES[0]}"
+
+[panel]
+binary_path = "${PANEL_BIN}"
+service_name = "${PANEL_SVC}"
+
+[auth]
+username = "${PANEL_ADMIN_USER}"
+password_hash = "${pass_hash}"
+jwt_secret = "${jwt_secret}"
+session_ttl = "24h"
+TOML
+        chown "${PANEL_USER}:${PANEL_USER}" "$PANEL_CFG"
+        chmod 600 "$PANEL_CFG"
+        ok "Конфиг: ${PANEL_CFG}"
+    else
+        info "Конфиг панели уже существует — пропуск"
+    fi
+
+    # Sudoers drop-in
+    local sudoers="/etc/sudoers.d/${PANEL_SVC}"
+    local cp_bin mv_bin chmod_bin rm_bin systemctl_bin
+    cp_bin=$(command -v cp); mv_bin=$(command -v mv)
+    chmod_bin=$(command -v chmod); rm_bin=$(command -v rm)
+    systemctl_bin=$(command -v systemctl)
+
+    cat > "$sudoers" <<EOF
+${PANEL_USER} ALL=(root) NOPASSWD: ${cp_bin} -f ${PANEL_BIN} ${PANEL_DATA}/staging/telemt-panel.bak
+${PANEL_USER} ALL=(root) NOPASSWD: ${cp_bin} -f ${PANEL_DATA}/staging/telemt-panel ${PANEL_BIN}.tmp
+${PANEL_USER} ALL=(root) NOPASSWD: ${chmod_bin} 0755 ${PANEL_BIN}.tmp
+${PANEL_USER} ALL=(root) NOPASSWD: ${mv_bin} -f ${PANEL_BIN}.tmp ${PANEL_BIN}
+${PANEL_USER} ALL=(root) NOPASSWD: ${rm_bin} -f ${PANEL_BIN}.tmp
+${PANEL_USER} ALL=(root) NOPASSWD: ${systemctl_bin} restart ${PANEL_SVC}
+${PANEL_USER} ALL=(root) NOPASSWD: ${systemctl_bin} restart telemt*
+${PANEL_USER} ALL=(root) NOPASSWD: ${systemctl_bin} start ${PANEL_SVC}
+EOF
+    chmod 0440 "$sudoers"
+    ok "Sudoers: ${sudoers}"
+
+    # Systemd unit
+    cat > "/etc/systemd/system/${PANEL_SVC}.service" <<SVC
+[Unit]
+Description=Telemt Panel
+After=network.target
+
+[Service]
+Type=simple
+User=${PANEL_USER}
+ExecStart=${PANEL_BIN} --config ${PANEL_CFG}
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=${PANEL_CFG_DIR} ${PANEL_DATA}
+
+[Install]
+WantedBy=multi-user.target
+SVC
+    systemctl daemon-reload
+    systemctl enable "${PANEL_SVC}"
+    ok "Systemd-сервис ${PANEL_SVC} создан"
+
+    local pub_ip; pub_ip=$(get_public_ip_cached)
+    info "Панель будет доступна: http://${pub_ip}:${PANEL_PORT}"
+}
+
+panel_start() {
+    [[ "${DO_PANEL:-false}" != true ]] && return 0
+    systemctl start "${PANEL_SVC}" 2>/dev/null || true
+    local st; st=$(systemctl is-active "${PANEL_SVC}" 2>/dev/null)
+    if [[ "$st" == "active" ]]; then
+        ok "telemt-panel: ${GREEN}active${RESET} (порт ${PANEL_PORT})"
+    else
+        warn "telemt-panel: $st"
+    fi
+}
+
+panel_remove() {
+    if [[ -f "/etc/systemd/system/${PANEL_SVC:-telemt-panel}.service" ]] || id "${PANEL_USER:-telemt-panel}" &>/dev/null; then
+        info "Удаление web-панели..."
+        systemctl stop "${PANEL_SVC:-telemt-panel}" 2>/dev/null || true
+        systemctl disable "${PANEL_SVC:-telemt-panel}" 2>/dev/null || true
+        rm -f "/etc/systemd/system/${PANEL_SVC:-telemt-panel}.service"
+        rm -f "/etc/sudoers.d/${PANEL_SVC:-telemt-panel}"
+        rm -f "${PANEL_BIN:-/usr/local/bin/telemt-panel}"
+        rm -rf "${PANEL_CFG_DIR:-/etc/telemt-panel}" "${PANEL_DATA:-/var/lib/telemt-panel}"
+        userdel "${PANEL_USER:-telemt-panel}" 2>/dev/null || true
+        systemctl daemon-reload
+        ok "Web-панель удалена"
+    fi
+}
+
 step_start() {
     hdr "Шаг 10 — Запуск сервисов"
     confirm "Запустить и включить telemt в автозагрузку?" skip || return 0
@@ -1854,6 +2051,9 @@ step_start() {
     echo ""
     info "Открытые порты:"
     ss -tlnp | grep -E ":(443|5223|8530)" || warn "Порты пока не видны"
+
+    # Запуск web-панели если была выбрана
+    panel_start
 }
 
 # ─── ШАГ 11: Ссылки для клиентов ─────────────────────────────────────────────
@@ -1983,6 +2183,11 @@ print_summary() {
     [[ "${USE_TSPU:-true}" == true ]] && echo -e "  ${GREEN}✓${RESET} client_mss=\"tspu\" ${DIM}— обход ТСПУ${RESET}"
     [[ "${USE_TSPU:-true}" == false ]] && echo -e "  ${YELLOW}○${RESET} client_mss=\"tspu\" ${DIM}— отключён (закомментирован)${RESET}"
     [[ "${DO_VLESS:-false}"    == true ]] && echo -e "  ${GREEN}✓${RESET} VLESS Reality upstream (telemt → SOCKS5 → 3x-ui → Telegram DC)"
+    if [[ "${DO_PANEL:-false}" == true ]]; then
+        local panel_st; panel_st=$(systemctl is-active "${PANEL_SVC:-telemt-panel}" 2>/dev/null)
+        local pub_ip_panel; pub_ip_panel=$(get_public_ip_cached)
+        echo -e "  ${GREEN}✓${RESET} Web-панель: http://${pub_ip_panel}:${PANEL_PORT:-8080}  (${panel_st})"
+    fi
 
     echo ""
     echo -e "  ${BOLD}Управление:${RESET} ${CYAN}sudo mytelemtinfo${RESET}"
@@ -2013,6 +2218,7 @@ do_purge_all() {
     echo -e "  ${YELLOW}Будут удалены:${RESET}"
     echo -e "  • Все инстансы telemt (сервисы, конфиги, бинарник, пользователь)"
     echo -e "  • mytelemtinfo команда"
+    echo -e "  • Web-панель telemt_panel (сервис, бинарник, конфиг, пользователь)"
     echo -e "  • VLESS Reality: xray-core конфиги (бинарник /usr/local/bin/xray не трогается)"
     echo -e "  • WARP компоненты ${DIM}(legacy)${RESET}: wg-quick@warp, microsocks-мост, wgcf"
     echo -e "  • nft SYN limiter (сервис и правила)"
@@ -2048,6 +2254,9 @@ do_purge_all() {
         rm -f /usr/local/bin/mytelemtinfo
         ok "mytelemtinfo удалён"
     fi
+
+    # ── 3b) Удаляем web-панель ──
+    panel_remove
 
     # ── 4) Удаляем VLESS Reality (xray-core) ──
     if [[ -f /etc/telemt-vless/config.json ]] || systemctl list-unit-files 2>/dev/null | grep -q "telemt-vless" || id xray &>/dev/null; then
@@ -2180,7 +2389,7 @@ PYEOF
     # Порты telemt (стандартные + кастомные из конфигов если бы они ещё были)
     if ufw status 2>/dev/null | grep -q "Status: active"; then
         info "Закрытие UFW портов telemt..."
-        for port in 443 5223 8530; do
+        for port in 443 5223 8530 8080; do
             ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
         done
         ok "UFW порты закрыты"
@@ -2196,6 +2405,7 @@ PYEOF
     info "Состояние системы после очистки:"
     echo -e "  ${DIM}• telemt: $(command -v /bin/telemt &>/dev/null && echo 'ещё есть' || echo 'удалён')${RESET}"
     echo -e "  ${DIM}• mytelemtinfo: $(command -v mytelemtinfo &>/dev/null && echo 'ещё есть' || echo 'удалён')${RESET}"
+    echo -e "  ${DIM}• telemt-panel: $(command -v telemt-panel &>/dev/null && echo 'ещё есть' || echo 'удалён')${RESET}"
     echo -e "  ${DIM}• VLESS (telemt-vless): $(systemctl is-active --quiet telemt-vless 2>/dev/null && echo 'активен' || echo 'нет')${RESET}"
     echo -e "  ${DIM}• warp интерфейс ${DIM}(legacy)${RESET}: $(wg show warp &>/dev/null && echo 'активен' || echo 'нет')${RESET}"
     echo -e "  ${DIM}• nft telemt_limit: $(nft list table inet telemt_limit &>/dev/null && echo 'активна' || echo 'нет')${RESET}"
@@ -2578,6 +2788,7 @@ main() {
     fi
     echo -e "  client_mss=tspu: ${USE_TSPU:-true}"
     echo -e "  VLESS Reality:   ${DO_VLESS:-false}"
+    echo -e "  Web-панель:      ${DO_PANEL:-false}"
     echo ""
     confirm "Всё верно — поехали?" exit
 
@@ -2613,6 +2824,7 @@ main() {
         step_site_health_check
     fi
     step_install_mytelemtinfo
+    step_panel
     step_start
     print_summary
 }
