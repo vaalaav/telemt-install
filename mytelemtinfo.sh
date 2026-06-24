@@ -872,6 +872,21 @@ proxy_update() {
     echo -e "  ${BOLD}Обновление бинарника telemt${RESET}\n"
     local ver_before; ver_before=$(/bin/telemt --version 2>&1 | head -1 || echo "неизвестна")
     info "Текущая версия: ${BOLD}${ver_before}${RESET}"
+
+    local ver_latest=""
+    ver_latest=$(wget -qO- --timeout=5 "https://api.github.com/repos/telemt/telemt/releases/latest" 2>/dev/null \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('tag_name',''))" 2>/dev/null) || true
+
+    if [[ -n "$ver_latest" ]]; then
+        if [[ "$ver_before" == *"$ver_latest"* || "$ver_latest" == *"$ver_before"* ]]; then
+            ok "Уже установлена последняя версия (${ver_latest})"
+        else
+            info "Новая версия: ${BOLD}${ver_latest}${RESET}"
+        fi
+    else
+        warn "Не удалось проверить наличие обновлений"
+    fi
+
     echo ""
     read -rp "  Скачать и установить новую версию? [y/N]: " ans
     [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
