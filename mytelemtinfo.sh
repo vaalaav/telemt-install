@@ -277,9 +277,10 @@ health_check() {
         # Тест URL (только в full)
         if [[ "$mode" == "full" && -n "$site_dom" ]]; then
             local site_port; site_port=$(get_site_port 2>/dev/null)
-            local code; code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 3 "https://${site_dom}:${site_port}/" 2>/dev/null)
+            local su; [[ "$site_port" == "443" ]] && su="https://${site_dom}" || su="https://${site_dom}:${site_port}"
+            local code; code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 3 "${su}/" 2>/dev/null)
             if [[ "$code" == "200" || "$code" == "30"* ]]; then
-                results+=("OK\tСайт URL\thttps://${site_dom}:${site_port}/ → ${code}")
+                results+=("OK\tСайт URL\t${su}/ → ${code}")
             else
                 results+=("WARN\tСайт URL\tкод ${code:-—} (ожидался 200)")
             fi
@@ -525,12 +526,20 @@ get_site_domain() {
 }
 
 get_site_port() {
+    # SNI-роутинг активен — внешний порт 443
+    [[ -f /etc/nginx/modules-enabled/90-stream-sni.conf ]] && { echo "443"; return; }
     local saved; saved=$(get_site_info)
     if [[ -n "$saved" ]]; then
         echo "$saved" | cut -d'|' -f4
         return
     fi
     grep "listen" "$SITE_CONFIG_FILE" 2>/dev/null | grep "ssl" | grep -oE '[0-9]+' | head -1 || echo "8443"
+}
+
+site_url() {
+    local dom; dom=$(get_site_domain)
+    local port; port=$(get_site_port)
+    [[ "$port" == "443" ]] && echo "https://${dom}" || echo "https://${dom}:${port}"
 }
 
 status_site() {
@@ -562,10 +571,13 @@ status_site() {
         cert_status="${RED}нет cert${RESET}"
     fi
 
+    local label; [[ "$port" == "443" ]] && label="${domain}" || label="${domain}:${port}"
+    local href="https://${label}"
+
     if [[ "$nginx_st" == "active" ]]; then
-        echo -e "${GREEN}${domain}:${port}${RESET}  ${cert_status}"
+        echo -e "\e]8;;${href}\a${GREEN}${label}${RESET}\e]8;;\a  ${cert_status}"
     else
-        echo -e "${YELLOW}nginx ${nginx_st}${RESET}  ${domain}:${port}"
+        echo -e "${YELLOW}nginx ${nginx_st}${RESET}  ${label}"
     fi
 }
 
@@ -3345,10 +3357,11 @@ menu_site() {
             fi
 
             # Тест URL
+            local su; [[ "$port" == "443" ]] && su="https://${dom}" || su="https://${dom}:${port}"
             local http_code
             http_code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 3 \
-                "https://${dom}:${port}/" 2>/dev/null || echo "—")
-            echo -e "  Тест URL:      https://${dom}:${port}/ → ${BOLD}${http_code}${RESET}"
+                "${su}/" 2>/dev/null || echo "—")
+            echo -e "  Тест URL:      ${su}/ → ${BOLD}${http_code}${RESET}"
             echo ""
 
             echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
@@ -3608,10 +3621,11 @@ site_health_check() {
         err "Сертификат отсутствует"; issues=$((issues+1))
     fi
 
+    local su; [[ "$port" == "443" ]] && su="https://${dom}" || su="https://${dom}:${port}"
     local code
-    code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 "https://${dom}:${port}/" 2>/dev/null)
+    code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 "${su}/" 2>/dev/null)
     if [[ "$code" == "200" || "$code" == "30"* ]]; then
-        ok "URL отвечает: https://${dom}:${port}/ → ${code}"
+        ok "URL отвечает: ${su}/ → ${code}"
     else
         err "URL отвечает кодом: ${code}"; issues=$((issues+1))
     fi

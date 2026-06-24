@@ -1589,7 +1589,7 @@ step_install_site_deps() {
     confirm "Установить?" skip || return 0
 
     wait_apt
-    if ! apt-get install -y nginx certbot python3-certbot-nginx git curl 2>&1 | tail -3; then
+    if ! apt-get install -y nginx libnginx-mod-stream certbot python3-certbot-nginx git curl 2>&1 | tail -3; then
         err "Не удалось установить зависимости — пропуск сайта"
         return 1
     fi
@@ -1632,7 +1632,7 @@ HTMLFB
 
 # Шаг: настройка nginx (HTTP для ACME + HTTPS-сайт на 8443)
 step_setup_nginx() {
-    hdr "Сайт: настройка nginx (HTTP для ACME + HTTPS на ${SITE_PORT})"
+    hdr "Сайт: настройка nginx (HTTP для ACME)"
     confirm "Создать конфиг nginx?" skip || return 0
 
     # Проверяем что порт 80 не занят чужим процессом (нужен для ACME challenge)
@@ -1708,7 +1708,7 @@ step_get_certbot_cert() {
 
     ok "Сертификат получен: /etc/letsencrypt/live/$SITE_DOMAIN/"
 
-    # Теперь добавляем HTTPS-блок на $SITE_PORT
+    # Теперь добавляем HTTPS-блок на 127.0.0.1:8443 (за stream-прокси)
     cat > /etc/nginx/sites-available/telemt-site.conf << NGINX
 # Сайт-заглушка telemt-install
 server {
@@ -1719,12 +1719,11 @@ server {
         root /var/www/letsencrypt;
         default_type "text/plain";
     }
-    location / { return 444; }
+    location / { return 301 https://\$host\$request_uri; }
 }
 
 server {
-    listen ${SITE_PORT} ssl http2;
-    listen [::]:${SITE_PORT} ssl http2;
+    listen 127.0.0.1:8443 ssl http2;
     server_name ${SITE_DOMAIN};
 
     ssl_certificate     /etc/letsencrypt/live/${SITE_DOMAIN}/fullchain.pem;
@@ -1749,7 +1748,7 @@ NGINX
         return 1
     fi
     systemctl restart nginx
-    ok "nginx переключён на HTTPS на порту ${SITE_PORT}"
+    ok "nginx переключён на HTTPS (127.0.0.1:8443, за stream-прокси)"
 
     # Deploy-hook: после renewal сертификата перезагружаем nginx,
     # чтобы он подхватил новые ssl-файлы в памяти
@@ -1770,6 +1769,51 @@ HOOK
 }
 
 # Шаг: проверка работоспособности сайта + telemt + связки
+step_setup_sni_routing() {
+    hdr "Сайт: SNI-роутинг (порт 443)"
+    local pub_ip; pub_ip=$(get_public_ip_cached)
+    [[ -z "$pub_ip" ]] && { err "Не удалось определить публичный IP"; return 1; }
+
+    # Перебиндить telemt-инстансы с порта 443 на 127.0.0.1
+    local toml matched=false
+    for toml in /etc/telemt/telemt[0-9]*.toml; do
+        [[ -f "$toml" ]] || continue
+        grep -qE '^\s*port\s*=\s*443\b' "$toml" || continue
+        sed -i 's/^\(\s*listen_addr_ipv4\s*=\s*\)"0\.0\.0\.0"/\1"127.0.0.1"/' "$toml"
+        local svc; svc=$(basename "$toml" .toml)
+        systemctl restart "$svc" 2>/dev/null || warn "Не удалось перезапустить $svc"
+        ok "$(basename "$toml"): listen → 127.0.0.1:443"
+        matched=true
+    done
+    $matched || { err "Не найден telemt-инстанс на порту 443"; return 1; }
+
+    # stream-блок: SNI → сайт или telemt
+    cat > /etc/nginx/modules-enabled/90-stream-sni.conf << STREAM
+stream {
+    map \$ssl_preread_server_name \$backend {
+        ${SITE_DOMAIN}    site_https;
+        default           telemt_tls;
+    }
+    upstream site_https  { server 127.0.0.1:8443; }
+    upstream telemt_tls  { server 127.0.0.1:443;  }
+
+    server {
+        listen ${pub_ip}:443;
+        ssl_preread on;
+        proxy_pass \$backend;
+    }
+}
+STREAM
+
+    if ! nginx -t 2>&1 | tail -3; then
+        err "nginx -t (stream SNI) не прошёл"
+        return 1
+    fi
+    systemctl restart nginx
+    ok "SNI: ${SITE_DOMAIN} → сайт, остальное → telemt"
+}
+
+# Шаг: проверка работоспособности сайта + telemt + связки
 step_site_health_check() {
     hdr "Сайт: проверка работоспособности"
 
@@ -1777,7 +1821,7 @@ step_site_health_check() {
         echo ""
         err "${BOLD}Установка сайта НЕ завершилась успешно${RESET}"
         warn "Что работает: telemt на 443 (по обычным MTProxy ссылкам)"
-        warn "Что НЕ работает: сайт-заглушка на ${SITE_DOMAIN:-?}:${SITE_PORT:-8443}"
+        warn "Что НЕ работает: сайт-заглушка на ${SITE_DOMAIN:-?}"
         echo ""
         info "Чтобы попробовать установить сайт повторно после устранения проблемы:"
         info "  sudo mytelemtinfo → 8. Сайт-заглушка → 1. Установить"
@@ -1806,13 +1850,17 @@ step_site_health_check() {
         issues=$((issues+1))
     fi
 
-    # 3. HTTPS на 8443 отвечает 200
-    sleep 2  # дать nginx время на reload
+    # 3. HTTPS отвечает 200
+    sleep 2  # дать nginx время на restart
+    local site_url
+    [[ "${SITE_PORT}" == "443" || -f /etc/nginx/modules-enabled/90-stream-sni.conf ]] \
+        && site_url="https://${SITE_DOMAIN}" \
+        || site_url="https://${SITE_DOMAIN}:${SITE_PORT}"
     local http_code
     http_code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
-        "https://${SITE_DOMAIN}:${SITE_PORT}/" 2>/dev/null || echo "000")
+        "${site_url}/" 2>/dev/null || echo "000")
     if [[ "$http_code" == "200" || "$http_code" == "30"* ]]; then
-        ok "Сайт отвечает: https://${SITE_DOMAIN}:${SITE_PORT}/ → ${http_code}"
+        ok "Сайт отвечает: ${site_url}/ → ${http_code}"
     else
         warn "Сайт ответил кодом: ${http_code} (ожидался 200)"
         issues=$((issues+1))
@@ -1842,7 +1890,7 @@ step_install_mytelemtinfo() {
     info "Скачивание менеджера /usr/local/bin/mytelemtinfo"
     confirm "Установить?" skip || return 0
 
-    curl -fsSL "https://raw.githubusercontent.com/vaalaav/telemt-install/main/mytelemtinfo.sh?v=$(date +%s)" \
+    curl -fsSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/vaalaav/telemt-install/main/mytelemtinfo.sh" \
         -o /usr/local/bin/mytelemtinfo
     chmod +x /usr/local/bin/mytelemtinfo
     ok "Установлено: mytelemtinfo"
@@ -2819,6 +2867,9 @@ main() {
         fi
         if [[ "$SITE_SETUP_FAILED" != true ]]; then
             step_get_certbot_cert || SITE_SETUP_FAILED=true
+        fi
+        if [[ "$SITE_SETUP_FAILED" != true ]]; then
+            step_setup_sni_routing || SITE_SETUP_FAILED=true
         fi
         # health_check всегда вызываем — он сам поймёт нужно ли отчитываться об ошибке
         step_site_health_check
