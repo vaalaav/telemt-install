@@ -137,7 +137,7 @@ On re-run — choose: install over existing, clean install, or removal only.
 
 ### 📚 Источники / References
 
-[telemt server guide](https://assyoucandy.github.io/telemt-server-guide/) · [keepalive guide](https://assyoucandy.github.io/telemt-server-guide/telemt-keepalive-guide.html) · [nft tune](https://h1de0x.github.io/telemt-tune/) · [telemt releases](https://github.com/telemt/telemt/releases)
+[telemt server guide](https://assyoucandy.github.io/telemt-server-guide/) · [keepalive guide](https://assyoucandy.github.io/telemt-server-guide/telemt-keepalive-guide.html) · [nft tune](https://h1de0x.github.io/telemt-tune/) · [telemt releases](https://github.com/telemt/telemt/releases)· [telemt-panel](https://github.com/amirotin/telemt_panel)
 
 Часть кода написана с помощью Claude (Anthropic)
 
