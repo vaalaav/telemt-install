@@ -75,28 +75,6 @@ sudo ./install.sh --purge      # Полное удаление всех комп
 
 ---
 
-### 📁 Структура проекта
-
-```
-telemt-install/
-├── install.sh          # Точка входа
-├── main.sh             # Оркестратор модулей
-├── config.env          # Переменные конфигурации
-├── lib/
-│   ├── 01_prepare.sh   # Подготовка окружения
-│   ├── 02_binary.sh    # Загрузка бинарника
-│   ├── 03_vless.sh     # VLESS Reality
-│   ├── 04_configs.sh   # Генерация конфигов
-│   ├── 05_network.sh   # Сеть и файрвол
-│   ├── 06_site.sh      # Nginx + Certbot
-│   └── 07_lifecycle.sh # systemd и запуск
-├── utils/
-│   └── helpers.sh      # Утилиты и логирование
-└── mytelemtinfo.sh     # TUI-менеджер
-```
-
----
-
 ## 🇬🇧 English
 
 ### ⚡ Quick Start
@@ -152,28 +130,6 @@ sudo ./install.sh --purge      # Full removal of all components
 ```
 
 On re-run — choose: install over existing, clean install, or removal only.
-
----
-
-### 📁 Project Structure
-
-```
-telemt-install/
-├── install.sh          # Entry point
-├── main.sh             # Module orchestrator
-├── config.env          # Configuration variables
-├── lib/
-│   ├── 01_prepare.sh   # Environment setup
-│   ├── 02_binary.sh    # Binary download
-│   ├── 03_vless.sh     # VLESS Reality
-│   ├── 04_configs.sh   # Config generation
-│   ├── 05_network.sh   # Network & firewall
-│   ├── 06_site.sh      # Nginx + Certbot
-│   └── 07_lifecycle.sh # systemd & startup
-├── utils/
-│   └── helpers.sh      # Utilities & logging
-└── mytelemtinfo.sh     # TUI manager
-```
 
 ---
 
