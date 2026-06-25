@@ -267,12 +267,13 @@ ask_site_details() {
     ok "Шаблон: $SITE_TEMPLATE_URL"
 
     # Фиксируем параметры инстанса telemt для сценария site:
-    # один инстанс на 443, домен совпадает с реальным сайтом
+    # один инстанс на 443; tls_domain НЕ равен SITE_DOMAIN —
+    # иначе SNI-роутинг невозможен и mask создаёт петлю на себя
     INSTANCES=(1)
     CUSTOM_PORTS[1]=443
-    CUSTOM_DOMAINS[1]="$SITE_DOMAIN"
+    # CUSTOM_DOMAINS[1] остаётся по умолчанию (www.cloudflare.com)
     CUSTOM_APIS[1]=9091
-    info "Сценарий site: создаётся 1 инстанс telemt на порту 443 с tls_domain=$SITE_DOMAIN"
+    info "Сценарий site: инстанс telemt на 443, tls_domain=${CUSTOM_DOMAINS[1]} (SNI-роутинг на сайт через nginx)"
 }
 
 detect_ssh_port() {
@@ -293,7 +294,7 @@ select_components() {
     if [[ "${INSTALL_SCENARIO:-standard}" == "site" ]]; then
         echo ""
         info "Сценарий 'Свой сайт': инстанс telemt автоматически создаётся на порту 443"
-        info "с tls_domain=${SITE_DOMAIN} (для совпадения с доменом сайта)"
+        info "с tls_domain=${CUSTOM_DOMAINS[1]} + SNI-роутинг nginx для сайта"
     else
         echo ""
         echo -e "  ${BOLD}Инстансы telemt:${RESET}"
@@ -801,9 +802,8 @@ step_configs() {
         local tspu_line='client_mss = "tspu"'
         [[ "${USE_TSPU:-true}" == false ]] && tspu_line='#client_mss = "tspu"   # отключено: обход ТСПУ (РФ-фильтрация)'
 
-        # mask_port: в сценарии site пересылаем на локальный nginx (8443)
+        # mask_port: маскировка под tls_domain (всегда 443)
         local mask_port_val=443
-        [[ "${INSTALL_SCENARIO:-standard}" == "site" ]] && mask_port_val=8443
 
         cat > "/etc/telemt/telemt${n}.toml" << TOML
 [general]
@@ -1594,7 +1594,7 @@ step_install_site_deps() {
     confirm "Установить?" skip || return 0
 
     wait_apt
-    if ! apt-get install -y nginx certbot python3-certbot-nginx git curl 2>&1 | tail -3; then
+    if ! apt-get install -y nginx libnginx-mod-stream certbot python3-certbot-nginx git curl 2>&1 | tail -3; then
         err "Не удалось установить зависимости — пропуск сайта"
         return 1
     fi
@@ -1713,7 +1713,7 @@ step_get_certbot_cert() {
 
     ok "Сертификат получен: /etc/letsencrypt/live/$SITE_DOMAIN/"
 
-    # Теперь добавляем HTTPS-блок на 8443 (доступен для telemt mask через публичный IP)
+    # Теперь добавляем HTTPS-блок на 127.0.0.1:8443 (за stream-прокси)
     cat > /etc/nginx/sites-available/telemt-site.conf << NGINX
 # Сайт-заглушка telemt-install
 server {
@@ -1728,8 +1728,7 @@ server {
 }
 
 server {
-    listen 8443 ssl http2;
-    listen [::]:8443 ssl http2;
+    listen 127.0.0.1:8443 ssl http2;
     server_name ${SITE_DOMAIN};
 
     ssl_certificate     /etc/letsencrypt/live/${SITE_DOMAIN}/fullchain.pem;
@@ -1754,7 +1753,7 @@ NGINX
         return 1
     fi
     systemctl restart nginx
-    ok "nginx переключён на HTTPS (порт 8443, доступен через telemt mask на 443)"
+    ok "nginx переключён на HTTPS (127.0.0.1:8443, за stream-прокси)"
 
     # Deploy-hook: после renewal сертификата перезагружаем nginx,
     # чтобы он подхватил новые ssl-файлы в памяти
@@ -1772,6 +1771,49 @@ HOOK
         systemctl enable --now certbot.timer 2>&1 | grep -v "Created symlink" || true
         ok "Автообновление сертификата: certbot.timer активен"
     fi
+}
+
+step_setup_sni_routing() {
+    hdr "Сайт: SNI-роутинг (порт 443)"
+    local pub_ip; pub_ip=$(get_public_ip_cached)
+    [[ -z "$pub_ip" ]] && { err "Не удалось определить публичный IP"; return 1; }
+
+    # Перебиндить telemt-инстансы с порта 443 на 127.0.0.1
+    local toml matched=false
+    for toml in /etc/telemt/telemt[0-9]*.toml; do
+        [[ -f "$toml" ]] || continue
+        grep -qE '^\s*port\s*=\s*443\b' "$toml" || continue
+        sed -i 's/^\(\s*listen_addr_ipv4\s*=\s*\)"0\.0\.0\.0"/\1"127.0.0.1"/' "$toml"
+        local svc; svc=$(basename "$toml" .toml)
+        systemctl restart "$svc" 2>/dev/null || warn "Не удалось перезапустить $svc"
+        ok "$(basename "$toml"): listen → 127.0.0.1:443"
+        matched=true
+    done
+    $matched || { err "Не найден telemt-инстанс на порту 443"; return 1; }
+
+    # stream-блок: SNI → сайт или telemt
+    cat > /etc/nginx/modules-enabled/90-stream-sni.conf << STREAM
+stream {
+    map \$ssl_preread_server_name \$backend {
+        ${SITE_DOMAIN}    site_https;
+        default           telemt_tls;
+    }
+    upstream site_https  { server 127.0.0.1:8443; }
+    upstream telemt_tls  { server 127.0.0.1:443;  }
+
+    server {
+        listen ${pub_ip}:443;
+        ssl_preread on;
+        proxy_pass \$backend;
+    }
+}
+STREAM
+
+    if ! nginx -t 2>&1 | tail -3; then
+        err "nginx -t не прошёл"; return 1
+    fi
+    systemctl restart nginx
+    ok "SNI: ${SITE_DOMAIN} → nginx:8443 (сайт), остальное → telemt:443 (прокси)"
 }
 
 # Шаг: проверка работоспособности сайта + telemt + связки
@@ -1827,14 +1869,22 @@ step_site_health_check() {
         issues=$((issues+1))
     fi
 
-    # 4. tls_domain в telemt-конфиге совпадает с SITE_DOMAIN
+    # 4. tls_domain НЕ совпадает с SITE_DOMAIN (иначе SNI-роутинг сломается)
     if [[ -f /etc/telemt/telemt1.toml ]]; then
         if grep -q "tls_domain = \"${SITE_DOMAIN}\"" /etc/telemt/telemt1.toml; then
-            ok "tls_domain в telemt совпадает с доменом сайта"
-        else
-            warn "tls_domain в /etc/telemt/telemt1.toml не равен ${SITE_DOMAIN}"
+            warn "tls_domain == SITE_DOMAIN — SNI-роутинг не сможет разделить трафик!"
             issues=$((issues+1))
+        else
+            ok "tls_domain отличается от домена сайта (SNI-роутинг корректен)"
         fi
+    fi
+
+    # 5. stream SNI-конфиг существует
+    if [[ -f /etc/nginx/modules-enabled/90-stream-sni.conf ]]; then
+        ok "nginx stream SNI-роутинг настроен"
+    else
+        warn "Отсутствует /etc/nginx/modules-enabled/90-stream-sni.conf"
+        issues=$((issues+1))
     fi
 
     echo ""
@@ -2828,6 +2878,9 @@ main() {
         fi
         if [[ "$SITE_SETUP_FAILED" != true ]]; then
             step_get_certbot_cert || SITE_SETUP_FAILED=true
+        fi
+        if [[ "$SITE_SETUP_FAILED" != true ]]; then
+            step_setup_sni_routing || SITE_SETUP_FAILED=true
         fi
         # health_check всегда вызываем — он сам поймёт нужно ли отчитываться об ошибке
         step_site_health_check

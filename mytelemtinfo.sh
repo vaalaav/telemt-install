@@ -286,12 +286,12 @@ health_check() {
             fi
         fi
 
-        # tls_domain в telemt совпадает
+        # tls_domain НЕ должен совпадать с доменом сайта (для SNI-роутинга)
         if [[ -f /etc/telemt/telemt1.toml && -n "$site_dom" ]]; then
             if grep -q "tls_domain = \"${site_dom}\"" /etc/telemt/telemt1.toml; then
-                results+=("OK\ttls_domain telemt\tсовпадает с доменом сайта")
+                results+=("WARN\ttls_domain telemt\tравен домену сайта — SNI-роутинг не работает")
             else
-                results+=("WARN\ttls_domain telemt\tне равен ${site_dom} в telemt1.toml")
+                results+=("OK\ttls_domain telemt\tотличается от домена сайта")
             fi
         fi
     fi
@@ -526,18 +526,8 @@ get_site_domain() {
 }
 
 get_site_port() {
-    # telemt mask-режим: сайт доступен на 443 через telemt
-    local dom; dom=$(get_site_domain 2>/dev/null)
-    if [[ -n "$dom" ]]; then
-        local toml
-        for toml in /etc/telemt/telemt[0-9]*.toml; do
-            [[ -f "$toml" ]] || continue
-            grep -qE '^\s*port\s*=\s*443\b' "$toml" || continue
-            grep -qE "^\s*tls_domain\s*=\s*\"${dom}\"" "$toml" || continue
-            grep -qE '^\s*mask\s*=\s*true' "$toml" || continue
-            echo "443"; return
-        done
-    fi
+    # SNI-роутинг через nginx stream — сайт доступен на 443
+    [[ -f /etc/nginx/modules-enabled/90-stream-sni.conf ]] && { echo "443"; return; }
     local saved; saved=$(get_site_info)
     if [[ -n "$saved" ]]; then
         echo "$saved" | cut -d'|' -f4
@@ -1323,11 +1313,6 @@ proxy_add() {
         info "Публичный IP сервера: ${BOLD}${pub_ip}${RESET}"
     fi
 
-    # mask_port: если tls_domain совпадает с доменом сайта, пересылаем на nginx 8443
-    local _mask_port_val=443
-    local _site_dom; _site_dom=$(get_site_domain 2>/dev/null)
-    [[ -n "$_site_dom" && "$new_sni" == "$_site_dom" ]] && _mask_port_val=8443
-
     cat > "/etc/telemt/telemt${slot}.toml" << TOML
 [general]
 fast_mode = true
@@ -1361,7 +1346,7 @@ whitelist = ["127.0.0.1/32"]
 [censorship]
 tls_domain = "${new_sni}"
 mask = true
-mask_port = ${_mask_port_val}
+mask_port = 443
 tls_emulation = true
 unknown_sni_action = "reject_handshake"
 fake_cert_len = 2048
@@ -3523,7 +3508,7 @@ server {
 }
 
 server {
-    listen ${site_port} ssl http2;
+    listen 127.0.0.1:${site_port} ssl http2;
     server_name ${site_dom};
     ssl_certificate     /etc/letsencrypt/live/${site_dom}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${site_dom}/privkey.pem;
@@ -3547,11 +3532,38 @@ NGINX
     echo "$site_dom" > /etc/telemt/.custom_domain
     chmod 644 /etc/telemt/.custom_domain
 
-    # Если есть инстансы telemt — обновить tls_domain и mask_port первого инстанса
+    # SNI-роутинг: tls_domain НЕ должен совпадать с доменом сайта
     if [[ -f /etc/telemt/telemt1.toml ]]; then
-        sed -i "s|^tls_domain = .*|tls_domain = \"${site_dom}\"|" /etc/telemt/telemt1.toml
-        sed -i "s|^mask_port = .*|mask_port = 8443|" /etc/telemt/telemt1.toml
-        systemctl restart telemt1 2>/dev/null && ok "telemt1 перезапущен с tls_domain=${site_dom}, mask_port=8443"
+        local cur_tls; cur_tls=$(grep -m1 'tls_domain' /etc/telemt/telemt1.toml | grep -oE '"[^"]+"' | tr -d '"')
+        if [[ "$cur_tls" == "$site_dom" ]]; then
+            sed -i 's|^tls_domain = .*|tls_domain = "www.cloudflare.com"|' /etc/telemt/telemt1.toml
+            ok "tls_domain изменён: ${site_dom} → www.cloudflare.com (для SNI-роутинга)"
+        fi
+        # Перебиндить на 127.0.0.1 для stream-прокси
+        sed -i 's/^listen_addr_ipv4 = "0\.0\.0\.0"/listen_addr_ipv4 = "127.0.0.1"/' /etc/telemt/telemt1.toml
+        systemctl restart telemt1 2>/dev/null && ok "telemt1 перезапущен на 127.0.0.1:443"
+    fi
+
+    # Настройка nginx stream SNI-роутинга
+    local pub_ip; pub_ip=$(get_public_ip 2>/dev/null)
+    if [[ -n "$pub_ip" ]]; then
+        apt-get install -y libnginx-mod-stream 2>&1 | tail -1 || true
+        cat > /etc/nginx/modules-enabled/90-stream-sni.conf << STREAM
+stream {
+    map \$ssl_preread_server_name \$backend {
+        ${site_dom}    site_https;
+        default        telemt_tls;
+    }
+    upstream site_https  { server 127.0.0.1:8443; }
+    upstream telemt_tls  { server 127.0.0.1:443;  }
+    server {
+        listen ${pub_ip}:443;
+        ssl_preread on;
+        proxy_pass \$backend;
+    }
+}
+STREAM
+        nginx -t 2>&1 | tail -1 && systemctl restart nginx && ok "SNI-роутинг настроен"
     fi
 
     ok "${BOLD}Сайт-заглушка установлена${RESET}"
@@ -3646,13 +3658,20 @@ site_health_check() {
         err "URL отвечает кодом: ${code}"; issues=$((issues+1))
     fi
 
-    # tls_domain в telemt
+    # tls_domain НЕ должен совпадать с доменом сайта
     if [[ -f /etc/telemt/telemt1.toml ]]; then
         if grep -q "tls_domain = \"${dom}\"" /etc/telemt/telemt1.toml; then
-            ok "tls_domain в telemt = ${dom}"
+            warn "tls_domain == домен сайта — SNI-роутинг не работает!"; issues=$((issues+1))
         else
-            warn "tls_domain в /etc/telemt/telemt1.toml не равен ${dom}"
+            ok "tls_domain отличается от домена сайта"
         fi
+    fi
+
+    # stream SNI-конфиг
+    if [[ -f /etc/nginx/modules-enabled/90-stream-sni.conf ]]; then
+        ok "nginx stream SNI-роутинг настроен"
+    else
+        warn "Нет SNI-конфига /etc/nginx/modules-enabled/90-stream-sni.conf"; issues=$((issues+1))
     fi
 
     echo ""
