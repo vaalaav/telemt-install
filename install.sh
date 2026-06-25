@@ -120,6 +120,19 @@ check_vless_not_self() {
     return 0
 }
 
+# ─── Хелпер: проверка что порт 80 свободен (для certbot ACME) ──────────────
+check_port_80_free() {
+    if ! ss -tlnp 2>/dev/null | grep -qE ':80\s'; then
+        return 0
+    fi
+    local listener; listener=$(ss -tlnp 2>/dev/null | grep -E ':80\s' | grep -oE 'users:\(\("[^"]+' | head -1 | cut -d'"' -f2)
+    if [[ "$listener" == "nginx" ]]; then
+        return 0  # nginx уже запущен — это нормально
+    fi
+    err "Порт 80 занят процессом: ${listener:-unknown}"
+    err "certbot ACME challenge не сможет работать. Освободите порт 80."
+    return 1
+}
 
 # ─── Баннер ───────────────────────────────────────────────────────────────────
 print_banner() {
@@ -140,7 +153,128 @@ BANNER
 }
 
 # ─── Определение SSH-порта ────────────────────────────────────────────────────
+# ─── Выбор сценария: Стандарт / Свой сайт ──────────────────────────────────
+select_scenario() {
+    INSTALL_SCENARIO="standard"  # стандарт по умолчанию
 
+    echo ""
+    echo -e "  ${BOLD}${CYAN}Что устанавливать?${RESET}"
+    echo ""
+    echo -e "  ${BOLD}1.${RESET} ${BOLD}Стандартная установка${RESET}"
+    echo -e "      MTProxy на нескольких портах (443/5223/8530) с маскировкой под SNI."
+    echo -e "      ${DIM}UFW, keepalive, BBR, nft, VLESS upstream, свой домен в ссылке.${RESET}"
+    echo ""
+    echo -e "  ${BOLD}2.${RESET} ${BOLD}Свой сайт${RESET} ${DIM}(домен с заглушкой + MTProxy на 443)${RESET}"
+    echo -e "      Поднимает реальный сайт через nginx + Let's Encrypt на порту 8443,"
+    echo -e "      MTProxy слушает 443. В ссылке клиента — домен сайта."
+    echo ""
+    local ch
+    while true; do
+        read -rp "$(echo -e "  ${YELLOW}?${RESET} Сценарий [1/2]: ")" ch
+        case "$ch" in
+            1|"") INSTALL_SCENARIO="standard"; ok "Сценарий: Стандартная установка"; break ;;
+            2)    INSTALL_SCENARIO="site";     ok "Сценарий: Свой сайт";              break ;;
+            0|q)  echo -e "${YELLOW}Отменено.${RESET}"; exit 0 ;;
+            *)    warn "Введите 1, 2 или 0" ;;
+        esac
+    done
+    echo ""
+}
+
+# ─── Запрос параметров сайта (для сценария site) ────────────────────────────
+ask_site_details() {
+    SITE_DOMAIN=""
+    SITE_EMAIL=""
+    SITE_TEMPLATE_URL="https://github.com/vaalaav/Market-Terminal-Template"
+    SITE_PORT="8443"   # фиксированный порт для сайта
+
+    echo ""
+    hdr "Настройка сайта-заглушки"
+    echo ""
+    echo -e "  Сайт будет на ${BOLD}${SITE_PORT}${RESET} порту, MTProxy остаётся на ${BOLD}443${RESET}."
+    echo -e "  ${DIM}Требование: A-запись домен → IP этого сервера должна быть настроена.${RESET}"
+    echo ""
+
+    # 1) Домен с проверкой DNS
+    local server_ip resolved_ip
+    server_ip=$(get_public_ip)
+    [[ -n "$server_ip" ]] && info "IP этого сервера: ${BOLD}${server_ip}${RESET}"
+    echo ""
+
+    while true; do
+        read -rp "  Домен для сайта (например site.example.com): " SITE_DOMAIN
+        if [[ -z "$SITE_DOMAIN" ]]; then
+            warn "Домен обязателен"; continue
+        fi
+        if [[ "$SITE_DOMAIN" != *.* ]]; then
+            warn "Введите корректное FQDN (с точкой), например proxy.example.com"; continue
+        fi
+
+        # Проверка A-записи
+        info "Проверка DNS (резолв $SITE_DOMAIN)..."
+        resolved_ip=$(getent hosts "$SITE_DOMAIN" 2>/dev/null | awk '{print $1}' | head -1)
+        if [[ -z "$resolved_ip" ]]; then
+            err "Домен не резолвится. Настройте A-запись и подождите пока DNS обновится."
+            read -rp "  Попробовать ещё раз? [Y/n]: " r
+            [[ "${r,,}" =~ ^(n|no)$ ]] && { err "Установка прервана"; exit 1; }
+            continue
+        fi
+        if [[ -n "$server_ip" && "$resolved_ip" != "$server_ip" ]]; then
+            err "DNS-несовпадение: $SITE_DOMAIN → $resolved_ip, IP сервера → $server_ip"
+            warn "certbot не сможет выпустить сертификат — установка прервана"
+            read -rp "  Попробовать другой домен? [Y/n]: " r
+            [[ "${r,,}" =~ ^(n|no)$ ]] && { err "Установка прервана"; exit 1; }
+            continue
+        fi
+        ok "DNS корректен: $SITE_DOMAIN → $resolved_ip"
+        break
+    done
+
+    # 2) Email для Let's Encrypt
+    echo ""
+    while true; do
+        read -rp "  Email для Let's Encrypt (для уведомлений об истечении): " SITE_EMAIL
+        if [[ "$SITE_EMAIL" =~ ^[^@]+@[^@]+\.[^@]+$ ]]; then
+            ok "Email: $SITE_EMAIL"
+            break
+        fi
+        warn "Введите корректный email (например you@example.com)"
+    done
+
+    # 3) Шаблон сайта
+    echo ""
+    echo -e "  ${BOLD}Шаблон сайта:${RESET}"
+    echo -e "  ${GREEN}1${RESET} — ${BOLD}vaalaav/Market-Terminal-Template${RESET} ${DIM}(по умолчанию)${RESET}"
+    echo -e "  ${GREEN}2${RESET} — другой GitHub-репозиторий"
+    local tch
+    while true; do
+        read -rp "  Выбор [1/2]: " tch
+        case "$tch" in
+            1|"") SITE_TEMPLATE_URL="https://github.com/vaalaav/Market-Terminal-Template"; break ;;
+            2)
+                while true; do
+                    read -rp "  URL GitHub-репозитория: " SITE_TEMPLATE_URL
+                    if [[ "$SITE_TEMPLATE_URL" =~ ^https://github\.com/[^/]+/[^/]+/?$ ]]; then
+                        break
+                    fi
+                    warn "Формат: https://github.com/user/repo"
+                done
+                break
+                ;;
+            *) warn "1 или 2" ;;
+        esac
+    done
+    ok "Шаблон: $SITE_TEMPLATE_URL"
+
+    # Фиксируем параметры инстанса telemt для сценария site:
+    # один инстанс на 443; tls_domain НЕ равен SITE_DOMAIN —
+    # иначе SNI-роутинг невозможен и mask создаёт петлю на себя
+    INSTANCES=(1)
+    CUSTOM_PORTS[1]=443
+    # CUSTOM_DOMAINS[1] остаётся по умолчанию (www.cloudflare.com)
+    CUSTOM_APIS[1]=9091
+    info "Сценарий site: инстанс telemt на 443, tls_domain=${CUSTOM_DOMAINS[1]} (SNI-роутинг на сайт через nginx)"
+}
 
 detect_ssh_port() {
     SSH_PORT=$(ss -tlnp 2>/dev/null | awk '/sshd/{print $4}' | grep -oE '[0-9]+$' | head -1)
@@ -156,6 +290,12 @@ select_components() {
     hdr "Шаг 0 — Выбор компонентов"
 
     # --- Инстансы ---
+    # В сценарии 'site' инстансы уже зафиксированы в ask_site_details (1 шт. на 443)
+    if [[ "${INSTALL_SCENARIO:-standard}" == "site" ]]; then
+        echo ""
+        info "Сценарий 'Свой сайт': инстанс telemt автоматически создаётся на порту 443"
+        info "с tls_domain=${CUSTOM_DOMAINS[1]} + SNI-роутинг nginx для сайта"
+    else
         echo ""
         echo -e "  ${BOLD}Инстансы telemt:${RESET}"
         echo -e "  ${GREEN}1${RESET} — порт ${BOLD}443${RESET}   | ${CYAN}www.cloudflare.com${RESET}  (HTTPS/CDN)"
@@ -215,6 +355,7 @@ select_components() {
         ok "Инстанс 4 (свой): порт=${BOLD}${CUSTOM_PORTS[4]}${RESET}  SNI=${CYAN}${CUSTOM_DOMAINS[4]}${RESET}"
     fi
     ok "Инстансы: ${INSTANCES[*]}"
+    fi   # конец else блока для INSTALL_SCENARIO != site
 
     # --- UFW ---
     echo ""
@@ -300,6 +441,17 @@ select_components() {
     [[ "${ans,,}" =~ ^(n|no|н|нет)$ ]] && USE_TSPU=false
 
     # --- Свой домен вместо IP в ссылке для клиента ---
+    if [[ "${INSTALL_SCENARIO:-standard}" == "site" ]]; then
+        # В сценарии site домен берётся из SITE_DOMAIN автоматически
+        USE_CUSTOM_DOMAIN=true
+        CUSTOM_LINK_DOMAIN="${SITE_DOMAIN:-}"
+        mkdir -p /etc/telemt
+        if [[ -n "$CUSTOM_LINK_DOMAIN" ]]; then
+            echo "$CUSTOM_LINK_DOMAIN" > /etc/telemt/.custom_domain
+            chmod 644 /etc/telemt/.custom_domain
+            info "В ссылках клиентов будет домен сайта: ${BOLD}${CUSTOM_LINK_DOMAIN}${RESET}"
+        fi
+    else
         echo ""
         echo -e "  ${BOLD}Свой домен в ссылке для клиента${RESET}"
         echo -e "  Вместо ${BOLD}server=РЕАЛЬНЫЙ_IP${RESET} в tg://proxy?... будет ${BOLD}server=твой.домен${RESET}"
@@ -342,6 +494,7 @@ select_components() {
             echo "$CUSTOM_LINK_DOMAIN" > /etc/telemt/.custom_domain
             chmod 644 /etc/telemt/.custom_domain
         fi
+    fi
 
     # --- VLESS Reality upstream для Telegram DC ---
     echo ""
@@ -782,6 +935,13 @@ step_ufw() {
         ok "Порт $port открыт"
     done
 
+    # В сценарии site открываем 80 (ACME) и SITE_PORT (сайт)
+    if [[ "${INSTALL_SCENARIO:-standard}" == "site" ]]; then
+        ufw allow 80/tcp
+        ok "Порт 80 открыт (Let's Encrypt ACME)"
+        ufw allow "${SITE_PORT:-8443}/tcp"
+        ok "Порт ${SITE_PORT:-8443} открыт (сайт-заглушка)"
+    fi
 
     # Web-панель
     if [[ "${DO_PANEL:-false}" == true ]]; then
@@ -1423,6 +1583,318 @@ TUNIT
     systemctl daemon-reload
     systemctl enable --now telemt-vless-refresh.timer 2>&1 | grep -v "Created symlink" || true
 }
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Сайт-заглушка (для сценария INSTALL_SCENARIO=site)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Шаг: установка nginx, certbot, git
+step_install_site_deps() {
+    hdr "Сайт: установка nginx + certbot + git"
+    confirm "Установить?" skip || return 0
+
+    wait_apt
+    if ! apt-get install -y nginx libnginx-mod-stream certbot python3-certbot-nginx git curl 2>&1 | tail -3; then
+        err "Не удалось установить зависимости — пропуск сайта"
+        return 1
+    fi
+    ok "nginx + certbot + git установлены"
+    systemctl enable --now nginx 2>&1 | grep -v "Created symlink" || true
+    ok "nginx запущен"
+}
+
+# Шаг: клонирование шаблона из GitHub
+step_clone_site_template() {
+    hdr "Сайт: клонирование шаблона"
+    info "Шаблон: ${BOLD}${SITE_TEMPLATE_URL}${RESET}"
+    confirm "Клонировать в /var/www/telemt-site?" skip || return 0
+
+    # Чистим старое если есть
+    if [[ -d /var/www/telemt-site ]]; then
+        warn "Старая директория /var/www/telemt-site существует — будет заменена"
+        rm -rf /var/www/telemt-site
+    fi
+    mkdir -p /var/www
+
+    if ! git clone --depth 1 "$SITE_TEMPLATE_URL" /var/www/telemt-site 2>&1; then
+        err "Не удалось клонировать шаблон"
+        # Резерв: ставим простую страницу-заглушку
+        mkdir -p /var/www/telemt-site
+        cat > /var/www/telemt-site/index.html << 'HTMLFB'
+<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8"><title>Сайт в разработке</title>
+<style>body{font-family:sans-serif;text-align:center;padding:3em;background:#f4f4f4;color:#333}</style>
+</head><body><h1>Сайт в разработке</h1><p>Coming soon.</p></body></html>
+HTMLFB
+        warn "Создана резервная заглушка"
+    else
+        ok "Шаблон склонирован: $(ls /var/www/telemt-site | head -5 | tr '\\n' ' ')..."
+    fi
+
+    chown -R www-data:www-data /var/www/telemt-site
+    chmod -R o+rX /var/www/telemt-site
+}
+
+# Шаг: настройка nginx (HTTP для ACME + HTTPS-сайт на 8443)
+step_setup_nginx() {
+    hdr "Сайт: настройка nginx (HTTP для ACME)"
+    confirm "Создать конфиг nginx?" skip || return 0
+
+    # Проверяем что порт 80 не занят чужим процессом (нужен для ACME challenge)
+    if ! check_port_80_free; then
+        warn "Установка сайта прервана. Сценарий 'Свой сайт' не может продолжаться без 80 порта."
+        warn "После освобождения порта 80 запустите: sudo mytelemtinfo → 8 → 1 (установить сайт)"
+        SITE_SETUP_FAILED=true
+        return 1
+    fi
+
+    mkdir -p /var/www/letsencrypt
+
+    # HTTP-блок (для certbot ACME challenge); основной HTTPS-блок создадим ПОСЛЕ certbot
+    cat > /etc/nginx/sites-available/telemt-site.conf << NGINX
+# Сайт-заглушка telemt-install
+# HTTP-блок — только для Let's Encrypt ACME challenge
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${SITE_DOMAIN};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+        default_type "text/plain";
+    }
+    location / {
+        return 444;   # тихо обрываем любые другие запросы по HTTP
+    }
+}
+NGINX
+
+    # Включаем
+    ln -sf /etc/nginx/sites-available/telemt-site.conf /etc/nginx/sites-enabled/telemt-site.conf
+
+    # Убираем default site чтобы не было конфликта
+    rm -f /etc/nginx/sites-enabled/default
+
+    if ! nginx -t 2>&1 | tail -3; then
+        err "nginx -t не прошёл"
+        return 1
+    fi
+    systemctl reload nginx
+    ok "nginx настроен (HTTP-блок для ACME)"
+}
+
+# Шаг: получение сертификата Let's Encrypt через webroot
+step_get_certbot_cert() {
+    hdr "Сайт: получение сертификата Let's Encrypt"
+    confirm "Запустить certbot?" skip || return 0
+
+    if [[ -z "${SITE_DOMAIN:-}" || -z "${SITE_EMAIL:-}" ]]; then
+        err "Не заданы SITE_DOMAIN или SITE_EMAIL"
+        return 1
+    fi
+
+    info "Запрос сертификата для $SITE_DOMAIN..."
+    if ! certbot certonly --webroot -w /var/www/letsencrypt \
+        -d "$SITE_DOMAIN" --email "$SITE_EMAIL" \
+        --agree-tos --non-interactive --no-eff-email 2>&1 | tail -10; then
+        err "certbot не смог выпустить сертификат для $SITE_DOMAIN"
+        warn "Возможные причины:"
+        warn "  1) DNS A-запись $SITE_DOMAIN ещё не пропагировалась"
+        warn "  2) Порт 80 заблокирован UFW/iptables или другим хостом по дороге"
+        warn "  3) Достигнут rate-limit Let's Encrypt (5 неудач за час)"
+        echo ""
+        warn "Откатываем nginx-конфиг сайта (HTTP-блок останется для повторной попытки)..."
+        # Не удаляем nginx-конфиг полностью — он нужен для повторной попытки
+        # Но помечаем что установка сайта провалилась
+        SITE_SETUP_FAILED=true
+        return 1
+    fi
+
+    ok "Сертификат получен: /etc/letsencrypt/live/$SITE_DOMAIN/"
+
+    # Теперь добавляем HTTPS-блок на 127.0.0.1:8443 (за stream-прокси)
+    cat > /etc/nginx/sites-available/telemt-site.conf << NGINX
+# Сайт-заглушка telemt-install
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${SITE_DOMAIN};
+    location /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+        default_type "text/plain";
+    }
+    location / { return 301 https://\$host\$request_uri; }
+}
+
+server {
+    listen 127.0.0.1:8443 ssl http2;
+    server_name ${SITE_DOMAIN};
+
+    ssl_certificate     /etc/letsencrypt/live/${SITE_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${SITE_DOMAIN}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+
+    root /var/www/telemt-site;
+    index index.html index.htm;
+
+    server_tokens off;
+
+    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
+}
+NGINX
+
+    if ! nginx -t 2>&1 | tail -3; then
+        err "nginx -t (с HTTPS) не прошёл"
+        SITE_SETUP_FAILED=true
+        return 1
+    fi
+    systemctl restart nginx
+    ok "nginx переключён на HTTPS (127.0.0.1:8443, за stream-прокси)"
+
+    # Deploy-hook: после renewal сертификата перезагружаем nginx,
+    # чтобы он подхватил новые ssl-файлы в памяти
+    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+    cat > /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh << 'HOOK'
+#!/bin/sh
+# Авто-reload nginx после обновления сертификата certbot
+systemctl reload nginx 2>/dev/null || true
+HOOK
+    chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+    ok "Deploy-hook установлен (nginx будет reload'иться после каждого renewal)"
+
+    # Автообновление сертификата — certbot ставит свой timer, проверим что он активен
+    if systemctl list-unit-files 2>/dev/null | grep -q "certbot.timer"; then
+        systemctl enable --now certbot.timer 2>&1 | grep -v "Created symlink" || true
+        ok "Автообновление сертификата: certbot.timer активен"
+    fi
+}
+
+step_setup_sni_routing() {
+    hdr "Сайт: SNI-роутинг (порт 443)"
+    local pub_ip; pub_ip=$(get_public_ip_cached)
+    [[ -z "$pub_ip" ]] && { err "Не удалось определить публичный IP"; return 1; }
+
+    # Перебиндить telemt-инстансы с порта 443 на 127.0.0.1
+    local toml matched=false
+    for toml in /etc/telemt/telemt[0-9]*.toml; do
+        [[ -f "$toml" ]] || continue
+        grep -qE '^\s*port\s*=\s*443\b' "$toml" || continue
+        sed -i 's/^\(\s*listen_addr_ipv4\s*=\s*\)"0\.0\.0\.0"/\1"127.0.0.1"/' "$toml"
+        local svc; svc=$(basename "$toml" .toml)
+        systemctl restart "$svc" 2>/dev/null || warn "Не удалось перезапустить $svc"
+        ok "$(basename "$toml"): listen → 127.0.0.1:443"
+        matched=true
+    done
+    $matched || { err "Не найден telemt-инстанс на порту 443"; return 1; }
+
+    # stream-блок: SNI → сайт или telemt
+    cat > /etc/nginx/modules-enabled/90-stream-sni.conf << STREAM
+stream {
+    map \$ssl_preread_server_name \$backend {
+        ${SITE_DOMAIN}    site_https;
+        default           telemt_tls;
+    }
+    upstream site_https  { server 127.0.0.1:8443; }
+    upstream telemt_tls  { server 127.0.0.1:443;  }
+
+    server {
+        listen ${pub_ip}:443;
+        ssl_preread on;
+        proxy_pass \$backend;
+    }
+}
+STREAM
+
+    if ! nginx -t 2>&1 | tail -3; then
+        err "nginx -t не прошёл"; return 1
+    fi
+    systemctl restart nginx
+    ok "SNI: ${SITE_DOMAIN} → nginx:8443 (сайт), остальное → telemt:443 (прокси)"
+}
+
+# Шаг: проверка работоспособности сайта + telemt + связки
+step_site_health_check() {
+    hdr "Сайт: проверка работоспособности"
+
+    if [[ "${SITE_SETUP_FAILED:-false}" == true ]]; then
+        echo ""
+        err "${BOLD}Установка сайта НЕ завершилась успешно${RESET}"
+        warn "Что работает: telemt на 443 (по обычным MTProxy ссылкам)"
+        warn "Что НЕ работает: сайт-заглушка на ${SITE_DOMAIN:-?}"
+        echo ""
+        info "Чтобы попробовать установить сайт повторно после устранения проблемы:"
+        info "  sudo mytelemtinfo → 8. Сайт-заглушка → 1. Установить"
+        echo ""
+        return 0  # не падаем, чтобы остальной pipeline продолжился (mytelemtinfo, summary)
+    fi
+
+    local issues=0
+
+    # 1. nginx active
+    if systemctl is-active --quiet nginx; then
+        ok "nginx: active"
+    else
+        err "nginx: НЕ active"
+        issues=$((issues+1))
+    fi
+
+    # 2. Сертификат существует и валиден
+    local cert="/etc/letsencrypt/live/${SITE_DOMAIN}/fullchain.pem"
+    if [[ -f "$cert" ]]; then
+        local exp_date
+        exp_date=$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)
+        ok "Сертификат: действителен до ${BOLD}${exp_date}${RESET}"
+    else
+        err "Сертификат не найден: $cert"
+        issues=$((issues+1))
+    fi
+
+    # 3. HTTPS отвечает 200
+    sleep 2  # дать nginx время на restart
+    local site_url
+    [[ "${INSTALL_SCENARIO:-standard}" == "site" ]] \
+        && site_url="https://${SITE_DOMAIN}" \
+        || site_url="https://${SITE_DOMAIN}:${SITE_PORT}"
+    local http_code
+    http_code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
+        "${site_url}/" 2>/dev/null || echo "000")
+    if [[ "$http_code" == "200" || "$http_code" == "30"* ]]; then
+        ok "Сайт отвечает: ${site_url}/ → ${http_code}"
+    else
+        warn "Сайт ответил кодом: ${http_code} (ожидался 200)"
+        issues=$((issues+1))
+    fi
+
+    # 4. tls_domain НЕ совпадает с SITE_DOMAIN (иначе SNI-роутинг сломается)
+    if [[ -f /etc/telemt/telemt1.toml ]]; then
+        if grep -q "tls_domain = \"${SITE_DOMAIN}\"" /etc/telemt/telemt1.toml; then
+            warn "tls_domain == SITE_DOMAIN — SNI-роутинг не сможет разделить трафик!"
+            issues=$((issues+1))
+        else
+            ok "tls_domain отличается от домена сайта (SNI-роутинг корректен)"
+        fi
+    fi
+
+    # 5. stream SNI-конфиг существует
+    if [[ -f /etc/nginx/modules-enabled/90-stream-sni.conf ]]; then
+        ok "nginx stream SNI-роутинг настроен"
+    else
+        warn "Отсутствует /etc/nginx/modules-enabled/90-stream-sni.conf"
+        issues=$((issues+1))
+    fi
+
+    echo ""
+    if [[ $issues -eq 0 ]]; then
+        ok "${BOLD}Сайт-заглушка работает корректно${RESET}"
+    else
+        warn "${BOLD}Найдено проблем: ${issues}${RESET}"
+    fi
+}
+
 # ─── ШАГ: Установка mytelemtinfo ─────────────────────────────────────────────
 step_install_mytelemtinfo() {
     hdr "Установка команды mytelemtinfo"
@@ -1707,6 +2179,25 @@ print_summary() {
     done
     echo -e "  ${CYAN}└──────┴───────┴────────────────────────┴───────────┘${RESET}"
 
+    # ── Блок про сайт-заглушку (только для сценария site) ──
+    if [[ "${INSTALL_SCENARIO:-standard}" == "site" && -n "${SITE_DOMAIN:-}" ]]; then
+        echo ""
+        echo -e "  ${BOLD}Сайт-заглушка:${RESET}"
+        local site_status; site_status=$(systemctl is-active nginx 2>/dev/null)
+        local site_st_disp
+        case "$site_status" in
+            active)   site_st_disp="${GREEN}▶ active${RESET}" ;;
+            *)        site_st_disp="${RED}■ ${site_status}${RESET}" ;;
+        esac
+        echo -e "  nginx:    ${site_st_disp}"
+        echo -e "  URL:      ${CYAN}https://${SITE_DOMAIN}:${SITE_PORT:-8443}/${RESET}"
+        local cert="/etc/letsencrypt/live/${SITE_DOMAIN}/fullchain.pem"
+        if [[ -f "$cert" ]]; then
+            local exp; exp=$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)
+            echo -e "  Сертификат: ${GREEN}валиден до ${exp}${RESET}"
+        fi
+        echo -e "  Шаблон:   ${DIM}${SITE_TEMPLATE_URL}${RESET}"
+    fi
 
     echo ""
 
@@ -2322,23 +2813,38 @@ main() {
     echo -e "  На каждом шаге: ${GREEN}y${RESET} (выполнить), Enter/n (пропустить), ${RED}q${RESET} (выход)."
     echo ""
 
+    # Выбор сценария установки (Стандартная / Свой сайт)
+    select_scenario
 
     confirm "Начать установку?" exit
 
     detect_ssh_port
 
+    # Сайт-заглушка — запрос параметров ДО select_components,
+    # потому что select_components читает SITE_DOMAIN
+    if [[ "${INSTALL_SCENARIO:-standard}" == "site" ]]; then
+        ask_site_details
+    fi
 
     select_components
 
     echo ""
     echo -e "${BOLD}Итоговый план:${RESET}"
+    echo -e "  Сценарий:        ${INSTALL_SCENARIO:-standard}"
+    if [[ "${INSTALL_SCENARIO:-standard}" == "site" ]]; then
+        echo -e "  Сайт:            ${SITE_DOMAIN:-?} на порту ${SITE_PORT:-8443}"
+        echo -e "  Email Let's Encrypt: ${SITE_EMAIL:-?}"
+        echo -e "  Шаблон сайта:    ${SITE_TEMPLATE_URL:-?}"
+    fi
     echo -e "  Инстансы:        ${INSTANCES[*]}"
     echo -e "  UFW:             $DO_UFW | rate-limit: $DO_RATELIMIT"
     echo -e "  Keepalive:       ${DO_KEEPALIVE:-false}"
     echo -e "  BBR + fq:        ${DO_BBR:-false}"
     echo -e "  nft limiter:     ${DO_NFT:-false}"
     echo -e "  Таймауты:        ${DO_TIMEOUTS:-false}"
-    echo -e "  Свой домен:      ${USE_CUSTOM_DOMAIN:-false}${USE_CUSTOM_DOMAIN:+ (${CUSTOM_LINK_DOMAIN})}"
+    if [[ "${INSTALL_SCENARIO:-standard}" != "site" ]]; then
+        echo -e "  Свой домен:      ${USE_CUSTOM_DOMAIN:-false}${USE_CUSTOM_DOMAIN:+ (${CUSTOM_LINK_DOMAIN})}"
+    fi
     echo -e "  client_mss=tspu: ${USE_TSPU:-true}"
     echo -e "  VLESS Reality:   ${DO_VLESS:-false}"
     echo -e "  Web-панель:      ${DO_PANEL:-false}"
@@ -2360,6 +2866,25 @@ main() {
     step_ratelimit
     step_keepalive
     step_nft_limiter
+    # Сайт-заглушка (только в сценарии site)
+    if [[ "${INSTALL_SCENARIO:-standard}" == "site" ]]; then
+        SITE_SETUP_FAILED=false
+        step_install_site_deps || SITE_SETUP_FAILED=true
+        if [[ "$SITE_SETUP_FAILED" != true ]]; then
+            step_clone_site_template || SITE_SETUP_FAILED=true
+        fi
+        if [[ "$SITE_SETUP_FAILED" != true ]]; then
+            step_setup_nginx || SITE_SETUP_FAILED=true
+        fi
+        if [[ "$SITE_SETUP_FAILED" != true ]]; then
+            step_get_certbot_cert || SITE_SETUP_FAILED=true
+        fi
+        if [[ "$SITE_SETUP_FAILED" != true ]]; then
+            step_setup_sni_routing || SITE_SETUP_FAILED=true
+        fi
+        # health_check всегда вызываем — он сам поймёт нужно ли отчитываться об ошибке
+        step_site_health_check
+    fi
     step_install_mytelemtinfo
     step_panel
     step_start
