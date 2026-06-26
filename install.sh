@@ -120,19 +120,6 @@ check_vless_not_self() {
     return 0
 }
 
-# ─── Хелпер: проверка что порт 80 свободен (для certbot ACME) ──────────────
-check_port_80_free() {
-    if ! ss -tlnp 2>/dev/null | grep -qE ':80\s'; then
-        return 0
-    fi
-    local listener; listener=$(ss -tlnp 2>/dev/null | grep -E ':80\s' | grep -oE 'users:\(\("[^"]+' | head -1 | cut -d'"' -f2)
-    if [[ "$listener" == "nginx" ]]; then
-        return 0  # nginx уже запущен — это нормально
-    fi
-    err "Порт 80 занят процессом: ${listener:-unknown}"
-    err "certbot ACME challenge не сможет работать. Освободите порт 80."
-    return 1
-}
 
 # ─── Баннер ───────────────────────────────────────────────────────────────────
 print_banner() {
@@ -153,128 +140,7 @@ BANNER
 }
 
 # ─── Определение SSH-порта ────────────────────────────────────────────────────
-# ─── Выбор сценария: Стандарт / Свой сайт ──────────────────────────────────
-select_scenario() {
-    INSTALL_SCENARIO="standard"  # стандарт по умолчанию
 
-    echo ""
-    echo -e "  ${BOLD}${CYAN}Что устанавливать?${RESET}"
-    echo ""
-    echo -e "  ${BOLD}1.${RESET} ${BOLD}Стандартная установка${RESET}"
-    echo -e "      MTProxy на нескольких портах (443/5223/8530) с маскировкой под SNI."
-    echo -e "      ${DIM}UFW, keepalive, BBR, nft, VLESS upstream, свой домен в ссылке.${RESET}"
-    echo ""
-    echo -e "  ${BOLD}2.${RESET} ${BOLD}Свой сайт${RESET} ${DIM}(домен с заглушкой + MTProxy на 443)${RESET}"
-    echo -e "      Поднимает реальный сайт через nginx + Let's Encrypt на порту 8443,"
-    echo -e "      MTProxy слушает 443. В ссылке клиента — домен сайта."
-    echo ""
-    local ch
-    while true; do
-        read -rp "$(echo -e "  ${YELLOW}?${RESET} Сценарий [1/2]: ")" ch
-        case "$ch" in
-            1|"") INSTALL_SCENARIO="standard"; ok "Сценарий: Стандартная установка"; break ;;
-            2)    INSTALL_SCENARIO="site";     ok "Сценарий: Свой сайт";              break ;;
-            0|q)  echo -e "${YELLOW}Отменено.${RESET}"; exit 0 ;;
-            *)    warn "Введите 1, 2 или 0" ;;
-        esac
-    done
-    echo ""
-}
-
-# ─── Запрос параметров сайта (для сценария site) ────────────────────────────
-ask_site_details() {
-    SITE_DOMAIN=""
-    SITE_EMAIL=""
-    SITE_TEMPLATE_URL="https://github.com/vaalaav/Market-Terminal-Template"
-    SITE_PORT="8443"   # фиксированный порт для сайта
-
-    echo ""
-    hdr "Настройка сайта-заглушки"
-    echo ""
-    echo -e "  Сайт будет на ${BOLD}${SITE_PORT}${RESET} порту, MTProxy остаётся на ${BOLD}443${RESET}."
-    echo -e "  ${DIM}Требование: A-запись домен → IP этого сервера должна быть настроена.${RESET}"
-    echo ""
-
-    # 1) Домен с проверкой DNS
-    local server_ip resolved_ip
-    server_ip=$(get_public_ip)
-    [[ -n "$server_ip" ]] && info "IP этого сервера: ${BOLD}${server_ip}${RESET}"
-    echo ""
-
-    while true; do
-        read -rp "  Домен для сайта (например site.example.com): " SITE_DOMAIN
-        if [[ -z "$SITE_DOMAIN" ]]; then
-            warn "Домен обязателен"; continue
-        fi
-        if [[ "$SITE_DOMAIN" != *.* ]]; then
-            warn "Введите корректное FQDN (с точкой), например proxy.example.com"; continue
-        fi
-
-        # Проверка A-записи
-        info "Проверка DNS (резолв $SITE_DOMAIN)..."
-        resolved_ip=$(getent hosts "$SITE_DOMAIN" 2>/dev/null | awk '{print $1}' | head -1)
-        if [[ -z "$resolved_ip" ]]; then
-            err "Домен не резолвится. Настройте A-запись и подождите пока DNS обновится."
-            read -rp "  Попробовать ещё раз? [Y/n]: " r
-            [[ "${r,,}" =~ ^(n|no)$ ]] && { err "Установка прервана"; exit 1; }
-            continue
-        fi
-        if [[ -n "$server_ip" && "$resolved_ip" != "$server_ip" ]]; then
-            err "DNS-несовпадение: $SITE_DOMAIN → $resolved_ip, IP сервера → $server_ip"
-            warn "certbot не сможет выпустить сертификат — установка прервана"
-            read -rp "  Попробовать другой домен? [Y/n]: " r
-            [[ "${r,,}" =~ ^(n|no)$ ]] && { err "Установка прервана"; exit 1; }
-            continue
-        fi
-        ok "DNS корректен: $SITE_DOMAIN → $resolved_ip"
-        break
-    done
-
-    # 2) Email для Let's Encrypt
-    echo ""
-    while true; do
-        read -rp "  Email для Let's Encrypt (для уведомлений об истечении): " SITE_EMAIL
-        if [[ "$SITE_EMAIL" =~ ^[^@]+@[^@]+\.[^@]+$ ]]; then
-            ok "Email: $SITE_EMAIL"
-            break
-        fi
-        warn "Введите корректный email (например you@example.com)"
-    done
-
-    # 3) Шаблон сайта
-    echo ""
-    echo -e "  ${BOLD}Шаблон сайта:${RESET}"
-    echo -e "  ${GREEN}1${RESET} — ${BOLD}vaalaav/Market-Terminal-Template${RESET} ${DIM}(по умолчанию)${RESET}"
-    echo -e "  ${GREEN}2${RESET} — другой GitHub-репозиторий"
-    local tch
-    while true; do
-        read -rp "  Выбор [1/2]: " tch
-        case "$tch" in
-            1|"") SITE_TEMPLATE_URL="https://github.com/vaalaav/Market-Terminal-Template"; break ;;
-            2)
-                while true; do
-                    read -rp "  URL GitHub-репозитория: " SITE_TEMPLATE_URL
-                    if [[ "$SITE_TEMPLATE_URL" =~ ^https://github\.com/[^/]+/[^/]+/?$ ]]; then
-                        break
-                    fi
-                    warn "Формат: https://github.com/user/repo"
-                done
-                break
-                ;;
-            *) warn "1 или 2" ;;
-        esac
-    done
-    ok "Шаблон: $SITE_TEMPLATE_URL"
-
-    # Фиксируем параметры инстанса telemt для сценария site:
-    # один инстанс на 443; tls_domain НЕ равен SITE_DOMAIN —
-    # иначе SNI-роутинг невозможен и mask создаёт петлю на себя
-    INSTANCES=(1)
-    CUSTOM_PORTS[1]=443
-    # CUSTOM_DOMAINS[1] остаётся по умолчанию (www.cloudflare.com)
-    CUSTOM_APIS[1]=9091
-    info "Сценарий site: инстанс telemt на 443, tls_domain=${CUSTOM_DOMAINS[1]} (SNI-роутинг на сайт через nginx)"
-}
 
 detect_ssh_port() {
     SSH_PORT=$(ss -tlnp 2>/dev/null | awk '/sshd/{print $4}' | grep -oE '[0-9]+$' | head -1)
@@ -290,12 +156,6 @@ select_components() {
     hdr "Шаг 0 — Выбор компонентов"
 
     # --- Инстансы ---
-    # В сценарии 'site' инстансы уже зафиксированы в ask_site_details (1 шт. на 443)
-    if [[ "${INSTALL_SCENARIO:-standard}" == "site" ]]; then
-        echo ""
-        info "Сценарий 'Свой сайт': инстанс telemt автоматически создаётся на порту 443"
-        info "с tls_domain=${CUSTOM_DOMAINS[1]} + SNI-роутинг nginx для сайта"
-    else
         echo ""
         echo -e "  ${BOLD}Инстансы telemt:${RESET}"
         echo -e "  ${GREEN}1${RESET} — порт ${BOLD}443${RESET}   | ${CYAN}www.cloudflare.com${RESET}  (HTTPS/CDN)"
@@ -355,7 +215,6 @@ select_components() {
         ok "Инстанс 4 (свой): порт=${BOLD}${CUSTOM_PORTS[4]}${RESET}  SNI=${CYAN}${CUSTOM_DOMAINS[4]}${RESET}"
     fi
     ok "Инстансы: ${INSTANCES[*]}"
-    fi   # конец else блока для INSTALL_SCENARIO != site
 
     # --- UFW ---
     echo ""
@@ -400,10 +259,10 @@ select_components() {
     if [[ "$DO_NFT" == true ]]; then
         echo ""
         echo -e "  Параметры лимитера (Enter = оставить дефолт):"
-        read -rp "$(echo -e "${YELLOW}?${RESET} RATE (rate over X) [1/second]: ")" NFT_RATE
-        NFT_RATE="${NFT_RATE:-1/second}"
-        read -rp "$(echo -e "${YELLOW}?${RESET} BURST [1]: ")" NFT_BURST
-        NFT_BURST="${NFT_BURST:-1}"
+        read -rp "$(echo -e "${YELLOW}?${RESET} RATE (rate over X) [55/minute]: ")" NFT_RATE
+        NFT_RATE="${NFT_RATE:-55/minute}"
+        read -rp "$(echo -e "${YELLOW}?${RESET} BURST [3]: ")" NFT_BURST
+        NFT_BURST="${NFT_BURST:-3}"
         read -rp "$(echo -e "${YELLOW}?${RESET} METER_TIMEOUT [60s]: ")" NFT_TIMEOUT
         NFT_TIMEOUT="${NFT_TIMEOUT:-60s}"
         ok "nft limiter: rate over $NFT_RATE burst $NFT_BURST timeout $NFT_TIMEOUT"
@@ -441,17 +300,6 @@ select_components() {
     [[ "${ans,,}" =~ ^(n|no|н|нет)$ ]] && USE_TSPU=false
 
     # --- Свой домен вместо IP в ссылке для клиента ---
-    if [[ "${INSTALL_SCENARIO:-standard}" == "site" ]]; then
-        # В сценарии site домен берётся из SITE_DOMAIN автоматически
-        USE_CUSTOM_DOMAIN=true
-        CUSTOM_LINK_DOMAIN="${SITE_DOMAIN:-}"
-        mkdir -p /etc/telemt
-        if [[ -n "$CUSTOM_LINK_DOMAIN" ]]; then
-            echo "$CUSTOM_LINK_DOMAIN" > /etc/telemt/.custom_domain
-            chmod 644 /etc/telemt/.custom_domain
-            info "В ссылках клиентов будет домен сайта: ${BOLD}${CUSTOM_LINK_DOMAIN}${RESET}"
-        fi
-    else
         echo ""
         echo -e "  ${BOLD}Свой домен в ссылке для клиента${RESET}"
         echo -e "  Вместо ${BOLD}server=РЕАЛЬНЫЙ_IP${RESET} в tg://proxy?... будет ${BOLD}server=твой.домен${RESET}"
@@ -494,7 +342,6 @@ select_components() {
             echo "$CUSTOM_LINK_DOMAIN" > /etc/telemt/.custom_domain
             chmod 644 /etc/telemt/.custom_domain
         fi
-    fi
 
     # --- VLESS Reality upstream для Telegram DC ---
     echo ""
@@ -783,6 +630,12 @@ step_configs() {
     ok "IP для tg://ссылок: $PUBLIC_IP"
     echo ""
 
+    # Для public_host: домен если задан, иначе IP
+    local LINK_HOST="${PUBLIC_IP}"
+    if [[ "${USE_CUSTOM_DOMAIN:-false}" == true && -n "${CUSTOM_LINK_DOMAIN:-}" ]]; then
+        LINK_HOST="${CUSTOM_LINK_DOMAIN}"
+    fi
+
     for n in "${INSTANCES[@]}"; do
         local port domain api secret
         port=$(instance_port "$n"); domain=$(instance_domain "$n"); api=$(instance_api "$n")
@@ -818,7 +671,7 @@ tls = true
 
 [general.links]
 show = "*"
-public_host = "${PUBLIC_IP}"
+public_host = "${LINK_HOST}"
 
 [network]
 ipv4 = true
@@ -935,13 +788,6 @@ step_ufw() {
         ok "Порт $port открыт"
     done
 
-    # В сценарии site открываем 80 (ACME) и SITE_PORT (сайт)
-    if [[ "${INSTALL_SCENARIO:-standard}" == "site" ]]; then
-        ufw allow 80/tcp
-        ok "Порт 80 открыт (Let's Encrypt ACME)"
-        ufw allow "${SITE_PORT:-8443}/tcp"
-        ok "Порт ${SITE_PORT:-8443} открыт (сайт-заглушка)"
-    fi
 
     # Web-панель
     if [[ "${DO_PANEL:-false}" == true ]]; then
@@ -1094,8 +940,8 @@ step_nft_limiter() {
 
     echo ""
     echo -e "  Создаёт per-client ограничение входящих SYN для каждого порта telemt."
-    echo -e "  Параметры: rate over ${BOLD}${NFT_RATE}${RESET} burst ${BOLD}${NFT_BURST}${RESET} timeout ${BOLD}${NFT_TIMEOUT}${RESET}"
-    echo -e "  Метод: hook ${BOLD}input${RESET} (non-Docker инсталляция)"
+    echo -e "  Два уровня: iOS DPI-probe (len=64 ttl<65) 15/s burst 30 + общий ${BOLD}${NFT_RATE}${RESET} burst ${BOLD}${NFT_BURST}${RESET}"
+    echo -e "  Действие: ${BOLD}reject with tcp reset${RESET} (мгновенный ответ клиенту, без таймаутов)"
     echo -e "  После перезагрузки: systemd-сервис ${BOLD}telemt-nft-limit.service${RESET} восстанавливает правила."
     echo ""
 
@@ -1127,9 +973,10 @@ step_nft_limiter() {
     # Создаём постоянный скрипт
     cat > /usr/local/sbin/telemt-nft-limit.sh << NFTSCRIPT
 #!/bin/bash
-# telemt nft inbound SYN per-client limiter
-# Адаптировано для non-Docker: hook input
-# Источник: https://h1de0x.github.io/telemt-tune/
+# telemt nft inbound SYN per-client limiter (two-tier: iOS probe + general)
+# iOS DPI-probe: len=64 ttl<65 → 15/s burst 30
+# General SYN: configurable RATE/BURST
+# Action: reject with tcp reset (instant client feedback, no timeouts)
 
 set -eu
 
@@ -1149,12 +996,15 @@ nft "add chain inet \$TABLE input { type filter hook input priority 0; policy ac
 # Добавляем правила per-port per-client
 NFTSCRIPT
 
-    # Добавляем правила для каждого порта
+    # Добавляем правила для каждого порта (two-tier: iOS probe + general)
     for n in "${INSTANCES[@]}"; do
         local port; port=$(instance_port "$n")
         cat >> /usr/local/sbin/telemt-nft-limit.sh << NFTRULE
-nft "add rule inet \$TABLE input ip daddr \$SERVER_IP tcp dport ${port} tcp flags & (syn | ack) == syn meter telemt_in_syn_p${port} { ip saddr timeout \$METER_TIMEOUT limit rate over \$RATE burst \$BURST packets } counter drop comment \"telemt_syn_p${port}\""
-echo "Правило применено: порт ${port}"
+# Tier 1: iOS DPI-probe (SYN len=64, TTL<65) — мягкий лимит 15/s burst 30
+nft "add rule inet \$TABLE input ip daddr \$SERVER_IP tcp dport ${port} tcp flags & (syn|ack) == syn meta length 64 ip ttl < 65 meter telemt_ios_p${port} { ip saddr timeout \$METER_TIMEOUT limit rate over 15/second burst 30 packets } counter reject with tcp reset comment \"telemt_ios_p${port}\""
+# Tier 2: общий SYN rate — reject вместо drop (мгновенный ответ клиенту)
+nft "add rule inet \$TABLE input ip daddr \$SERVER_IP tcp dport ${port} tcp flags & (syn|ack) == syn meter telemt_syn_p${port} { ip saddr timeout \$METER_TIMEOUT limit rate over \$RATE burst \$BURST packets } counter reject with tcp reset comment \"telemt_syn_p${port}\""
+echo "Правила применены: порт ${port} (iOS tier + general)"
 NFTRULE
     done
 
@@ -1189,7 +1039,7 @@ SERVICE
 
     systemctl daemon-reload
     systemctl enable telemt-nft-limit.service
-    ok "Сервис telemt-nft-limit.service включён в автозапуск"
+    ok "Сервис telemt-nft-limit.service включён (two-tier: iOS + general, reject mode)"
 
     # Проверка
     echo ""
@@ -1583,318 +1433,6 @@ TUNIT
     systemctl daemon-reload
     systemctl enable --now telemt-vless-refresh.timer 2>&1 | grep -v "Created symlink" || true
 }
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Сайт-заглушка (для сценария INSTALL_SCENARIO=site)
-# ═════════════════════════════════════════════════════════════════════════════
-
-# Шаг: установка nginx, certbot, git
-step_install_site_deps() {
-    hdr "Сайт: установка nginx + certbot + git"
-    confirm "Установить?" skip || return 0
-
-    wait_apt
-    if ! apt-get install -y nginx libnginx-mod-stream certbot python3-certbot-nginx git curl 2>&1 | tail -3; then
-        err "Не удалось установить зависимости — пропуск сайта"
-        return 1
-    fi
-    ok "nginx + certbot + git установлены"
-    systemctl enable --now nginx 2>&1 | grep -v "Created symlink" || true
-    ok "nginx запущен"
-}
-
-# Шаг: клонирование шаблона из GitHub
-step_clone_site_template() {
-    hdr "Сайт: клонирование шаблона"
-    info "Шаблон: ${BOLD}${SITE_TEMPLATE_URL}${RESET}"
-    confirm "Клонировать в /var/www/telemt-site?" skip || return 0
-
-    # Чистим старое если есть
-    if [[ -d /var/www/telemt-site ]]; then
-        warn "Старая директория /var/www/telemt-site существует — будет заменена"
-        rm -rf /var/www/telemt-site
-    fi
-    mkdir -p /var/www
-
-    if ! git clone --depth 1 "$SITE_TEMPLATE_URL" /var/www/telemt-site 2>&1; then
-        err "Не удалось клонировать шаблон"
-        # Резерв: ставим простую страницу-заглушку
-        mkdir -p /var/www/telemt-site
-        cat > /var/www/telemt-site/index.html << 'HTMLFB'
-<!DOCTYPE html>
-<html lang="ru"><head><meta charset="UTF-8"><title>Сайт в разработке</title>
-<style>body{font-family:sans-serif;text-align:center;padding:3em;background:#f4f4f4;color:#333}</style>
-</head><body><h1>Сайт в разработке</h1><p>Coming soon.</p></body></html>
-HTMLFB
-        warn "Создана резервная заглушка"
-    else
-        ok "Шаблон склонирован: $(ls /var/www/telemt-site | head -5 | tr '\\n' ' ')..."
-    fi
-
-    chown -R www-data:www-data /var/www/telemt-site
-    chmod -R o+rX /var/www/telemt-site
-}
-
-# Шаг: настройка nginx (HTTP для ACME + HTTPS-сайт на 8443)
-step_setup_nginx() {
-    hdr "Сайт: настройка nginx (HTTP для ACME)"
-    confirm "Создать конфиг nginx?" skip || return 0
-
-    # Проверяем что порт 80 не занят чужим процессом (нужен для ACME challenge)
-    if ! check_port_80_free; then
-        warn "Установка сайта прервана. Сценарий 'Свой сайт' не может продолжаться без 80 порта."
-        warn "После освобождения порта 80 запустите: sudo mytelemtinfo → 8 → 1 (установить сайт)"
-        SITE_SETUP_FAILED=true
-        return 1
-    fi
-
-    mkdir -p /var/www/letsencrypt
-
-    # HTTP-блок (для certbot ACME challenge); основной HTTPS-блок создадим ПОСЛЕ certbot
-    cat > /etc/nginx/sites-available/telemt-site.conf << NGINX
-# Сайт-заглушка telemt-install
-# HTTP-блок — только для Let's Encrypt ACME challenge
-
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${SITE_DOMAIN};
-
-    location /.well-known/acme-challenge/ {
-        root /var/www/letsencrypt;
-        default_type "text/plain";
-    }
-    location / {
-        return 444;   # тихо обрываем любые другие запросы по HTTP
-    }
-}
-NGINX
-
-    # Включаем
-    ln -sf /etc/nginx/sites-available/telemt-site.conf /etc/nginx/sites-enabled/telemt-site.conf
-
-    # Убираем default site чтобы не было конфликта
-    rm -f /etc/nginx/sites-enabled/default
-
-    if ! nginx -t 2>&1 | tail -3; then
-        err "nginx -t не прошёл"
-        return 1
-    fi
-    systemctl reload nginx
-    ok "nginx настроен (HTTP-блок для ACME)"
-}
-
-# Шаг: получение сертификата Let's Encrypt через webroot
-step_get_certbot_cert() {
-    hdr "Сайт: получение сертификата Let's Encrypt"
-    confirm "Запустить certbot?" skip || return 0
-
-    if [[ -z "${SITE_DOMAIN:-}" || -z "${SITE_EMAIL:-}" ]]; then
-        err "Не заданы SITE_DOMAIN или SITE_EMAIL"
-        return 1
-    fi
-
-    info "Запрос сертификата для $SITE_DOMAIN..."
-    if ! certbot certonly --webroot -w /var/www/letsencrypt \
-        -d "$SITE_DOMAIN" --email "$SITE_EMAIL" \
-        --agree-tos --non-interactive --no-eff-email 2>&1 | tail -10; then
-        err "certbot не смог выпустить сертификат для $SITE_DOMAIN"
-        warn "Возможные причины:"
-        warn "  1) DNS A-запись $SITE_DOMAIN ещё не пропагировалась"
-        warn "  2) Порт 80 заблокирован UFW/iptables или другим хостом по дороге"
-        warn "  3) Достигнут rate-limit Let's Encrypt (5 неудач за час)"
-        echo ""
-        warn "Откатываем nginx-конфиг сайта (HTTP-блок останется для повторной попытки)..."
-        # Не удаляем nginx-конфиг полностью — он нужен для повторной попытки
-        # Но помечаем что установка сайта провалилась
-        SITE_SETUP_FAILED=true
-        return 1
-    fi
-
-    ok "Сертификат получен: /etc/letsencrypt/live/$SITE_DOMAIN/"
-
-    # Теперь добавляем HTTPS-блок на 127.0.0.1:8443 (за stream-прокси)
-    cat > /etc/nginx/sites-available/telemt-site.conf << NGINX
-# Сайт-заглушка telemt-install
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${SITE_DOMAIN};
-    location /.well-known/acme-challenge/ {
-        root /var/www/letsencrypt;
-        default_type "text/plain";
-    }
-    location / { return 301 https://\$host\$request_uri; }
-}
-
-server {
-    listen 127.0.0.1:8443 ssl http2;
-    server_name ${SITE_DOMAIN};
-
-    ssl_certificate     /etc/letsencrypt/live/${SITE_DOMAIN}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${SITE_DOMAIN}/privkey.pem;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-
-    root /var/www/telemt-site;
-    index index.html index.htm;
-
-    server_tokens off;
-
-    location / {
-        try_files \$uri \$uri/ /index.html;
-    }
-}
-NGINX
-
-    if ! nginx -t 2>&1 | tail -3; then
-        err "nginx -t (с HTTPS) не прошёл"
-        SITE_SETUP_FAILED=true
-        return 1
-    fi
-    systemctl restart nginx
-    ok "nginx переключён на HTTPS (127.0.0.1:8443, за stream-прокси)"
-
-    # Deploy-hook: после renewal сертификата перезагружаем nginx,
-    # чтобы он подхватил новые ssl-файлы в памяти
-    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-    cat > /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh << 'HOOK'
-#!/bin/sh
-# Авто-reload nginx после обновления сертификата certbot
-systemctl reload nginx 2>/dev/null || true
-HOOK
-    chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
-    ok "Deploy-hook установлен (nginx будет reload'иться после каждого renewal)"
-
-    # Автообновление сертификата — certbot ставит свой timer, проверим что он активен
-    if systemctl list-unit-files 2>/dev/null | grep -q "certbot.timer"; then
-        systemctl enable --now certbot.timer 2>&1 | grep -v "Created symlink" || true
-        ok "Автообновление сертификата: certbot.timer активен"
-    fi
-}
-
-step_setup_sni_routing() {
-    hdr "Сайт: SNI-роутинг (порт 443)"
-    local pub_ip; pub_ip=$(get_public_ip_cached)
-    [[ -z "$pub_ip" ]] && { err "Не удалось определить публичный IP"; return 1; }
-
-    # Перебиндить telemt-инстансы с порта 443 на 127.0.0.1
-    local toml matched=false
-    for toml in /etc/telemt/telemt[0-9]*.toml; do
-        [[ -f "$toml" ]] || continue
-        grep -qE '^\s*port\s*=\s*443\b' "$toml" || continue
-        sed -i 's/^\(\s*listen_addr_ipv4\s*=\s*\)"0\.0\.0\.0"/\1"127.0.0.1"/' "$toml"
-        local svc; svc=$(basename "$toml" .toml)
-        systemctl restart "$svc" 2>/dev/null || warn "Не удалось перезапустить $svc"
-        ok "$(basename "$toml"): listen → 127.0.0.1:443"
-        matched=true
-    done
-    $matched || { err "Не найден telemt-инстанс на порту 443"; return 1; }
-
-    # stream-блок: SNI → сайт или telemt
-    cat > /etc/nginx/modules-enabled/90-stream-sni.conf << STREAM
-stream {
-    map \$ssl_preread_server_name \$backend {
-        ${SITE_DOMAIN}    site_https;
-        default           telemt_tls;
-    }
-    upstream site_https  { server 127.0.0.1:8443; }
-    upstream telemt_tls  { server 127.0.0.1:443;  }
-
-    server {
-        listen ${pub_ip}:443;
-        ssl_preread on;
-        proxy_pass \$backend;
-    }
-}
-STREAM
-
-    if ! nginx -t 2>&1 | tail -3; then
-        err "nginx -t не прошёл"; return 1
-    fi
-    systemctl restart nginx
-    ok "SNI: ${SITE_DOMAIN} → nginx:8443 (сайт), остальное → telemt:443 (прокси)"
-}
-
-# Шаг: проверка работоспособности сайта + telemt + связки
-step_site_health_check() {
-    hdr "Сайт: проверка работоспособности"
-
-    if [[ "${SITE_SETUP_FAILED:-false}" == true ]]; then
-        echo ""
-        err "${BOLD}Установка сайта НЕ завершилась успешно${RESET}"
-        warn "Что работает: telemt на 443 (по обычным MTProxy ссылкам)"
-        warn "Что НЕ работает: сайт-заглушка на ${SITE_DOMAIN:-?}"
-        echo ""
-        info "Чтобы попробовать установить сайт повторно после устранения проблемы:"
-        info "  sudo mytelemtinfo → 8. Сайт-заглушка → 1. Установить"
-        echo ""
-        return 0  # не падаем, чтобы остальной pipeline продолжился (mytelemtinfo, summary)
-    fi
-
-    local issues=0
-
-    # 1. nginx active
-    if systemctl is-active --quiet nginx; then
-        ok "nginx: active"
-    else
-        err "nginx: НЕ active"
-        issues=$((issues+1))
-    fi
-
-    # 2. Сертификат существует и валиден
-    local cert="/etc/letsencrypt/live/${SITE_DOMAIN}/fullchain.pem"
-    if [[ -f "$cert" ]]; then
-        local exp_date
-        exp_date=$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)
-        ok "Сертификат: действителен до ${BOLD}${exp_date}${RESET}"
-    else
-        err "Сертификат не найден: $cert"
-        issues=$((issues+1))
-    fi
-
-    # 3. HTTPS отвечает 200
-    sleep 2  # дать nginx время на restart
-    local site_url
-    [[ "${INSTALL_SCENARIO:-standard}" == "site" ]] \
-        && site_url="https://${SITE_DOMAIN}" \
-        || site_url="https://${SITE_DOMAIN}:${SITE_PORT}"
-    local http_code
-    http_code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
-        "${site_url}/" 2>/dev/null || echo "000")
-    if [[ "$http_code" == "200" || "$http_code" == "30"* ]]; then
-        ok "Сайт отвечает: ${site_url}/ → ${http_code}"
-    else
-        warn "Сайт ответил кодом: ${http_code} (ожидался 200)"
-        issues=$((issues+1))
-    fi
-
-    # 4. tls_domain НЕ совпадает с SITE_DOMAIN (иначе SNI-роутинг сломается)
-    if [[ -f /etc/telemt/telemt1.toml ]]; then
-        if grep -q "tls_domain = \"${SITE_DOMAIN}\"" /etc/telemt/telemt1.toml; then
-            warn "tls_domain == SITE_DOMAIN — SNI-роутинг не сможет разделить трафик!"
-            issues=$((issues+1))
-        else
-            ok "tls_domain отличается от домена сайта (SNI-роутинг корректен)"
-        fi
-    fi
-
-    # 5. stream SNI-конфиг существует
-    if [[ -f /etc/nginx/modules-enabled/90-stream-sni.conf ]]; then
-        ok "nginx stream SNI-роутинг настроен"
-    else
-        warn "Отсутствует /etc/nginx/modules-enabled/90-stream-sni.conf"
-        issues=$((issues+1))
-    fi
-
-    echo ""
-    if [[ $issues -eq 0 ]]; then
-        ok "${BOLD}Сайт-заглушка работает корректно${RESET}"
-    else
-        warn "${BOLD}Найдено проблем: ${issues}${RESET}"
-    fi
-}
-
 # ─── ШАГ: Установка mytelemtinfo ─────────────────────────────────────────────
 step_install_mytelemtinfo() {
     hdr "Установка команды mytelemtinfo"
@@ -2179,25 +1717,6 @@ print_summary() {
     done
     echo -e "  ${CYAN}└──────┴───────┴────────────────────────┴───────────┘${RESET}"
 
-    # ── Блок про сайт-заглушку (только для сценария site) ──
-    if [[ "${INSTALL_SCENARIO:-standard}" == "site" && -n "${SITE_DOMAIN:-}" ]]; then
-        echo ""
-        echo -e "  ${BOLD}Сайт-заглушка:${RESET}"
-        local site_status; site_status=$(systemctl is-active nginx 2>/dev/null)
-        local site_st_disp
-        case "$site_status" in
-            active)   site_st_disp="${GREEN}▶ active${RESET}" ;;
-            *)        site_st_disp="${RED}■ ${site_status}${RESET}" ;;
-        esac
-        echo -e "  nginx:    ${site_st_disp}"
-        echo -e "  URL:      ${CYAN}https://${SITE_DOMAIN}:${SITE_PORT:-8443}/${RESET}"
-        local cert="/etc/letsencrypt/live/${SITE_DOMAIN}/fullchain.pem"
-        if [[ -f "$cert" ]]; then
-            local exp; exp=$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)
-            echo -e "  Сертификат: ${GREEN}валиден до ${exp}${RESET}"
-        fi
-        echo -e "  Шаблон:   ${DIM}${SITE_TEMPLATE_URL}${RESET}"
-    fi
 
     echo ""
 
@@ -2266,6 +1785,192 @@ do_update() {
     systemctl start telemt1 telemt2 telemt3 2>/dev/null || true
     ok "Обновлено: $(/bin/telemt --version 2>&1)"
     exit 0
+}
+
+# ─── Селективное удаление модулей ─────────────────────────────────────────────
+do_selective_remove() {
+    hdr "Удаление отдельных модулей"
+    echo ""
+
+    # Собираем список установленных модулей
+    local -a mod_keys=() mod_labels=()
+
+    if [[ -x /bin/telemt ]] || [[ -d /etc/telemt ]]; then
+        mod_keys+=("telemt"); mod_labels+=("telemt (бинарник, конфиги, сервисы)")
+    fi
+    [[ -f /usr/local/bin/mytelemtinfo ]] && { mod_keys+=("mytelemtinfo"); mod_labels+=("mytelemtinfo"); }
+    if [[ -x "${PANEL_BIN:-/usr/local/bin/telemt-panel}" ]] || systemctl list-unit-files 2>/dev/null | grep -q "${PANEL_SVC:-telemt-panel}"; then
+        mod_keys+=("panel"); mod_labels+=("Web-панель (telemt_panel)")
+    fi
+    if [[ -f /etc/telemt-vless/config.json ]] || systemctl list-unit-files 2>/dev/null | grep -q telemt-vless; then
+        mod_keys+=("vless"); mod_labels+=("VLESS Reality (xray конфиги)")
+    fi
+    if [[ -f /etc/systemd/system/telemt-nft-limit.service ]] || nft list table inet telemt_limit &>/dev/null 2>&1; then
+        mod_keys+=("nft"); mod_labels+=("nft SYN limiter")
+    fi
+    if grep -q "MTProto rate-limit" /etc/ufw/before.rules 2>/dev/null; then
+        mod_keys+=("ratelimit"); mod_labels+=("UFW rate-limit")
+    fi
+    if [[ -f /etc/sysctl.d/99-telemt-net.conf ]] || [[ -f /etc/sysctl.d/99-tg-keepalive.conf ]]; then
+        mod_keys+=("sysctl"); mod_labels+=("TCP keepalive + BBR")
+    fi
+    if [[ -f /etc/nginx/sites-enabled/telemt-site.conf ]] || [[ -d /var/www/telemt-site ]]; then
+        mod_keys+=("site"); mod_labels+=("Сайт (nginx)")
+    fi
+    if [[ -f /etc/wireguard/warp.conf ]] || systemctl list-unit-files 2>/dev/null | grep -q "wg-quick@warp\|telemt-warp-socks"; then
+        mod_keys+=("warp"); mod_labels+=("WARP (legacy)")
+    fi
+
+    if ((${#mod_keys[@]} == 0)); then
+        info "Установленных модулей не обнаружено."
+        return
+    fi
+
+    echo -e "  ${BOLD}Обнаружены модули:${RESET}"
+    echo ""
+    local i
+    for i in "${!mod_labels[@]}"; do
+        echo -e "  ${BOLD}$((i+1)).${RESET} ${mod_labels[$i]}"
+    done
+    echo ""
+    echo -e "  ${BOLD}0.${RESET} Отмена"
+    echo ""
+    echo -e "  Введите номера через пробел (например: ${BOLD}1 3 5${RESET}) или ${BOLD}all${RESET}"
+    read -rp "  Удалить: " sel
+
+    [[ -z "$sel" || "$sel" == "0" ]] && { info "Отменено."; return; }
+
+    local -a chosen=()
+    if [[ "$sel" == "all" ]]; then
+        chosen=("${mod_keys[@]}")
+    else
+        for num in $sel; do
+            local idx=$((num - 1))
+            if ((idx >= 0 && idx < ${#mod_keys[@]})); then
+                chosen+=("${mod_keys[$idx]}")
+            else
+                warn "Пропущен неверный номер: $num"
+            fi
+        done
+    fi
+
+    ((${#chosen[@]} == 0)) && { info "Ничего не выбрано."; return; }
+
+    echo ""
+    echo -e "  ${YELLOW}Будут удалены:${RESET}"
+    for k in "${chosen[@]}"; do
+        local idx
+        for idx in "${!mod_keys[@]}"; do
+            [[ "${mod_keys[$idx]}" == "$k" ]] && echo -e "  • ${mod_labels[$idx]}" && break
+        done
+    done
+    echo ""
+    confirm "Подтвердить удаление?" exit || return
+
+    for k in "${chosen[@]}"; do
+        case "$k" in
+            telemt)
+                info "Удаление telemt..."
+                for n in 1 2 3 4 5 6 7 8 9 10; do
+                    if [[ -f "/etc/systemd/system/telemt${n}.service" ]]; then
+                        systemctl stop "telemt${n}" 2>/dev/null || true
+                        systemctl disable "telemt${n}" 2>/dev/null || true
+                        rm -f "/etc/systemd/system/telemt${n}.service"
+                    fi
+                done
+                # Kill orphan processes
+                pkill -f '/bin/telemt' 2>/dev/null || true
+                rm -rf /etc/telemt /opt/telemt
+                rm -f /bin/telemt
+                userdel telemt 2>/dev/null || true
+                systemctl daemon-reload 2>/dev/null || true
+                ok "telemt удалён"
+                ;;
+            mytelemtinfo)
+                rm -f /usr/local/bin/mytelemtinfo
+                ok "mytelemtinfo удалён"
+                ;;
+            panel)
+                panel_remove
+                ok "Web-панель удалена"
+                ;;
+            vless)
+                info "Удаление VLESS Reality..."
+                systemctl stop telemt-vless 2>/dev/null || true
+                systemctl disable telemt-vless 2>/dev/null || true
+                systemctl stop telemt-vless-refresh.timer 2>/dev/null || true
+                systemctl disable telemt-vless-refresh.timer 2>/dev/null || true
+                rm -f /etc/systemd/system/telemt-vless.service
+                rm -f /etc/systemd/system/telemt-vless-refresh.service
+                rm -f /etc/systemd/system/telemt-vless-refresh.timer
+                rm -f /usr/local/sbin/telemt-vless-refresh
+                rm -rf /etc/telemt-vless
+                if id xray &>/dev/null && ! pgrep -u xray &>/dev/null; then
+                    userdel xray 2>/dev/null || true
+                fi
+                systemctl daemon-reload 2>/dev/null || true
+                ok "VLESS Reality удалён"
+                ;;
+            nft)
+                systemctl stop telemt-nft-limit.service 2>/dev/null || true
+                systemctl disable telemt-nft-limit.service 2>/dev/null || true
+                rm -f /etc/systemd/system/telemt-nft-limit.service
+                rm -f /usr/local/sbin/telemt-nft-limit.sh
+                nft delete table inet telemt_limit 2>/dev/null || true
+                systemctl daemon-reload 2>/dev/null || true
+                ok "nft SYN limiter удалён"
+                ;;
+            ratelimit)
+                info "Удаление UFW rate-limit..."
+                python3 << 'PYEOF'
+path = "/etc/ufw/before.rules"
+lines = open(path).readlines()
+out, skip = [], False
+for l in lines:
+    if "MTProto rate-limit" in l and "конец" not in l: skip = True
+    if not skip: out.append(l)
+    if "конец MTProto rate-limit" in l: skip = False
+open(path,"w").writelines(out)
+PYEOF
+                rm -f /etc/modules-load.d/xt_recent.conf
+                ufw reload >/dev/null 2>&1 || true
+                ok "UFW rate-limit удалён"
+                ;;
+            sysctl)
+                rm -f /etc/sysctl.d/99-telemt-net.conf /etc/sysctl.d/99-tg-keepalive.conf
+                sysctl -w net.ipv4.tcp_keepalive_time=7200  >/dev/null 2>&1 || true
+                sysctl -w net.ipv4.tcp_keepalive_intvl=75   >/dev/null 2>&1 || true
+                sysctl -w net.ipv4.tcp_keepalive_probes=9   >/dev/null 2>&1 || true
+                sysctl --system >/dev/null 2>&1 || true
+                ok "TCP keepalive + BBR откачены к дефолтам"
+                ;;
+            site)
+                info "Удаление сайта..."
+                rm -f /etc/nginx/sites-enabled/telemt-site.conf
+                rm -f /etc/nginx/sites-available/telemt-site.conf
+                rm -rf /var/www/telemt-site /var/www/letsencrypt
+                if command -v nginx &>/dev/null && systemctl is-active --quiet nginx; then
+                    nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
+                fi
+                ok "Сайт (nginx) удалён"
+                ;;
+            warp)
+                info "Удаление WARP (legacy)..."
+                systemctl stop telemt-warp-socks 2>/dev/null || true
+                systemctl disable telemt-warp-socks 2>/dev/null || true
+                rm -f /etc/systemd/system/telemt-warp-socks.service
+                systemctl stop wg-quick@warp 2>/dev/null || true
+                systemctl disable wg-quick@warp 2>/dev/null || true
+                rm -f /etc/wireguard/warp.conf /etc/wireguard/wgcf-account.toml /etc/wireguard/wgcf-profile.conf
+                rm -f /usr/local/bin/wgcf
+                systemctl daemon-reload 2>/dev/null || true
+                ok "WARP legacy удалён"
+                ;;
+        esac
+    done
+
+    echo ""
+    ok "${BOLD}Выбранные модули удалены.${RESET}"
 }
 
 # ─── Полная очистка системы от всех компонентов установщика ─────────────────
@@ -2747,104 +2452,243 @@ main() {
     fi
 
     check_root
-    print_banner
 
     # Флаги командной строки
     [[ "${1:-}" == "--update" ]] && do_update
     [[ "${1:-}" == "--purge"  ]] && do_purge_only
     [[ "${1:-}" == "--vless-only" ]] && do_vless_only_install
 
-    echo -e "  Установка ${BOLD}telemt${RESET} — Telegram MTProxy на Rust."
+    while true; do
+    print_banner
+
+    # ── Детекция установленных компонентов ──
+    local -A DET=() 2>/dev/null || DET=()
+    local det_count=0
+
+    # telemt binary + instances
+    if [[ -x /bin/telemt ]]; then
+        local tv; tv=$(/bin/telemt --version 2>&1 | head -1)
+        local inst_ports="" inst_n=0
+        for f in /etc/telemt/telemt[0-9]*.toml; do
+            [[ -f "$f" ]] || continue
+            ((inst_n++))
+            local p; p=$(grep -oP '^\s*port\s*=\s*\K[0-9]+' "$f" 2>/dev/null)
+            [[ -n "$p" ]] && inst_ports="${inst_ports:+${inst_ports}, }${p}"
+        done
+        if ((inst_n > 0)); then
+            DET[telemt]="${tv:-binary}  ${inst_n} инст. (${inst_ports})"
+        else
+            DET[telemt]="${tv:-binary}  конфигов нет"
+        fi
+        ((det_count++))
+    elif command -v telemt &>/dev/null || [[ -x /usr/local/bin/telemt ]] || [[ -x /usr/bin/telemt ]]; then
+        local tp; tp=$(command -v telemt 2>/dev/null || echo "/usr/local/bin/telemt or /usr/bin/telemt")
+        DET[telemt_foreign]="сторонний ($tp)"
+        ((det_count++))
+    fi
+
+    # mytelemtinfo
+    [[ -f /usr/local/bin/mytelemtinfo ]] && { DET[mytelemtinfo]="установлен"; ((det_count++)); }
+
+    # web-панель
+    if [[ -x "${PANEL_BIN:-/usr/local/bin/telemt-panel}" ]]; then
+        local ps; ps=$(systemctl is-active "${PANEL_SVC:-telemt-panel}" 2>/dev/null) || true
+        DET[panel]="$ps"; ((det_count++))
+    fi
+
+    # VLESS Reality
+    if [[ -f /etc/telemt-vless/config.json ]] || systemctl list-unit-files 2>/dev/null | grep -q telemt-vless; then
+        local vs; vs=$(systemctl is-active telemt-vless 2>/dev/null) || true
+        DET[vless]="$vs"; ((det_count++))
+    fi
+
+    # nft SYN limiter
+    if [[ -f /etc/systemd/system/telemt-nft-limit.service ]] || nft list table inet telemt_limit &>/dev/null 2>&1; then
+        local ns; ns=$(systemctl is-active telemt-nft-limit 2>/dev/null) || true
+        DET[nft]="${ns:-inactive}"; ((det_count++))
+    fi
+
+    # UFW + rate-limit
+    if ufw status 2>/dev/null | grep -q "Status: active"; then
+        local rl="нет"
+        grep -q "MTProto rate-limit" /etc/ufw/before.rules 2>/dev/null && rl="да"
+        DET[ufw]="active, rate-limit: $rl"; ((det_count++))
+    fi
+
+    # TCP keepalive + BBR
+    if [[ -f /etc/sysctl.d/99-telemt-net.conf ]] || [[ -f /etc/sysctl.d/99-tg-keepalive.conf ]]; then
+        DET[sysctl]="настроен"; ((det_count++))
+    fi
+
+    # Сайт (nginx)
+    if [[ -f /etc/nginx/sites-enabled/telemt-site.conf ]] || [[ -d /var/www/telemt-site ]]; then
+        local sd=""
+        [[ -f /etc/telemt/.custom_domain ]] && sd=$(cat /etc/telemt/.custom_domain 2>/dev/null)
+        DET[site]="${sd:-конфиг есть}"; ((det_count++))
+    fi
+
+    # WARP legacy
+    if [[ -f /etc/wireguard/warp.conf ]] || systemctl list-unit-files 2>/dev/null | grep -q "wg-quick@warp\|telemt-warp-socks"; then
+        DET[warp]="обнаружен"; ((det_count++))
+    fi
+
+    # ── Вывод статуса всех компонентов ──
+    _sc() {
+        local name="$1" status="$2" color="${3:-dim}"
+        local pad=22
+        local name_len=${#name}
+        local dots=""
+        local i; for ((i = name_len; i < pad; i++)); do dots+="·"; done
+        local cs ce
+        case "$color" in
+            green)  cs="${GREEN}"; ce="${RESET}" ;;
+            red)    cs="${RED}";   ce="${RESET}" ;;
+            yellow) cs="${YELLOW}";ce="${RESET}" ;;
+            cyan)   cs="${CYAN}";  ce="${RESET}" ;;
+            *)      cs="${DIM}";   ce="${RESET}" ;;
+        esac
+        echo -e "  ${BOLD}${name}${RESET} ${DIM}${dots}${RESET} ${cs}${status}${ce}"
+    }
+
+    echo -e "  ${CYAN}╭─────────────────────────────────────────────────────╮${RESET}"
+    echo -e "  ${CYAN}│${RESET}  ${BOLD}Состояние компонентов${RESET}                               ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}╰─────────────────────────────────────────────────────╯${RESET}"
     echo ""
 
-    # Определяем что уже установлено
-    local existing_install=false
-    local telemt_exists=false
-    if [[ -f /bin/telemt ]] || [[ -d /etc/telemt ]] || [[ -f /usr/local/bin/mytelemtinfo ]]; then
-        existing_install=true
-    fi
-    # Проверяем, есть ли вообще telemt на сервере (мог быть установлен не нашим скриптом)
-    if command -v telemt &>/dev/null || [[ -x /bin/telemt ]] || [[ -x /usr/local/bin/telemt ]] || [[ -x /usr/bin/telemt ]]; then
-        telemt_exists=true
+    # telemt
+    if [[ -n "${DET[telemt]:-}" ]]; then
+        _sc "telemt" "${DET[telemt]}" "green"
+    elif [[ -n "${DET[telemt_foreign]:-}" ]]; then
+        _sc "telemt" "${DET[telemt_foreign]}" "yellow"
+    else
+        _sc "telemt" "не установлен" "dim"
     fi
 
-    # Меню режимов показываем если: есть существующая установка ИЛИ есть telemt от другого
-    # установщика ИЛИ передан --clean
-    if [[ "$existing_install" == true || "$telemt_exists" == true || "${1:-}" == "--clean" ]]; then
-        if [[ "$existing_install" == true ]]; then
-            warn "Обнаружена существующая установка telemt-install."
-        elif [[ "$telemt_exists" == true ]]; then
-            info "Обнаружен telemt установленный другим способом (не нашим скриптом)."
-        fi
-        echo ""
-        echo -e "  ${BOLD}Выберите режим:${RESET}"
-        echo -e "  ${BOLD}1.${RESET} Установка поверх ${DIM}(обычная, существующие конфиги сохраняются)${RESET}"
-        echo -e "  ${BOLD}2.${RESET} ${YELLOW}Чистая установка${RESET} ${DIM}(полная очистка + новая установка)${RESET}"
-        echo -e "  ${BOLD}3.${RESET} ${RED}Только очистка${RESET} ${DIM}(удалить всё без новой установки)${RESET}"
-        echo -e "  ${BOLD}${CYAN}4.${RESET} ${CYAN}Только установить VLESS туннель${RESET} ${DIM}(xray поверх существующего telemt)${RESET}"
-        echo -e "  ${BOLD}0.${RESET} Отмена"
-        echo ""
-        local mode
-        if [[ "${1:-}" == "--clean" ]]; then
-            mode=2
-            info "Режим --clean: чистая установка"
-        else
-            read -rp "  Режим [1/2/3/4/0]: " mode
-        fi
-        case "$mode" in
-            1) info "Режим: установка поверх существующей" ;;
-            2)
-                info "Режим: чистая установка (сначала очистка)"
-                if ! do_purge_all; then
-                    echo -e "${RED}Очистка отменена.${RESET}"
-                    exit 1
-                fi
-                echo ""
-                info "Очистка завершена. Переходим к установке..."
-                sleep 2
-                ;;
-            3) do_purge_only ;;
-            4) do_vless_only_install ;;
-            0|q|"") echo -e "${YELLOW}Отменено.${RESET}"; exit 0 ;;
-            *) err "Неверный пункт"; exit 1 ;;
-        esac
+    # mytelemtinfo
+    [[ -n "${DET[mytelemtinfo]:-}" ]] \
+        && _sc "mytelemtinfo" "установлен" "green" \
+        || _sc "mytelemtinfo" "не установлен" "dim"
+
+    # Web-панель
+    if [[ -n "${DET[panel]:-}" ]]; then
+        [[ "${DET[panel]}" == "active" ]] \
+            && _sc "Web-панель" "active" "green" \
+            || _sc "Web-панель" "${DET[panel]}" "yellow"
+    else
+        _sc "Web-панель" "не установлена" "dim"
     fi
+
+    # VLESS Reality
+    if [[ -n "${DET[vless]:-}" ]]; then
+        [[ "${DET[vless]}" == "active" ]] \
+            && _sc "VLESS Reality" "active" "green" \
+            || _sc "VLESS Reality" "${DET[vless]}" "yellow"
+    else
+        _sc "VLESS Reality" "не установлен" "dim"
+    fi
+
+    echo ""
+
+    # nft SYN limiter
+    if [[ -n "${DET[nft]:-}" ]]; then
+        [[ "${DET[nft]}" == "active" ]] \
+            && _sc "nft SYN limiter" "active" "green" \
+            || _sc "nft SYN limiter" "${DET[nft]}" "yellow"
+    else
+        _sc "nft SYN limiter" "не установлен" "dim"
+    fi
+
+    # UFW
+    [[ -n "${DET[ufw]:-}" ]] \
+        && _sc "UFW" "${DET[ufw]}" "green" \
+        || _sc "UFW" "не настроен" "dim"
+
+    # TCP keepalive + BBR
+    [[ -n "${DET[sysctl]:-}" ]] \
+        && _sc "TCP keepalive + BBR" "настроен" "green" \
+        || _sc "TCP keepalive + BBR" "не настроен" "dim"
+
+    echo ""
+
+    # Сайт (nginx)
+    [[ -n "${DET[site]:-}" ]] \
+        && _sc "Сайт (nginx)" "${DET[site]}" "cyan" \
+        || _sc "Сайт (nginx)" "не установлен" "dim"
+
+    # Свой домен
+    if [[ -f /etc/telemt/.custom_domain ]] && [[ -s /etc/telemt/.custom_domain ]]; then
+        _sc "Свой домен" "$(cat /etc/telemt/.custom_domain)" "cyan"
+    else
+        _sc "Свой домен" "не задан" "dim"
+    fi
+
+    # WARP legacy — показываем только если обнаружен
+    [[ -n "${DET[warp]:-}" ]] && _sc "WARP (legacy)" "обнаружен" "yellow"
+
+    unset -f _sc
+
+    # ── Главное меню ──
+    echo ""
+    echo -e "  ${CYAN}╭─────────────────────────────────────────────────────╮${RESET}"
+    echo -e "  ${CYAN}│${RESET}  ${BOLD}Выберите действие${RESET}                                   ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}╰─────────────────────────────────────────────────────╯${RESET}"
+    echo ""
+    echo -e "  ${GREEN}1${RESET}  ${BOLD}Чистая установка${RESET}"
+    echo -e "  ${GREEN}2${RESET}  ${BOLD}Установка поверх${RESET}"
+    echo -e "  ${GREEN}3${RESET}  ${BOLD}Очистка и установка${RESET}"
+    echo ""
+    echo -e "  ${YELLOW}4${RESET}  ${BOLD}${YELLOW}Удалить установленные модули${RESET}"
+    echo -e "  ${RED}5${RESET}  ${BOLD}${RED}Полная очистка${RESET}"
+    echo -e "  ${DIM}6${RESET}  ${BOLD}Выход${RESET}"
+    echo ""
+    local mode
+    if [[ "${1:-}" == "--clean" ]]; then
+        mode=3
+        info "Режим --clean: очистка и установка"
+    else
+        read -rp "  Выбор [1-6]: " mode
+    fi
+    case "$mode" in
+        1) info "Режим: чистая установка"; break ;;
+        2) info "Режим: установка поверх существующей"; break ;;
+        3)
+            info "Режим: очистка и установка"
+            if ! do_purge_all; then
+                echo -e "${RED}Очистка отменена.${RESET}"
+                exit 1
+            fi
+            echo ""
+            info "Очистка завершена. Переходим к установке..."
+            sleep 2
+            break
+            ;;
+        4) do_selective_remove; echo ""; info "Нажмите Enter для возврата в меню..."; read -r; continue ;;
+        5) do_purge_only ;;
+        6|0|q|"") echo -e "${YELLOW}Выход.${RESET}"; exit 0 ;;
+        *) err "Неверный пункт"; sleep 1; continue ;;
+    esac
+    done  # конец while true
 
     echo -e "  На каждом шаге: ${GREEN}y${RESET} (выполнить), Enter/n (пропустить), ${RED}q${RESET} (выход)."
     echo ""
 
-    # Выбор сценария установки (Стандартная / Свой сайт)
-    select_scenario
 
     confirm "Начать установку?" exit
 
     detect_ssh_port
 
-    # Сайт-заглушка — запрос параметров ДО select_components,
-    # потому что select_components читает SITE_DOMAIN
-    if [[ "${INSTALL_SCENARIO:-standard}" == "site" ]]; then
-        ask_site_details
-    fi
 
     select_components
 
     echo ""
     echo -e "${BOLD}Итоговый план:${RESET}"
-    echo -e "  Сценарий:        ${INSTALL_SCENARIO:-standard}"
-    if [[ "${INSTALL_SCENARIO:-standard}" == "site" ]]; then
-        echo -e "  Сайт:            ${SITE_DOMAIN:-?} на порту ${SITE_PORT:-8443}"
-        echo -e "  Email Let's Encrypt: ${SITE_EMAIL:-?}"
-        echo -e "  Шаблон сайта:    ${SITE_TEMPLATE_URL:-?}"
-    fi
     echo -e "  Инстансы:        ${INSTANCES[*]}"
     echo -e "  UFW:             $DO_UFW | rate-limit: $DO_RATELIMIT"
     echo -e "  Keepalive:       ${DO_KEEPALIVE:-false}"
     echo -e "  BBR + fq:        ${DO_BBR:-false}"
     echo -e "  nft limiter:     ${DO_NFT:-false}"
     echo -e "  Таймауты:        ${DO_TIMEOUTS:-false}"
-    if [[ "${INSTALL_SCENARIO:-standard}" != "site" ]]; then
-        echo -e "  Свой домен:      ${USE_CUSTOM_DOMAIN:-false}${USE_CUSTOM_DOMAIN:+ (${CUSTOM_LINK_DOMAIN})}"
-    fi
+    echo -e "  Свой домен:      ${USE_CUSTOM_DOMAIN:-false}${USE_CUSTOM_DOMAIN:+ (${CUSTOM_LINK_DOMAIN})}"
     echo -e "  client_mss=tspu: ${USE_TSPU:-true}"
     echo -e "  VLESS Reality:   ${DO_VLESS:-false}"
     echo -e "  Web-панель:      ${DO_PANEL:-false}"
@@ -2866,25 +2710,6 @@ main() {
     step_ratelimit
     step_keepalive
     step_nft_limiter
-    # Сайт-заглушка (только в сценарии site)
-    if [[ "${INSTALL_SCENARIO:-standard}" == "site" ]]; then
-        SITE_SETUP_FAILED=false
-        step_install_site_deps || SITE_SETUP_FAILED=true
-        if [[ "$SITE_SETUP_FAILED" != true ]]; then
-            step_clone_site_template || SITE_SETUP_FAILED=true
-        fi
-        if [[ "$SITE_SETUP_FAILED" != true ]]; then
-            step_setup_nginx || SITE_SETUP_FAILED=true
-        fi
-        if [[ "$SITE_SETUP_FAILED" != true ]]; then
-            step_get_certbot_cert || SITE_SETUP_FAILED=true
-        fi
-        if [[ "$SITE_SETUP_FAILED" != true ]]; then
-            step_setup_sni_routing || SITE_SETUP_FAILED=true
-        fi
-        # health_check всегда вызываем — он сам поймёт нужно ли отчитываться об ошибке
-        step_site_health_check
-    fi
     step_install_mytelemtinfo
     step_panel
     step_start
