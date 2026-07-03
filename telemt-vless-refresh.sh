@@ -98,6 +98,9 @@ def make_outbound(idx, n):
                 "publicKey": n["pbk"],
                 "shortId": n["sid"],
                 "spiderX": n["spx"]
+            },
+            "sockopt": {
+                "tcpKeepAliveInterval": 15
             }
         }
     }

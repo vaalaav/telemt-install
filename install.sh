@@ -1175,6 +1175,10 @@ SVC
         ok "Авто-обновление включено: telemt-vless-refresh.timer"
     fi
 
+    info "Настройка watchdog-проверки туннеля (каждые 5 минут)..."
+    install_xray_watchdog
+    ok "Watchdog включён: telemt-vless-watchdog.timer"
+
     # 9) Проверка статуса
     if systemctl is-active --quiet telemt-vless; then
         ok "Сервис telemt-vless запущен"
@@ -1432,6 +1436,45 @@ WantedBy=timers.target
 TUNIT
     systemctl daemon-reload
     systemctl enable --now telemt-vless-refresh.timer 2>&1 | grep -v "Created symlink" || true
+}
+
+install_xray_watchdog() {
+    cat > /usr/local/sbin/telemt-vless-watchdog << 'WDOG'
+#!/usr/bin/env bash
+set -uo pipefail
+systemctl is-active --quiet telemt-vless || exit 0
+if ! curl -s --max-time 5 --socks5 127.0.0.1:40000 https://api.ipify.org >/dev/null 2>&1; then
+    logger -t telemt-vless-watchdog "VLESS-тоннель не отвечает, перезапуск telemt-vless"
+    systemctl restart telemt-vless
+fi
+WDOG
+    chmod +x /usr/local/sbin/telemt-vless-watchdog
+
+    cat > /etc/systemd/system/telemt-vless-watchdog.service << 'WSVC'
+[Unit]
+Description=Watchdog for telemt-vless tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/telemt-vless-watchdog
+WSVC
+
+    cat > /etc/systemd/system/telemt-vless-watchdog.timer << 'WTIM'
+[Unit]
+Description=Check telemt-vless tunnel every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+WTIM
+    systemctl daemon-reload
+    systemctl enable --now telemt-vless-watchdog.timer 2>&1 | grep -v "Created symlink" || true
 }
 # ─── ШАГ: Установка mytelemtinfo ─────────────────────────────────────────────
 step_install_mytelemtinfo() {
