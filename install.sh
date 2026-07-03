@@ -2235,14 +2235,14 @@ do_purge_only() {
     exit 0
 }
 
-# ─── Режим --miko: DPI-оптимизация (MIKO-фиксы) ──────────────────────────────
+# ─── Режим --meko: DPI-оптимизация (MEKO-фиксы) ──────────────────────────────
 # Источник: Telemt Plus (vaalaav edition), MTPROTO_FIX_By_MEKO + reanimation.
 # SYN FIX сюда не входит — эту роль уже закрывает nft SYN limiter (step_nft_limiter),
 # держать два SYN-лимитера (nftables + iptables) на одном порту нельзя.
-_MIKO_SYSCTL_FILE="/etc/sysctl.d/99-telemt-miko.conf"
-_MIKO_BACKUP_DIR="/opt/telemt/backups"
+_MEKO_SYSCTL_FILE="/etc/sysctl.d/99-telemt-meko.conf"
+_MEKO_BACKUP_DIR="/opt/telemt/backups"
 
-_miko_toml_set() {
+_meko_toml_set() {
     local key="$1" value="$2" section="$3" file="$4"
     [[ -f "$file" ]] || return 1
     if grep -qE "^${key}[[:space:]]*=" "$file" 2>/dev/null; then
@@ -2256,10 +2256,10 @@ _miko_toml_set() {
     printf '\n[%s]\n%s = %s\n' "$section" "$key" "$value" >> "$file"
 }
 
-do_miko_only() {
+do_meko_only() {
     check_root
     print_banner
-    hdr "MIKO-фиксы — DPI-оптимизация (MTPROTO_FIX_By_MEKO)"
+    hdr "MEKO-фиксы — DPI-оптимизация (MTPROTO_FIX_By_MEKO)"
     info "SYN FIX пропущен: его роль уже выполняет nft SYN limiter"
     echo ""
 
@@ -2274,15 +2274,15 @@ do_miko_only() {
     ok "Найдено инстансов: ${#insts[@]} (${insts[*]})"
     echo ""
 
-    confirm "Применить MIKO-фиксы (MSS, sysctl, тюнинг telemt, firewall)?" exit || exit 0
+    confirm "Применить MEKO-фиксы (MSS, sysctl, тюнинг telemt, firewall)?" exit || exit 0
 
-    mkdir -p "$_MIKO_BACKUP_DIR"
+    mkdir -p "$_MEKO_BACKUP_DIR"
 
     # ── Фикс 1: MSS в конфигах telemt ──
     for n in "${insts[@]}"; do
         local f="/etc/telemt/telemt${n}.toml"
         if grep -qiE '^[^#]*mss' "$f" 2>/dev/null; then
-            cp "$f" "${_MIKO_BACKUP_DIR}/$(basename "$f").pre-mss.$(date +%s)"
+            cp "$f" "${_MEKO_BACKUP_DIR}/$(basename "$f").pre-mss.$(date +%s)"
             sed -i 's/^[[:space:]]*\(.*mss.*\)/#\1/i' "$f"
             ok "Инстанс $n: MSS отключён"
         else
@@ -2292,7 +2292,7 @@ do_miko_only() {
 
     # ── Фикс 2: sysctl ──
     info "Применение sysctl (BBR, TCP Fast Open, буферы, keepalive)..."
-    cat > "$_MIKO_SYSCTL_FILE" << 'SYSCTLEOF'
+    cat > "$_MEKO_SYSCTL_FILE" << 'SYSCTLEOF'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_fastopen = 3
@@ -2314,7 +2314,7 @@ net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_syncookies = 1
 SYSCTLEOF
-    if sysctl -p "$_MIKO_SYSCTL_FILE" > /dev/null 2>&1; then
+    if sysctl -p "$_MEKO_SYSCTL_FILE" > /dev/null 2>&1; then
         ok "sysctl применён"
     else
         warn "Часть параметров sysctl не поддержана текущим ядром"
@@ -2323,11 +2323,11 @@ SYSCTLEOF
     # ── Фикс 3: тюнинг конфигов telemt + LimitNOFILE ──
     for n in "${insts[@]}"; do
         local f="/etc/telemt/telemt${n}.toml"
-        cp "$f" "${_MIKO_BACKUP_DIR}/$(basename "$f").pre-miko.$(date +%s)"
-        _miko_toml_set "max_connections" "16384" "server" "$f"
-        _miko_toml_set "client_handshake" "15" "timeouts" "$f"
-        _miko_toml_set "tg_connect" "30" "general" "$f"
-        _miko_toml_set "client_keepalive" "120" "timeouts" "$f"
+        cp "$f" "${_MEKO_BACKUP_DIR}/$(basename "$f").pre-meko.$(date +%s)"
+        _meko_toml_set "max_connections" "16384" "server" "$f"
+        _meko_toml_set "client_handshake" "15" "timeouts" "$f"
+        _meko_toml_set "tg_connect" "30" "general" "$f"
+        _meko_toml_set "client_keepalive" "120" "timeouts" "$f"
         ok "Инстанс $n: max_connections=16384, handshake=15, tg_connect=30, keepalive=120"
 
         local override_dir="/etc/systemd/system/telemt${n}.service.d"
@@ -2357,7 +2357,7 @@ LIMEOF
     done
 
     echo ""
-    hdr "MIKO-фиксы применены"
+    hdr "MEKO-фиксы применены"
     exit 0
 }
 
@@ -2626,7 +2626,7 @@ main() {
     [[ "${1:-}" == "--update" ]] && do_update
     [[ "${1:-}" == "--purge"  ]] && do_purge_only
     [[ "${1:-}" == "--vless-only" ]] && do_vless_only_install
-    [[ "${1:-}" == "--miko" ]] && do_miko_only
+    [[ "${1:-}" == "--meko" ]] && do_meko_only
 
     while true; do
     print_banner
@@ -2809,7 +2809,7 @@ main() {
     echo ""
     echo -e "  ${YELLOW}4${RESET}  ${BOLD}${YELLOW}Удалить установленные модули${RESET}"
     echo -e "  ${RED}5${RESET}  ${BOLD}${RED}Полная очистка${RESET}"
-    echo -e "  ${CYAN}6${RESET}  ${BOLD}${CYAN}MIKO-фиксы${RESET} ${DIM}(DPI-оптимизация: MSS, sysctl, тюнинг telemt)${RESET}"
+    echo -e "  ${CYAN}6${RESET}  ${BOLD}${CYAN}MEKO-фиксы${RESET} ${DIM}(DPI-оптимизация: MSS, sysctl, тюнинг telemt)${RESET}"
     echo -e "  ${DIM}7${RESET}  ${BOLD}Выход${RESET}"
     echo ""
     local mode
@@ -2835,7 +2835,7 @@ main() {
             ;;
         4) do_selective_remove; echo ""; info "Нажмите Enter для возврата в меню..."; read -r; continue ;;
         5) do_purge_only ;;
-        6) do_miko_only ;;
+        6) do_meko_only ;;
         7|0|q|"") echo -e "${YELLOW}Выход.${RESET}"; exit 0 ;;
         *) err "Неверный пункт"; sleep 1; continue ;;
     esac

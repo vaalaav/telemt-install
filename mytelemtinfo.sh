@@ -527,7 +527,7 @@ main_menu() {
 
         echo -e "  Панель:     $(status_panel)"
         echo -e "  Ссылка:     $(status_link)"
-        echo -e "  MIKO-фиксы: $(status_miko)"
+        echo -e "  MEKO-фиксы: $(status_meko)"
         echo ""
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
         echo -e "  ${BOLD}1.${RESET} Управление прокси"
@@ -538,7 +538,7 @@ main_menu() {
         echo -e "  ${BOLD}6.${RESET} Свой домен в ссылках"
         echo -e "  ${BOLD}7.${RESET} VLESS Reality upstream"
         echo -e "  ${BOLD}8.${RESET} Панель управления (telemt_panel)"
-        echo -e "  ${BOLD}9.${RESET} MIKO-фиксы (DPI оптимизация)"
+        echo -e "  ${BOLD}9.${RESET} MEKO-фиксы (DPI оптимизация)"
         echo -e "  ${BOLD}0.${RESET} Выход"
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
         echo ""
@@ -552,7 +552,7 @@ main_menu() {
             6) menu_custom_domain ;;
             7) menu_vless ;;
             8) menu_panel ;;
-            9) menu_miko ;;
+            9) menu_meko ;;
             0|q) echo ""; exit 0 ;;
             *) warn "Неверный пункт" ; sleep 1 ;;
         esac
@@ -3439,17 +3439,17 @@ menu_panel() {
 }
 
 # ════════════════════════════════════════════════════════════════════════
-#  MIKO-ФИКСЫ (DPI-оптимизация из Telemt Plus, vaalaav edition)
+#  MEKO-ФИКСЫ (DPI-оптимизация из Telemt Plus, vaalaav edition)
 #  Источник: MTPROTO_FIX_By_MEKO (v0.74) + дополнения reanimation
 #  SYN FIX сюда НЕ переносится — его роль уже закрывает nft SYN Limiter
 #  (п.3 меню), держать два SYN-лимитера (nftables + iptables) на одном
 #  порту одновременно нельзя.
 # ════════════════════════════════════════════════════════════════════════
-MIKO_SYSCTL_FILE="/etc/sysctl.d/99-telemt-miko.conf"
-MIKO_BACKUP_DIR="/opt/telemt/backups"
-MIKO_STATE_FILE="/etc/telemt/.miko_applied"
+MEKO_SYSCTL_FILE="/etc/sysctl.d/99-telemt-meko.conf"
+MEKO_BACKUP_DIR="/opt/telemt/backups"
+MEKO_STATE_FILE="/etc/telemt/.meko_applied"
 
-_miko_toml_set() {
+_meko_toml_set() {
     local key="$1" value="$2" section="$3" file="$4"
     [[ -f "$file" ]] || return 1
     if grep -qE "^${key}[[:space:]]*=" "$file" 2>/dev/null; then
@@ -3463,30 +3463,30 @@ _miko_toml_set() {
     printf '\n[%s]\n%s = %s\n' "$section" "$key" "$value" >> "$file"
 }
 
-status_miko() {
-    if [[ ! -f "$MIKO_STATE_FILE" ]]; then
+status_meko() {
+    if [[ ! -f "$MEKO_STATE_FILE" ]]; then
         echo -e "${DIM}не применены${RESET}"
         return
     fi
-    local applied_at; applied_at=$(cat "$MIKO_STATE_FILE" 2>/dev/null)
-    if [[ -f "$MIKO_SYSCTL_FILE" ]]; then
+    local applied_at; applied_at=$(cat "$MEKO_STATE_FILE" 2>/dev/null)
+    if [[ -f "$MEKO_SYSCTL_FILE" ]]; then
         echo -e "${GREEN}применены${RESET} ${DIM}(${applied_at})${RESET}"
     else
         echo -e "${YELLOW}применялись, но sysctl-файл отсутствует${RESET}"
     fi
 }
 
-miko_disable_mss() {
+meko_disable_mss() {
     local insts; read -ra insts <<< "$(active_instances)"
     if [[ ${#insts[@]} -eq 0 ]]; then
         info "Активных инстансов не найдено — MSS-фикс пропущен"
         return 0
     fi
-    mkdir -p "$MIKO_BACKUP_DIR"
+    mkdir -p "$MEKO_BACKUP_DIR"
     for n in "${insts[@]}"; do
         local f="/etc/telemt/telemt${n}.toml"
         if grep -qiE '^[^#]*mss' "$f" 2>/dev/null; then
-            cp "$f" "${MIKO_BACKUP_DIR}/$(basename "$f").pre-mss.$(date +%s)"
+            cp "$f" "${MEKO_BACKUP_DIR}/$(basename "$f").pre-mss.$(date +%s)"
             sed -i 's/^[[:space:]]*\(.*mss.*\)/#\1/i' "$f"
             ok "Инстанс $n: MSS отключён (строки закомментированы)"
         else
@@ -3495,10 +3495,10 @@ miko_disable_mss() {
     done
 }
 
-miko_basic_optimization() {
+meko_basic_optimization() {
     info "Применение sysctl (BBR, TCP Fast Open, буферы, keepalive)..."
-    cat > "$MIKO_SYSCTL_FILE" << 'SYSCTLEOF'
-# telemt TCP tuning — MTPROTO_FIX_By_MEKO + дополнения (MIKO)
+    cat > "$MEKO_SYSCTL_FILE" << 'SYSCTLEOF'
+# telemt TCP tuning — MTPROTO_FIX_By_MEKO + дополнения (MEKO)
 # Сгенерировано mytelemtinfo
 
 net.core.default_qdisc = fq
@@ -3528,7 +3528,7 @@ net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_syncookies = 1
 SYSCTLEOF
 
-    if sysctl -p "$MIKO_SYSCTL_FILE" > /dev/null 2>&1; then
+    if sysctl -p "$MEKO_SYSCTL_FILE" > /dev/null 2>&1; then
         ok "sysctl применён"
     else
         warn "Некоторые параметры sysctl могли не примениться (не поддерживаются ядром)"
@@ -3540,17 +3540,17 @@ SYSCTLEOF
         return 0
     fi
 
-    mkdir -p "$MIKO_BACKUP_DIR"
+    mkdir -p "$MEKO_BACKUP_DIR"
     for n in "${insts[@]}"; do
         local f="/etc/telemt/telemt${n}.toml"
         [[ -f "$f" ]] || continue
 
-        cp "$f" "${MIKO_BACKUP_DIR}/$(basename "$f").pre-miko.$(date +%s)"
+        cp "$f" "${MEKO_BACKUP_DIR}/$(basename "$f").pre-meko.$(date +%s)"
 
-        _miko_toml_set "max_connections" "16384" "server" "$f"
-        _miko_toml_set "client_handshake" "15" "timeouts" "$f"
-        _miko_toml_set "tg_connect" "30" "general" "$f"
-        _miko_toml_set "client_keepalive" "120" "timeouts" "$f"
+        _meko_toml_set "max_connections" "16384" "server" "$f"
+        _meko_toml_set "client_handshake" "15" "timeouts" "$f"
+        _meko_toml_set "tg_connect" "30" "general" "$f"
+        _meko_toml_set "client_keepalive" "120" "timeouts" "$f"
         ok "Инстанс $n: max_connections=16384, handshake=15, tg_connect=30, keepalive=120"
 
         local override_dir="/etc/systemd/system/telemt${n}.service.d"
@@ -3570,7 +3570,7 @@ LIMEOF
     done
 }
 
-miko_firewall() {
+meko_firewall() {
     local insts; read -ra insts <<< "$(active_instances)"
     if [[ ${#insts[@]} -eq 0 ]]; then
         info "Активных инстансов не найдено — firewall-фикс пропущен"
@@ -3592,9 +3592,9 @@ miko_firewall() {
     fi
 }
 
-menu_miko() {
+menu_meko() {
     draw_header
-    echo -e "  ${BOLD}MIKO-фиксы: оптимизация и обход DPI${RESET}\n"
+    echo -e "  ${BOLD}MEKO-фиксы: оптимизация и обход DPI${RESET}\n"
     echo -e "  ${DIM}Источник: Telemt Plus (vaalaav edition), MTPROTO_FIX_By_MEKO${RESET}"
     echo -e "  ${DIM}SYN FIX не включён — эту роль уже выполняет nft SYN Limiter (п.3)${RESET}\n"
     echo -e "  Будет сделано:"
@@ -3607,21 +3607,21 @@ menu_miko() {
     warn "Значения применяются без проверки текущих настроек и перезапишут"
     warn "то, что задано вручную через пункт 4 (Настройки конфигов telemt)."
     echo ""
-    read -rp "  Применить MIKO-фиксы? [y/N]: " ans
+    read -rp "  Применить MEKO-фиксы? [y/N]: " ans
     if [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]]; then
         pause; return
     fi
 
     echo ""
-    miko_disable_mss
+    meko_disable_mss
     echo ""
-    miko_basic_optimization
+    meko_basic_optimization
     echo ""
-    miko_firewall
+    meko_firewall
 
-    date '+%Y-%m-%d %H:%M' > "$MIKO_STATE_FILE"
+    date '+%Y-%m-%d %H:%M' > "$MEKO_STATE_FILE"
     echo ""
-    ok "MIKO-фиксы применены"
+    ok "MEKO-фиксы применены"
     health_check_brief
     pause
 }
