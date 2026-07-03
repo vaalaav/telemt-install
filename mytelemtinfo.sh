@@ -241,60 +241,6 @@ health_check() {
         results+=("WARN\tWARP legacy\tобнаружен /etc/wireguard/warp.conf — удалите если не используется")
     fi
 
-    # 8. Сайт-заглушка (если установлена)
-    if [[ -f /etc/nginx/sites-enabled/telemt-site.conf ]]; then
-        # nginx active
-        if systemctl is-active --quiet nginx; then
-            results+=("OK\tnginx (сайт)\tactive")
-        else
-            results+=("FAIL\tnginx (сайт)\tне active")
-            issues=$((issues+1))
-        fi
-
-        # Сертификат + дата
-        local site_dom; site_dom=$(get_site_domain 2>/dev/null)
-        local cert="/etc/letsencrypt/live/${site_dom}/fullchain.pem"
-        if [[ -f "$cert" ]]; then
-            local exp_epoch now_epoch days
-            exp_epoch=$(date -d "$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)" +%s 2>/dev/null)
-            now_epoch=$(date +%s)
-            if [[ -n "$exp_epoch" ]]; then
-                days=$(( (exp_epoch - now_epoch) / 86400 ))
-                if [[ $days -gt 30 ]]; then
-                    results+=("OK\tSSL-сертификат\tвалиден ещё ${days} дней")
-                elif [[ $days -gt 0 ]]; then
-                    results+=("WARN\tSSL-сертификат\tистекает через ${days} дней — обновить через раздел 8")
-                else
-                    results+=("FAIL\tSSL-сертификат\tИСТЁК")
-                    issues=$((issues+1))
-                fi
-            fi
-        elif [[ -n "$site_dom" ]]; then
-            results+=("FAIL\tSSL-сертификат\tне найден для ${site_dom}")
-            issues=$((issues+1))
-        fi
-
-        # Тест URL (только в full)
-        if [[ "$mode" == "full" && -n "$site_dom" ]]; then
-            local site_port; site_port=$(get_site_port 2>/dev/null)
-            local su; [[ "$site_port" == "443" ]] && su="https://${site_dom}" || su="https://${site_dom}:${site_port}"
-            local code; code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 3 "${su}/" 2>/dev/null)
-            if [[ "$code" == "200" || "$code" == "30"* ]]; then
-                results+=("OK\tСайт URL\t${su}/ → ${code}")
-            else
-                results+=("WARN\tСайт URL\tкод ${code:-—} (ожидался 200)")
-            fi
-        fi
-
-        # tls_domain НЕ должен совпадать с доменом сайта (для SNI-роутинга)
-        if [[ -f /etc/telemt/telemt1.toml && -n "$site_dom" ]]; then
-            if grep -q "tls_domain = \"${site_dom}\"" /etc/telemt/telemt1.toml; then
-                results+=("WARN\ttls_domain telemt\tравен домену сайта — SNI-роутинг не работает")
-            else
-                results+=("OK\ttls_domain telemt\tотличается от домена сайта")
-            fi
-        fi
-    fi
 
     # 9. Панель управления (если установлена)
     if [[ -x "$PANEL_BIN" ]]; then
@@ -391,7 +337,7 @@ status_bbr() {
 status_nft() {
     if nft list table inet telemt_limit &>/dev/null; then
         local drops; drops=$(nft list chain inet telemt_limit input 2>/dev/null | grep -oE "packets [0-9]+" | awk '{s+=$2} END{print s+0}')
-        echo -e "${GREEN}активен${RESET}  дропов SYN: ${BOLD}${drops}${RESET}"
+        echo -e "${GREEN}активен${RESET}  reject SYN: ${BOLD}${drops}${RESET}"
     elif [[ -f /usr/local/sbin/telemt-nft-limit.sh ]]; then
         echo -e "${YELLOW}скрипт есть, таблица не активна${RESET}"
     else
@@ -502,84 +448,6 @@ status_vless() {
     fi
 }
 
-# ─── Сайт-заглушка ──────────────────────────────────────────────────────────
-SITE_CONFIG_FILE="/etc/nginx/sites-enabled/telemt-site.conf"
-SITE_WWW_DIR="/var/www/telemt-site"
-SITE_INFO_FILE="/etc/telemt/.site-info"  # хранит DOMAIN|EMAIL|TEMPLATE_URL|PORT
-
-# Получить сохранённые параметры сайта
-get_site_info() {
-    [[ -f "$SITE_INFO_FILE" ]] && cat "$SITE_INFO_FILE" 2>/dev/null
-}
-
-# Извлечь домен сайта из конфига nginx (резервно если .site-info нет)
-get_site_domain() {
-    local saved; saved=$(get_site_info)
-    if [[ -n "$saved" ]]; then
-        echo "$saved" | cut -d'|' -f1
-        return
-    fi
-    # Fallback: парсим из nginx-конфига
-    if [[ -f "$SITE_CONFIG_FILE" ]]; then
-        grep -m1 "server_name" "$SITE_CONFIG_FILE" 2>/dev/null | awk '{print $2}' | tr -d ';'
-    fi
-}
-
-get_site_port() {
-    # SNI-роутинг через nginx stream — сайт доступен на 443
-    [[ -f /etc/nginx/modules-enabled/90-stream-sni.conf ]] && { echo "443"; return; }
-    local saved; saved=$(get_site_info)
-    if [[ -n "$saved" ]]; then
-        echo "$saved" | cut -d'|' -f4
-        return
-    fi
-    grep "listen" "$SITE_CONFIG_FILE" 2>/dev/null | grep "ssl" | grep -oE '[0-9]+' | head -1 || echo "8443"
-}
-
-site_url() {
-    local dom; dom=$(get_site_domain)
-    local port; port=$(get_site_port)
-    [[ "$port" == "443" ]] && echo "https://${dom}" || echo "https://${dom}:${port}"
-}
-
-status_site() {
-    if [[ ! -f "$SITE_CONFIG_FILE" ]] && [[ ! -d "$SITE_WWW_DIR" ]]; then
-        echo -e "${DIM}не установлен${RESET}"
-        return
-    fi
-    local nginx_st="inactive" domain="?" port="?" cert_status=""
-    systemctl is-active --quiet nginx && nginx_st="active"
-    domain=$(get_site_domain)
-    port=$(get_site_port)
-
-    local cert="/etc/letsencrypt/live/${domain}/fullchain.pem"
-    if [[ -f "$cert" ]]; then
-        local exp_epoch now_epoch days
-        exp_epoch=$(date -d "$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)" +%s 2>/dev/null)
-        now_epoch=$(date +%s)
-        if [[ -n "$exp_epoch" ]]; then
-            days=$(( (exp_epoch - now_epoch) / 86400 ))
-            if [[ $days -gt 30 ]]; then
-                cert_status="${GREEN}cert ${days}д${RESET}"
-            elif [[ $days -gt 0 ]]; then
-                cert_status="${YELLOW}cert ${days}д${RESET}"
-            else
-                cert_status="${RED}cert истёк${RESET}"
-            fi
-        fi
-    else
-        cert_status="${RED}нет cert${RESET}"
-    fi
-
-    local label; [[ "$port" == "443" ]] && label="${domain}" || label="${domain}:${port}"
-    local href="https://${label}"
-
-    if [[ "$nginx_st" == "active" ]]; then
-        echo -e "\e]8;;${href}\a${GREEN}${label}${RESET}\e]8;;\a  ${cert_status}"
-    else
-        echo -e "${YELLOW}nginx ${nginx_st}${RESET}  ${label}"
-    fi
-}
 
 status_server_ip() {
     [[ -z "$_PUBLIC_IP_CACHE" ]] && _PUBLIC_IP_CACHE=$(get_public_ip)
@@ -656,9 +524,10 @@ main_menu() {
         echo -e "  Таймауты:   $(status_timeouts)"
         echo -e "  UFW:        $(status_ufw)"
         echo -e "  VLESS:      $(status_vless)"
-        echo -e "  Сайт:       $(status_site)"
+
         echo -e "  Панель:     $(status_panel)"
         echo -e "  Ссылка:     $(status_link)"
+        echo -e "  MIKO-фиксы: $(status_miko)"
         echo ""
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
         echo -e "  ${BOLD}1.${RESET} Управление прокси"
@@ -668,8 +537,8 @@ main_menu() {
         echo -e "  ${BOLD}5.${RESET} UFW / Rate-limit"
         echo -e "  ${BOLD}6.${RESET} Свой домен в ссылках"
         echo -e "  ${BOLD}7.${RESET} VLESS Reality upstream"
-        echo -e "  ${BOLD}8.${RESET} Сайт-заглушка"
-        echo -e "  ${BOLD}9.${RESET} Панель управления (telemt_panel)"
+        echo -e "  ${BOLD}8.${RESET} Панель управления (telemt_panel)"
+        echo -e "  ${BOLD}9.${RESET} MIKO-фиксы (DPI оптимизация)"
         echo -e "  ${BOLD}0.${RESET} Выход"
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
         echo ""
@@ -682,8 +551,8 @@ main_menu() {
             5) menu_ufw ;;
             6) menu_custom_domain ;;
             7) menu_vless ;;
-            8) menu_site ;;
-            9) menu_panel ;;
+            8) menu_panel ;;
+            9) menu_miko ;;
             0|q) echo ""; exit 0 ;;
             *) warn "Неверный пункт" ; sleep 1 ;;
         esac
@@ -898,7 +767,7 @@ proxy_single() {
         echo ""
         echo -e "  ${BOLD}1.${RESET} Запустить      ${BOLD}2.${RESET} Остановить"
         echo -e "  ${BOLD}3.${RESET} Перезапустить  ${BOLD}4.${RESET} Показать ссылку"
-        echo -e "  ${BOLD}5.${RESET} Логи           ${BOLD}6.${RESET} Просмотр конфига"
+        echo -e "  ${BOLD}5.${RESET} Логи           ${BOLD}6.${RESET} Редактировать конфиг"
         echo -e "  ${BOLD}0.${RESET} ← Назад"
         echo ""
         read -rp "  Выберите: " ch
@@ -909,7 +778,13 @@ proxy_single() {
             4) draw_header; link=$(get_link "${INSTANCE_APIS[$n]}"); \
                [[ -n "$link" ]] && echo -e "\n  ${GREEN}$link${RESET}\n" || warn "API не ответил"; pause ;;
             5) draw_header; journalctl -u "telemt${n}" -n 40 --no-pager; pause ;;
-            6) draw_header; echo ""; cat "/etc/telemt/telemt${n}.toml" 2>/dev/null || warn "Конфиг не найден"; pause ;;
+            6) local cfg="/etc/telemt/telemt${n}.toml"
+               if [[ -f "$cfg" ]]; then
+                   nano "$cfg"
+                   read -rp "  Перезапустить инстанс $n? (y/N): " yn
+                   [[ "$yn" =~ ^[yYдД] ]] && systemctl restart "telemt${n}" && ok "Перезапущен"
+               else warn "Конфиг не найден"; pause
+               fi ;;
             0|b) return ;;
         esac
     done
@@ -1127,8 +1002,8 @@ nft_resync() {
 
     # Получаем параметры из существующего скрипта
     local rate burst timeout ip
-    rate=$(grep -oP '(?<=^RATE=")[^"]+' /usr/local/sbin/telemt-nft-limit.sh 2>/dev/null || echo "1/second")
-    burst=$(grep -oP '(?<=^BURST=")[^"]+' /usr/local/sbin/telemt-nft-limit.sh 2>/dev/null || echo "1")
+    rate=$(grep -oP '(?<=^RATE=")[^"]+' /usr/local/sbin/telemt-nft-limit.sh 2>/dev/null || echo "55/minute")
+    burst=$(grep -oP '(?<=^BURST=")[^"]+' /usr/local/sbin/telemt-nft-limit.sh 2>/dev/null || echo "3")
     timeout=$(grep -oP '(?<=^METER_TIMEOUT=")[^"]+' /usr/local/sbin/telemt-nft-limit.sh 2>/dev/null || echo "60s")
     ip=$(grep -oP '(?<=^SERVER_IP=")[^"]+' /usr/local/sbin/telemt-nft-limit.sh 2>/dev/null)
 
@@ -1149,7 +1024,10 @@ nft_resync() {
     # Перезаписываем скрипт telemt-nft-limit.sh
     {
         echo '#!/bin/bash'
-        echo '# telemt nft inbound SYN per-client limiter (auto-regenerated)'
+        echo '# telemt nft inbound SYN per-client limiter (two-tier: iOS probe + general)'
+        echo '# iOS DPI-probe: len=64 ttl<65 -> 15/s burst 30'
+        echo '# General SYN: configurable RATE/BURST'
+        echo '# Action: reject with tcp reset (instant client feedback)'
         echo 'set -eu'
         echo ''
         echo 'TABLE="telemt_limit"'
@@ -1163,8 +1041,11 @@ nft_resync() {
         echo 'nft "add chain inet $TABLE input { type filter hook input priority 0; policy accept; }"'
         echo ''
         for p in "${ports[@]}"; do
-            echo "nft \"add rule inet \$TABLE input ip daddr \$SERVER_IP tcp dport ${p} tcp flags & (syn | ack) == syn meter telemt_in_syn_p${p} { ip saddr timeout \$METER_TIMEOUT limit rate over \$RATE burst \$BURST packets } counter drop comment \\\"telemt_syn_p${p}\\\"\""
-            echo "echo \"Правило применено: порт ${p}\""
+            # Tier 1: iOS DPI-probe (SYN len=64, TTL<65) — мягкий лимит 15/s burst 30
+            echo "nft \"add rule inet \$TABLE input ip daddr \$SERVER_IP tcp dport ${p} tcp flags & (syn|ack) == syn meta length 64 ip ttl < 65 meter telemt_ios_p${p} { ip saddr timeout \$METER_TIMEOUT limit rate over 15/second burst 30 packets } counter reject with tcp reset comment \\\"telemt_ios_p${p}\\\"\""
+            # Tier 2: общий SYN rate
+            echo "nft \"add rule inet \$TABLE input ip daddr \$SERVER_IP tcp dport ${p} tcp flags & (syn|ack) == syn meter telemt_syn_p${p} { ip saddr timeout \$METER_TIMEOUT limit rate over \$RATE burst \$BURST packets } counter reject with tcp reset comment \\\"telemt_syn_p${p}\\\"\""
+            echo "echo \"Правила применены: порт ${p} (iOS tier + general)\""
         done
         echo ''
         echo 'echo "=== Применённые правила ==="'
@@ -1965,13 +1846,14 @@ nft_change_params() {
     echo -e "  ${BOLD}Изменение параметров nft SYN limiter${RESET}\n"
 
     local cur_rate cur_burst cur_timeout
-    cur_rate=$(grep -oP '(?<=RATE=")[^"]+' /usr/local/sbin/telemt-nft-limit.sh 2>/dev/null || echo "1/second")
-    cur_burst=$(grep -oP '(?<=BURST=")[^"]+' /usr/local/sbin/telemt-nft-limit.sh 2>/dev/null || echo "1")
+    cur_rate=$(grep -oP '(?<=RATE=")[^"]+' /usr/local/sbin/telemt-nft-limit.sh 2>/dev/null || echo "55/minute")
+    cur_burst=$(grep -oP '(?<=BURST=")[^"]+' /usr/local/sbin/telemt-nft-limit.sh 2>/dev/null || echo "3")
     cur_timeout=$(grep -oP '(?<=METER_TIMEOUT=")[^"]+' /usr/local/sbin/telemt-nft-limit.sh 2>/dev/null || echo "60s")
 
-    echo -e "  ${DIM}Варианты rate:    1/second (жёстко) | 2/second (мягче)${RESET}"
-    echo -e "  ${DIM}Варианты burst:   1 (строго) | 3 (мягче для многих клиентов)${RESET}"
-    echo -e "  ${DIM}Варианты timeout: 30s (быстрее) | 60s (дефолт) | 120s (дольше)${RESET}\n"
+    echo -e "  ${DIM}Варианты rate:    55/minute (~1.1с, рекомендуется) | 30/minute (жёстко) | 2/second (мягко)${RESET}"
+    echo -e "  ${DIM}Варианты burst:   3 (рекомендуется) | 1 (строго) | 5 (много клиентов)${RESET}"
+    echo -e "  ${DIM}Варианты timeout: 30s (быстрее) | 60s (дефолт) | 120s (дольше)${RESET}"
+    echo -e "  ${DIM}iOS tier (len=64 ttl<65): 15/s burst 30 — фиксирован${RESET}\n"
 
     read -rp "  RATE        [${cur_rate}]: " new_rate;    new_rate="${new_rate:-$cur_rate}"
     read -rp "  BURST       [${cur_burst}]: " new_burst;  new_burst="${new_burst:-$cur_burst}"
@@ -2491,17 +2373,6 @@ PYEOF
 #  6. СВОЙ ДОМЕН В ССЫЛКАХ
 # ════════════════════════════════════════════════════════════════════════
 menu_custom_domain() {
-    # Если установлен сайт-заглушка — домен управляется через раздел 8
-    if [[ -f "$SITE_CONFIG_FILE" ]]; then
-        draw_header
-        echo -e "  ${BOLD}Свой домен в ссылках для клиентов${RESET}\n"
-        warn "Установлена сайт-заглушка — домен ${BOLD}$(get_site_domain)${RESET} управляется автоматически"
-        info "Этот домен совпадает с доменом сайта и используется в ссылках клиентов."
-        info "Для смены домена удалите сайт (раздел 8 → пункт 5), затем настройте заново."
-        echo ""
-        pause
-        return
-    fi
 
     while true; do
         draw_header
@@ -3318,427 +3189,7 @@ vless_remove() {
 }
 
 # ════════════════════════════════════════════════════════════════════════
-#  8. САЙТ-ЗАГЛУШКА
-# ════════════════════════════════════════════════════════════════════════
-
-menu_site() {
-    while true; do
-        draw_header
-        echo -e "  ${BOLD}Сайт-заглушка${RESET}\n"
-
-        local installed=false
-        [[ -f "$SITE_CONFIG_FILE" ]] && installed=true
-
-        if [[ "$installed" == true ]]; then
-            local dom port saved
-            dom=$(get_site_domain)
-            port=$(get_site_port)
-            saved=$(get_site_info)
-            local template_url=""
-            [[ -n "$saved" ]] && template_url=$(echo "$saved" | cut -d'|' -f3)
-
-            local nginx_st; nginx_st=$(systemctl is-active nginx 2>/dev/null)
-            if [[ "$nginx_st" == "active" ]]; then
-                echo -e "  Статус nginx:  ${GREEN}active${RESET}"
-            else
-                echo -e "  Статус nginx:  ${RED}${nginx_st}${RESET}"
-            fi
-            echo -e "  Домен:         ${BOLD}${dom}${RESET}"
-            echo -e "  Порт:          ${BOLD}${port}${RESET}"
-            echo -e "  Шаблон:        ${DIM}${template_url:-?}${RESET}"
-
-            # Сертификат
-            local cert="/etc/letsencrypt/live/${dom}/fullchain.pem"
-            if [[ -f "$cert" ]]; then
-                local exp; exp=$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)
-                echo -e "  Сертификат:    ${GREEN}валиден до ${exp}${RESET}"
-            else
-                echo -e "  Сертификат:    ${RED}нет${RESET}"
-            fi
-
-            # Тест URL
-            local su; [[ "$port" == "443" ]] && su="https://${dom}" || su="https://${dom}:${port}"
-            local http_code
-            http_code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 3 \
-                "${su}/" 2>/dev/null || echo "—")
-            echo -e "  Тест URL:      ${su}/ → ${BOLD}${http_code}${RESET}"
-            echo ""
-
-            echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
-            echo -e "  ${BOLD}1.${RESET} Сменить шаблон сайта"
-            echo -e "  ${BOLD}2.${RESET} Обновить сертификат вручную"
-            echo -e "  ${BOLD}3.${RESET} Проверка работоспособности"
-            echo -e "  ${BOLD}4.${RESET} Просмотр логов nginx"
-            echo -e "  ${BOLD}5.${RESET} ${RED}Удалить сайт-заглушку${RESET}"
-            echo -e "  ${BOLD}0.${RESET} ← Назад"
-            echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
-            echo ""
-            read -rp "  Выберите: " ch
-            case "$ch" in
-                1) site_change_template ;;
-                2) site_renew_cert ;;
-                3) site_health_check ;;
-                4) site_show_logs ;;
-                5) site_remove ;;
-                0|b) return ;;
-                *) warn "Неверный пункт"; sleep 1 ;;
-            esac
-        else
-            warn "Сайт-заглушка не установлена"
-            echo ""
-            echo -e "  Установка через mytelemtinfo требует ввести домен (с проверкой DNS),"
-            echo -e "  email для Let's Encrypt и URL шаблона из GitHub."
-            echo ""
-            echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
-            echo -e "  ${BOLD}1.${RESET} ${GREEN}Установить сайт${RESET}"
-            echo -e "  ${BOLD}0.${RESET} ← Назад"
-            echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════${RESET}"
-            echo ""
-            read -rp "  Выберите: " ch
-            case "$ch" in
-                1) site_install ;;
-                0|b) return ;;
-                *) warn "Неверный пункт"; sleep 1 ;;
-            esac
-        fi
-    done
-}
-
-# Установка сайта из mytelemtinfo (повторяет логику step_* из install.sh)
-site_install() {
-    draw_header
-    echo -e "  ${BOLD}Установка сайта-заглушки${RESET}\n"
-
-    # 1. Запрос домена с проверкой DNS
-    local site_dom server_ip resolved_ip
-    server_ip=$(get_public_ip)
-    [[ -n "$server_ip" ]] && info "IP сервера: ${BOLD}${server_ip}${RESET}"
-    while true; do
-        read -rp "  Домен сайта: " site_dom
-        [[ -z "$site_dom" || "$site_dom" != *.* ]] && { warn "Введите FQDN (например site.example.com)"; continue; }
-        resolved_ip=$(getent hosts "$site_dom" 2>/dev/null | awk '{print $1}' | head -1)
-        if [[ -z "$resolved_ip" ]]; then
-            err "Домен не резолвится"
-            read -rp "  Попробовать другой? [Y/n]: " r
-            [[ "${r,,}" =~ ^(n|no)$ ]] && { info "Отменено"; pause; return; }
-            continue
-        fi
-        if [[ -n "$server_ip" && "$resolved_ip" != "$server_ip" ]]; then
-            err "DNS не совпадает: $site_dom → $resolved_ip, IP сервера → $server_ip"
-            read -rp "  Попробовать другой? [Y/n]: " r
-            [[ "${r,,}" =~ ^(n|no)$ ]] && { info "Отменено"; pause; return; }
-            continue
-        fi
-        ok "DNS корректен: $site_dom → $resolved_ip"
-        break
-    done
-
-    # 2. Email
-    local site_email
-    while true; do
-        read -rp "  Email для Let's Encrypt: " site_email
-        [[ "$site_email" =~ ^[^@]+@[^@]+\.[^@]+$ ]] && break
-        warn "Введите корректный email"
-    done
-
-    # 3. Шаблон
-    local site_template_url
-    echo -e "  Шаблон:"
-    echo -e "  ${GREEN}1${RESET} — vaalaav/Market-Terminal-Template ${DIM}(по умолчанию)${RESET}"
-    echo -e "  ${GREEN}2${RESET} — другой GitHub-репозиторий"
-    local tc
-    read -rp "  Выбор [1/2]: " tc
-    case "$tc" in
-        2) read -rp "  URL: " site_template_url ;;
-        *) site_template_url="https://github.com/vaalaav/Market-Terminal-Template" ;;
-    esac
-
-    local site_port="8443"
-
-    # Сохраняем параметры
-    mkdir -p /etc/telemt
-    echo "${site_dom}|${site_email}|${site_template_url}|${site_port}" > "$SITE_INFO_FILE"
-    chmod 644 "$SITE_INFO_FILE"
-
-    info "Установка зависимостей..."
-    apt-get install -y nginx certbot python3-certbot-nginx git curl 2>&1 | tail -3 || { err "Ошибка apt"; pause; return; }
-    ok "nginx + certbot + git установлены"
-
-    info "Клонирование шаблона..."
-    rm -rf "$SITE_WWW_DIR"
-    if ! git clone --depth 1 "$site_template_url" "$SITE_WWW_DIR" 2>&1 | tail -3; then
-        warn "Шаблон не клонировался — создаю простую заглушку"
-        mkdir -p "$SITE_WWW_DIR"
-        echo "<h1>Сайт в разработке</h1>" > "$SITE_WWW_DIR/index.html"
-    fi
-    chown -R www-data:www-data "$SITE_WWW_DIR"
-    chmod -R o+rX "$SITE_WWW_DIR"
-
-    info "Настройка nginx (HTTP для ACME)..."
-    mkdir -p /var/www/letsencrypt
-    cat > /etc/nginx/sites-available/telemt-site.conf << NGINX
-server {
-    listen 80;
-    server_name ${site_dom};
-    location /.well-known/acme-challenge/ { root /var/www/letsencrypt; default_type "text/plain"; }
-    location / { return 301 https://\$host\$request_uri; }
-}
-NGINX
-    ln -sf /etc/nginx/sites-available/telemt-site.conf "$SITE_CONFIG_FILE"
-    rm -f /etc/nginx/sites-enabled/default
-    nginx -t 2>&1 | tail -3 && systemctl reload nginx
-
-    info "Получение сертификата Let's Encrypt..."
-    if ! certbot certonly --webroot -w /var/www/letsencrypt \
-        -d "$site_dom" --email "$site_email" \
-        --agree-tos --non-interactive --no-eff-email 2>&1 | tail -5; then
-        err "certbot не смог выпустить сертификат"
-        warn "Проверьте: A-запись, порт 80 не заблокирован, не превышен rate-limit Let's Encrypt"
-        pause; return
-    fi
-    ok "Сертификат получен"
-
-    # Дописываем HTTPS-блок
-    cat > /etc/nginx/sites-available/telemt-site.conf << NGINX
-server {
-    listen 80;
-    server_name ${site_dom};
-    location /.well-known/acme-challenge/ { root /var/www/letsencrypt; default_type "text/plain"; }
-    location / { return 301 https://\$host\$request_uri; }
-}
-
-server {
-    listen 127.0.0.1:${site_port} ssl http2;
-    server_name ${site_dom};
-    ssl_certificate     /etc/letsencrypt/live/${site_dom}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${site_dom}/privkey.pem;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    root ${SITE_WWW_DIR};
-    index index.html index.htm;
-    server_tokens off;
-    location / { try_files \$uri \$uri/ /index.html; }
-}
-NGINX
-    nginx -t 2>&1 | tail -3 && systemctl restart nginx
-    ok "nginx переключён на HTTPS на порту ${site_port}"
-
-    # UFW открыть порты
-    if ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw allow 80/tcp 2>/dev/null && info "UFW: открыт 80"
-        ufw allow "${site_port}/tcp" 2>/dev/null && info "UFW: открыт ${site_port}"
-    fi
-
-    # Сохраняем кастомный домен (он будет использоваться в ссылках telemt)
-    echo "$site_dom" > /etc/telemt/.custom_domain
-    chmod 644 /etc/telemt/.custom_domain
-
-    # SNI-роутинг: tls_domain НЕ должен совпадать с доменом сайта
-    if [[ -f /etc/telemt/telemt1.toml ]]; then
-        local cur_tls; cur_tls=$(grep -m1 'tls_domain' /etc/telemt/telemt1.toml | grep -oE '"[^"]+"' | tr -d '"')
-        if [[ "$cur_tls" == "$site_dom" ]]; then
-            sed -i 's|^tls_domain = .*|tls_domain = "www.cloudflare.com"|' /etc/telemt/telemt1.toml
-            ok "tls_domain изменён: ${site_dom} → www.cloudflare.com (для SNI-роутинга)"
-        fi
-        # Перебиндить на 127.0.0.1 для stream-прокси
-        sed -i 's/^listen_addr_ipv4 = "0\.0\.0\.0"/listen_addr_ipv4 = "127.0.0.1"/' /etc/telemt/telemt1.toml
-        systemctl restart telemt1 2>/dev/null && ok "telemt1 перезапущен на 127.0.0.1:443"
-    fi
-
-    # Настройка nginx stream SNI-роутинга
-    local pub_ip; pub_ip=$(get_public_ip 2>/dev/null)
-    if [[ -n "$pub_ip" ]]; then
-        apt-get install -y libnginx-mod-stream 2>&1 | tail -1 || true
-        cat > /etc/nginx/modules-enabled/90-stream-sni.conf << STREAM
-stream {
-    map \$ssl_preread_server_name \$backend {
-        ${site_dom}    site_https;
-        default        telemt_tls;
-    }
-    upstream site_https  { server 127.0.0.1:8443; }
-    upstream telemt_tls  { server 127.0.0.1:443;  }
-    server {
-        listen ${pub_ip}:443;
-        ssl_preread on;
-        proxy_pass \$backend;
-    }
-}
-STREAM
-        nginx -t 2>&1 | tail -1 && systemctl restart nginx && ok "SNI-роутинг настроен"
-    fi
-
-    ok "${BOLD}Сайт-заглушка установлена${RESET}"
-    health_check_brief
-    pause
-}
-
-site_change_template() {
-    draw_header
-    echo -e "  ${BOLD}Смена шаблона сайта${RESET}\n"
-    local saved; saved=$(get_site_info)
-    local cur_template; cur_template=$(echo "$saved" | cut -d'|' -f3)
-    echo -e "  Текущий шаблон: ${DIM}${cur_template}${RESET}\n"
-
-    local new_url
-    read -rp "  Новый URL GitHub-репо: " new_url
-    [[ -z "$new_url" || ! "$new_url" =~ ^https://github\.com/ ]] && { warn "Неверный URL"; pause; return; }
-
-    # Бэкап старого
-    local backup="/tmp/telemt-site.backup.$(date +%s)"
-    if [[ -d "$SITE_WWW_DIR" ]]; then
-        cp -a "$SITE_WWW_DIR" "$backup"
-        info "Бэкап старого шаблона: $backup"
-    fi
-
-    rm -rf "$SITE_WWW_DIR"
-    if ! git clone --depth 1 "$new_url" "$SITE_WWW_DIR" 2>&1 | tail -3; then
-        err "Не удалось клонировать новый шаблон"
-        if [[ -d "$backup" ]]; then
-            info "Восстанавливаем старый..."
-            mv "$backup" "$SITE_WWW_DIR"
-        fi
-        pause; return
-    fi
-    chown -R www-data:www-data "$SITE_WWW_DIR"
-    chmod -R o+rX "$SITE_WWW_DIR"
-
-    # Обновить URL в .site-info
-    local dom email port
-    dom=$(echo "$saved" | cut -d'|' -f1)
-    email=$(echo "$saved" | cut -d'|' -f2)
-    port=$(echo "$saved" | cut -d'|' -f4)
-    echo "${dom}|${email}|${new_url}|${port}" > "$SITE_INFO_FILE"
-
-    systemctl reload nginx 2>/dev/null
-    ok "Шаблон заменён"
-    health_check_brief
-    pause
-}
-
-site_renew_cert() {
-    draw_header
-    echo -e "  ${BOLD}Обновление сертификата${RESET}\n"
-    local dom; dom=$(get_site_domain)
-    info "Запуск certbot renew для $dom..."
-    if certbot renew --cert-name "$dom" --force-renewal --non-interactive 2>&1 | tail -5; then
-        ok "Сертификат обновлён"
-        systemctl reload nginx 2>/dev/null
-    else
-        err "Обновление не удалось"
-    fi
-    pause
-}
-
-site_health_check() {
-    draw_header
-    echo -e "  ${BOLD}Проверка работоспособности сайта${RESET}\n"
-
-    local dom port; dom=$(get_site_domain); port=$(get_site_port)
-    local issues=0
-
-    if systemctl is-active --quiet nginx; then
-        ok "nginx: active"
-    else
-        err "nginx: НЕ active"; issues=$((issues+1))
-    fi
-
-    local cert="/etc/letsencrypt/live/${dom}/fullchain.pem"
-    if [[ -f "$cert" ]]; then
-        local exp; exp=$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)
-        ok "Сертификат: до ${exp}"
-    else
-        err "Сертификат отсутствует"; issues=$((issues+1))
-    fi
-
-    local su; [[ "$port" == "443" ]] && su="https://${dom}" || su="https://${dom}:${port}"
-    local code
-    code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 "${su}/" 2>/dev/null)
-    if [[ "$code" == "200" || "$code" == "30"* ]]; then
-        ok "URL отвечает: ${su}/ → ${code}"
-    else
-        err "URL отвечает кодом: ${code}"; issues=$((issues+1))
-    fi
-
-    # tls_domain НЕ должен совпадать с доменом сайта
-    if [[ -f /etc/telemt/telemt1.toml ]]; then
-        if grep -q "tls_domain = \"${dom}\"" /etc/telemt/telemt1.toml; then
-            warn "tls_domain == домен сайта — SNI-роутинг не работает!"; issues=$((issues+1))
-        else
-            ok "tls_domain отличается от домена сайта"
-        fi
-    fi
-
-    # stream SNI-конфиг
-    if [[ -f /etc/nginx/modules-enabled/90-stream-sni.conf ]]; then
-        ok "nginx stream SNI-роутинг настроен"
-    else
-        warn "Нет SNI-конфига /etc/nginx/modules-enabled/90-stream-sni.conf"; issues=$((issues+1))
-    fi
-
-    echo ""
-    [[ $issues -eq 0 ]] && ok "${BOLD}Всё работает${RESET}" || warn "${BOLD}Проблем: $issues${RESET}"
-    pause
-}
-
-site_show_logs() {
-    draw_header
-    echo -e "  ${BOLD}Логи nginx${RESET}\n"
-    echo -e "  ${DIM}── access log (последние 30):${RESET}"
-    tail -30 /var/log/nginx/access.log 2>/dev/null | sed 's/^/    /'
-    echo ""
-    echo -e "  ${DIM}── error log (последние 20):${RESET}"
-    tail -20 /var/log/nginx/error.log 2>/dev/null | sed 's/^/    /'
-    pause
-}
-
-site_remove() {
-    draw_header
-    echo -e "  ${BOLD}${RED}Удаление сайта-заглушки${RESET}\n"
-    warn "Будут удалены: nginx-конфиг сайта, /var/www/telemt-site, опционально серт"
-    warn "nginx сам НЕ удаляется. telemt и его конфиги тоже остаются."
-    read -rp "  Подтвердить? [y/N]: " ans
-    [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]] && return
-
-    local dom; dom=$(get_site_domain)
-
-    rm -f /etc/nginx/sites-enabled/telemt-site.conf
-    rm -f /etc/nginx/sites-available/telemt-site.conf
-    rm -rf "$SITE_WWW_DIR" /var/www/letsencrypt
-    rm -f "$SITE_INFO_FILE"
-
-    if systemctl is-active --quiet nginx; then
-        nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null
-    fi
-    ok "Конфиги сайта удалены"
-
-    # Сертификат
-    if [[ -n "$dom" && -d "/etc/letsencrypt/live/$dom" ]]; then
-        echo ""
-        warn "Найден сертификат Let's Encrypt для ${dom}"
-        read -rp "  Удалить сертификат? [y/N]: " ans
-        if [[ "${ans,,}" =~ ^(y|yes|д|да)$ ]]; then
-            certbot delete --cert-name "$dom" --non-interactive 2>&1 | tail -2 || true
-            ok "Сертификат удалён"
-        fi
-    fi
-
-    # UFW закрыть 80 и порт сайта (если они были открыты только для сайта)
-    if ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw delete allow 80/tcp 2>/dev/null && info "UFW: закрыт 80"
-        # Порт сайта — может быть в .site-info, но мы его уже стёрли. Не трогаем 8443 явно
-    fi
-
-    # Кастомный домен — оставляем (он может использоваться отдельно), но предупреждаем
-    if [[ -f /etc/telemt/.custom_domain ]]; then
-        warn "Файл /etc/telemt/.custom_domain не удалён — снимите домен через меню 6, если нужно"
-    fi
-
-    ok "Сайт-заглушка удалена"
-    health_check_brief
-    pause
-}
-
-# ════════════════════════════════════════════════════════════════════════
-#  9. ПАНЕЛЬ УПРАВЛЕНИЯ (telemt_panel)
+#  8. ПАНЕЛЬ УПРАВЛЕНИЯ (telemt_panel)
 # ════════════════════════════════════════════════════════════════════════
 _panel_detect_arch() {
     local arch; arch=$(uname -m)
@@ -3985,6 +3436,194 @@ menu_panel() {
             esac
         fi
     done
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  MIKO-ФИКСЫ (DPI-оптимизация из Telemt Plus, vaalaav edition)
+#  Источник: MTPROTO_FIX_By_MEKO (v0.74) + дополнения reanimation
+#  SYN FIX сюда НЕ переносится — его роль уже закрывает nft SYN Limiter
+#  (п.3 меню), держать два SYN-лимитера (nftables + iptables) на одном
+#  порту одновременно нельзя.
+# ════════════════════════════════════════════════════════════════════════
+MIKO_SYSCTL_FILE="/etc/sysctl.d/99-telemt-miko.conf"
+MIKO_BACKUP_DIR="/opt/telemt/backups"
+MIKO_STATE_FILE="/etc/telemt/.miko_applied"
+
+_miko_toml_set() {
+    local key="$1" value="$2" section="$3" file="$4"
+    [[ -f "$file" ]] || return 1
+    if grep -qE "^${key}[[:space:]]*=" "$file" 2>/dev/null; then
+        sed -i "s/^${key}[[:space:]]*=.*/${key} = ${value}/" "$file"
+        return 0
+    fi
+    if grep -qE "^\[${section}\]" "$file" 2>/dev/null; then
+        sed -i "/^\[${section}\]/a ${key} = ${value}" "$file"
+        return 0
+    fi
+    printf '\n[%s]\n%s = %s\n' "$section" "$key" "$value" >> "$file"
+}
+
+status_miko() {
+    if [[ ! -f "$MIKO_STATE_FILE" ]]; then
+        echo -e "${DIM}не применены${RESET}"
+        return
+    fi
+    local applied_at; applied_at=$(cat "$MIKO_STATE_FILE" 2>/dev/null)
+    if [[ -f "$MIKO_SYSCTL_FILE" ]]; then
+        echo -e "${GREEN}применены${RESET} ${DIM}(${applied_at})${RESET}"
+    else
+        echo -e "${YELLOW}применялись, но sysctl-файл отсутствует${RESET}"
+    fi
+}
+
+miko_disable_mss() {
+    local insts; read -ra insts <<< "$(active_instances)"
+    if [[ ${#insts[@]} -eq 0 ]]; then
+        info "Активных инстансов не найдено — MSS-фикс пропущен"
+        return 0
+    fi
+    mkdir -p "$MIKO_BACKUP_DIR"
+    for n in "${insts[@]}"; do
+        local f="/etc/telemt/telemt${n}.toml"
+        if grep -qiE '^[^#]*mss' "$f" 2>/dev/null; then
+            cp "$f" "${MIKO_BACKUP_DIR}/$(basename "$f").pre-mss.$(date +%s)"
+            sed -i 's/^[[:space:]]*\(.*mss.*\)/#\1/i' "$f"
+            ok "Инстанс $n: MSS отключён (строки закомментированы)"
+        else
+            info "Инстанс $n: MSS уже отключён или отсутствует"
+        fi
+    done
+}
+
+miko_basic_optimization() {
+    info "Применение sysctl (BBR, TCP Fast Open, буферы, keepalive)..."
+    cat > "$MIKO_SYSCTL_FILE" << 'SYSCTLEOF'
+# telemt TCP tuning — MTPROTO_FIX_By_MEKO + дополнения (MIKO)
+# Сгенерировано mytelemtinfo
+
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+net.ipv4.tcp_fastopen = 3
+
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.core.netdev_max_backlog = 65535
+fs.file-max = 2097152
+
+net.ipv4.tcp_keepalive_time = 45
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 3
+
+net.ipv4.tcp_window_scaling = 1
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_syncookies = 1
+SYSCTLEOF
+
+    if sysctl -p "$MIKO_SYSCTL_FILE" > /dev/null 2>&1; then
+        ok "sysctl применён"
+    else
+        warn "Некоторые параметры sysctl могли не примениться (не поддерживаются ядром)"
+    fi
+
+    local insts; read -ra insts <<< "$(active_instances)"
+    if [[ ${#insts[@]} -eq 0 ]]; then
+        info "Активных инстансов не найдено — тюнинг конфигов и LimitNOFILE пропущены"
+        return 0
+    fi
+
+    mkdir -p "$MIKO_BACKUP_DIR"
+    for n in "${insts[@]}"; do
+        local f="/etc/telemt/telemt${n}.toml"
+        [[ -f "$f" ]] || continue
+
+        cp "$f" "${MIKO_BACKUP_DIR}/$(basename "$f").pre-miko.$(date +%s)"
+
+        _miko_toml_set "max_connections" "16384" "server" "$f"
+        _miko_toml_set "client_handshake" "15" "timeouts" "$f"
+        _miko_toml_set "tg_connect" "30" "general" "$f"
+        _miko_toml_set "client_keepalive" "120" "timeouts" "$f"
+        ok "Инстанс $n: max_connections=16384, handshake=15, tg_connect=30, keepalive=120"
+
+        local override_dir="/etc/systemd/system/telemt${n}.service.d"
+        mkdir -p "$override_dir"
+        cat > "${override_dir}/limits.conf" << 'LIMEOF'
+[Service]
+LimitNOFILE=65535
+LIMEOF
+    done
+
+    systemctl daemon-reload
+    ok "LimitNOFILE=65535 установлен для инстансов: ${insts[*]}"
+
+    info "Перезапуск инстансов для применения новых значений..."
+    for n in "${insts[@]}"; do
+        systemctl restart "telemt${n}" 2>/dev/null && ok "telemt${n} перезапущен" || err "telemt${n}: ошибка перезапуска"
+    done
+}
+
+miko_firewall() {
+    local insts; read -ra insts <<< "$(active_instances)"
+    if [[ ${#insts[@]} -eq 0 ]]; then
+        info "Активных инстансов не найдено — firewall-фикс пропущен"
+        return 0
+    fi
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        for n in "${insts[@]}"; do
+            ufw allow "${INSTANCE_PORTS[$n]}/tcp" > /dev/null 2>&1
+        done
+        ok "UFW: порты активных инстансов открыты"
+    elif command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
+        for n in "${insts[@]}"; do
+            firewall-cmd --permanent --add-port="${INSTANCE_PORTS[$n]}/tcp" > /dev/null 2>&1
+        done
+        firewall-cmd --reload > /dev/null 2>&1
+        ok "firewalld: порты активных инстансов открыты"
+    else
+        info "Активный firewall-менеджер (ufw/firewalld) не обнаружен — пропуск"
+    fi
+}
+
+menu_miko() {
+    draw_header
+    echo -e "  ${BOLD}MIKO-фиксы: оптимизация и обход DPI${RESET}\n"
+    echo -e "  ${DIM}Источник: Telemt Plus (vaalaav edition), MTPROTO_FIX_By_MEKO${RESET}"
+    echo -e "  ${DIM}SYN FIX не включён — эту роль уже выполняет nft SYN Limiter (п.3)${RESET}\n"
+    echo -e "  Будет сделано:"
+    echo -e "    • Отключение MSS в конфигах telemt (все активные инстансы)"
+    echo -e "    • sysctl: BBR, TCP Fast Open, буферы, keepalive 45/15/3"
+    echo -e "    • telemt: max_connections=16384, handshake=15, tg_connect=30, keepalive=120"
+    echo -e "    • LimitNOFILE=65535 для каждого инстанса"
+    echo -e "    • Открытие портов активных инстансов в firewall"
+    echo ""
+    warn "Значения применяются без проверки текущих настроек и перезапишут"
+    warn "то, что задано вручную через пункт 4 (Настройки конфигов telemt)."
+    echo ""
+    read -rp "  Применить MIKO-фиксы? [y/N]: " ans
+    if [[ ! "${ans,,}" =~ ^(y|yes|д|да)$ ]]; then
+        pause; return
+    fi
+
+    echo ""
+    miko_disable_mss
+    echo ""
+    miko_basic_optimization
+    echo ""
+    miko_firewall
+
+    date '+%Y-%m-%d %H:%M' > "$MIKO_STATE_FILE"
+    echo ""
+    ok "MIKO-фиксы применены"
+    health_check_brief
+    pause
 }
 
 # ════════════════════════════════════════════════════════════════════════

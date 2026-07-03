@@ -2235,6 +2235,132 @@ do_purge_only() {
     exit 0
 }
 
+# ─── Режим --miko: DPI-оптимизация (MIKO-фиксы) ──────────────────────────────
+# Источник: Telemt Plus (vaalaav edition), MTPROTO_FIX_By_MEKO + reanimation.
+# SYN FIX сюда не входит — эту роль уже закрывает nft SYN limiter (step_nft_limiter),
+# держать два SYN-лимитера (nftables + iptables) на одном порту нельзя.
+_MIKO_SYSCTL_FILE="/etc/sysctl.d/99-telemt-miko.conf"
+_MIKO_BACKUP_DIR="/opt/telemt/backups"
+
+_miko_toml_set() {
+    local key="$1" value="$2" section="$3" file="$4"
+    [[ -f "$file" ]] || return 1
+    if grep -qE "^${key}[[:space:]]*=" "$file" 2>/dev/null; then
+        sed -i "s/^${key}[[:space:]]*=.*/${key} = ${value}/" "$file"
+        return 0
+    fi
+    if grep -qE "^\[${section}\]" "$file" 2>/dev/null; then
+        sed -i "/^\[${section}\]/a ${key} = ${value}" "$file"
+        return 0
+    fi
+    printf '\n[%s]\n%s = %s\n' "$section" "$key" "$value" >> "$file"
+}
+
+do_miko_only() {
+    check_root
+    print_banner
+    hdr "MIKO-фиксы — DPI-оптимизация (MTPROTO_FIX_By_MEKO)"
+    info "SYN FIX пропущен: его роль уже выполняет nft SYN limiter"
+    echo ""
+
+    local -a insts=()
+    for f in /etc/telemt/telemt[0-9]*.toml; do
+        [[ -f "$f" ]] && insts+=("$(basename "$f" .toml | grep -oE '[0-9]+$')")
+    done
+    if ((${#insts[@]} == 0)); then
+        warn "Конфигов /etc/telemt/telemtN.toml не найдено — сначала выполните установку."
+        exit 1
+    fi
+    ok "Найдено инстансов: ${#insts[@]} (${insts[*]})"
+    echo ""
+
+    confirm "Применить MIKO-фиксы (MSS, sysctl, тюнинг telemt, firewall)?" exit || exit 0
+
+    mkdir -p "$_MIKO_BACKUP_DIR"
+
+    # ── Фикс 1: MSS в конфигах telemt ──
+    for n in "${insts[@]}"; do
+        local f="/etc/telemt/telemt${n}.toml"
+        if grep -qiE '^[^#]*mss' "$f" 2>/dev/null; then
+            cp "$f" "${_MIKO_BACKUP_DIR}/$(basename "$f").pre-mss.$(date +%s)"
+            sed -i 's/^[[:space:]]*\(.*mss.*\)/#\1/i' "$f"
+            ok "Инстанс $n: MSS отключён"
+        else
+            info "Инстанс $n: MSS уже отключён или отсутствует"
+        fi
+    done
+
+    # ── Фикс 2: sysctl ──
+    info "Применение sysctl (BBR, TCP Fast Open, буферы, keepalive)..."
+    cat > "$_MIKO_SYSCTL_FILE" << 'SYSCTLEOF'
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen = 3
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.core.netdev_max_backlog = 65535
+fs.file-max = 2097152
+net.ipv4.tcp_keepalive_time = 45
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 3
+net.ipv4.tcp_window_scaling = 1
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_syncookies = 1
+SYSCTLEOF
+    if sysctl -p "$_MIKO_SYSCTL_FILE" > /dev/null 2>&1; then
+        ok "sysctl применён"
+    else
+        warn "Часть параметров sysctl не поддержана текущим ядром"
+    fi
+
+    # ── Фикс 3: тюнинг конфигов telemt + LimitNOFILE ──
+    for n in "${insts[@]}"; do
+        local f="/etc/telemt/telemt${n}.toml"
+        cp "$f" "${_MIKO_BACKUP_DIR}/$(basename "$f").pre-miko.$(date +%s)"
+        _miko_toml_set "max_connections" "16384" "server" "$f"
+        _miko_toml_set "client_handshake" "15" "timeouts" "$f"
+        _miko_toml_set "tg_connect" "30" "general" "$f"
+        _miko_toml_set "client_keepalive" "120" "timeouts" "$f"
+        ok "Инстанс $n: max_connections=16384, handshake=15, tg_connect=30, keepalive=120"
+
+        local override_dir="/etc/systemd/system/telemt${n}.service.d"
+        mkdir -p "$override_dir"
+        cat > "${override_dir}/limits.conf" << 'LIMEOF'
+[Service]
+LimitNOFILE=65535
+LIMEOF
+    done
+    systemctl daemon-reload
+    ok "LimitNOFILE=65535 установлен для инстансов: ${insts[*]}"
+
+    # ── Фикс 4: Firewall ──
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        for n in "${insts[@]}"; do
+            local p; p=$(grep -oP '^\s*port\s*=\s*\K[0-9]+' "/etc/telemt/telemt${n}.toml" 2>/dev/null)
+            [[ -n "$p" ]] && ufw allow "${p}/tcp" > /dev/null 2>&1
+        done
+        ok "UFW: порты активных инстансов открыты"
+    fi
+
+    # ── Перезапуск ──
+    for n in "${insts[@]}"; do
+        systemctl restart "telemt${n}" 2>/dev/null \
+            && ok "telemt${n} перезапущен" \
+            || err "telemt${n}: ошибка перезапуска"
+    done
+
+    echo ""
+    hdr "MIKO-фиксы применены"
+    exit 0
+}
+
 # ─── Режим --vless-only: установить только VLESS туннель ────────────────────
 # Используется когда telemt уже работает (поставлен нашим скриптом или другим способом)
 # и нужно добавить только xray VLESS Reality upstream поверх него.
@@ -2500,6 +2626,7 @@ main() {
     [[ "${1:-}" == "--update" ]] && do_update
     [[ "${1:-}" == "--purge"  ]] && do_purge_only
     [[ "${1:-}" == "--vless-only" ]] && do_vless_only_install
+    [[ "${1:-}" == "--miko" ]] && do_miko_only
 
     while true; do
     print_banner
@@ -2682,14 +2809,15 @@ main() {
     echo ""
     echo -e "  ${YELLOW}4${RESET}  ${BOLD}${YELLOW}Удалить установленные модули${RESET}"
     echo -e "  ${RED}5${RESET}  ${BOLD}${RED}Полная очистка${RESET}"
-    echo -e "  ${DIM}6${RESET}  ${BOLD}Выход${RESET}"
+    echo -e "  ${CYAN}6${RESET}  ${BOLD}${CYAN}MIKO-фиксы${RESET} ${DIM}(DPI-оптимизация: MSS, sysctl, тюнинг telemt)${RESET}"
+    echo -e "  ${DIM}7${RESET}  ${BOLD}Выход${RESET}"
     echo ""
     local mode
     if [[ "${1:-}" == "--clean" ]]; then
         mode=3
         info "Режим --clean: очистка и установка"
     else
-        read -rp "  Выбор [1-6]: " mode
+        read -rp "  Выбор [1-7]: " mode
     fi
     case "$mode" in
         1) info "Режим: чистая установка"; break ;;
@@ -2707,7 +2835,8 @@ main() {
             ;;
         4) do_selective_remove; echo ""; info "Нажмите Enter для возврата в меню..."; read -r; continue ;;
         5) do_purge_only ;;
-        6|0|q|"") echo -e "${YELLOW}Выход.${RESET}"; exit 0 ;;
+        6) do_miko_only ;;
+        7|0|q|"") echo -e "${YELLOW}Выход.${RESET}"; exit 0 ;;
         *) err "Неверный пункт"; sleep 1; continue ;;
     esac
     done  # конец while true
