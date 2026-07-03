@@ -2,14 +2,14 @@
 
 # telemt-install
 
-**Модульный автоустановщик telemt для Ubuntu**
+**Автоустановщик telemt для Ubuntu**
 
 [![OS](https://img.shields.io/badge/Ubuntu-20.04+-E95420?logo=ubuntu&logoColor=white)](#)
 [![Shell](https://img.shields.io/badge/Bash-5.0+-4EAA25?logo=gnubash&logoColor=white)](#)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#)
 
 Разворачивает Telegram MTProxy на VPS в одну команду.\
-Полная автоматизация — от бинарника до TLS-сертификата.
+Полная автоматизация — от бинарника до готовых ссылок.
 
 🇷🇺 [Русский](#-русский) &nbsp;|&nbsp; 🇬🇧 [English](#-english)
 
@@ -37,8 +37,10 @@ sudo ./install.sh
 | | Функция | Описание |
 |:--:|---|---|
 | 🔀 | **Мультиинстанс** | До 10 параллельных прокси с индивидуальными параметрами |
-| 🛡️ | **VLESS Reality** | Интеграция xray-core — одиночные ссылки, подписки 3x-ui, балансировка, авто-обновление |
-| 🔍 | **Защита от DPI** | Rate-limit через xt_recent, nftables SYN-лимитер, поддержка TSPU-режима |
+| 🛡️ | **VLESS Reality** | Интеграция xray-core — одиночные ссылки, подписки, балансировка |
+| 📊 | **Web-панель** | telemt_panel — управление через браузер с авторизацией |
+| 🔍 | **Защита от DPI** | Rate-limit через xt_recent, nftables SYN-лимитер, TSPU-режим |
+| 🧬 | **MIKO-фиксы** | DPI-оптимизация на уровне параметров прокси и ядра |
 | ⚙️ | **Тюнинг ядра** | BBR, TCP Keepalive, настройка таймаутов |
 | 🧱 | **Файрвол** | Автонастройка UFW с синхронизацией при добавлении/удалении инстансов |
 | 🔄 | **Жизненный цикл** | systemd-сервисы, обновление бинарника, чистая переустановка, полное удаление |
@@ -52,12 +54,17 @@ sudo ./install.sh
 sudo mytelemtinfo
 ```
 
-TUI-панель для управления всеми аспектами после установки:
+TUI-панель с 9 разделами:
 
-- Управление инстансами — старт, стоп, рестарт, добавление, удаление, ссылки, логи
-- Настройка сети — Keepalive, BBR, nft SYN-лимитер, таймауты
-- Безопасность — UFW, rate-limit, TSPU
-- VLESS Reality — смена ссылки, привязка/отвязка от инстансов, тест IP
+1. **Управление прокси** — старт, стоп, рестарт, добавление и удаление инстансов, ссылки, логи, полное удаление
+2. **Сетевой тюнинг** — Keepalive, BBR
+3. **nft SYN Limiter** — параметры лимитера, счётчики
+4. **Таймауты** — настройка таймаутов telemt
+5. **UFW / Rate-limit** — управление файрволом
+6. **Свой домен** — привязка домена к ссылкам
+7. **VLESS Reality** — смена ссылки, привязка/отвязка от инстансов, тест IP
+8. **Web-панель** — установка, удаление и управление telemt_panel
+9. **MIKO-фиксы** — DPI-оптимизация
 
 ---
 
@@ -66,10 +73,11 @@ TUI-панель для управления всеми аспектами по�
 ```bash
 sudo ./install.sh              # Интерактивная установка
 sudo ./install.sh --update     # Обновить бинарник telemt
+sudo ./install.sh --clean      # Очистка + новая установка
 sudo ./install.sh --purge      # Полное удаление всех компонентов
 ```
 
-При повторном запуске — выбор: установка поверх, чистая установка или только очистка.
+При повторном запуске без флагов — выбор: установка поверх, чистая установка или только очистка.
 
 ---
 
@@ -93,8 +101,10 @@ sudo ./install.sh
 | | Feature | Description |
 |:--:|---|---|
 | 🔀 | **Multi-instance** | Up to 10 parallel proxies with individual settings |
-| 🛡️ | **VLESS Reality** | xray-core integration — single links, 3x-ui subscriptions, load balancing, auto-refresh |
-| 🔍 | **DPI Protection** | Rate-limiting via xt_recent, nftables SYN limiter, TSPU mode support |
+| 🛡️ | **VLESS Reality** | xray-core integration — single links, subscriptions, load balancing |
+| 📊 | **Web Panel** | telemt_panel — browser-based management with authentication |
+| 🔍 | **DPI Protection** | Rate-limiting via xt_recent, nftables SYN limiter, TSPU mode |
+| 🧬 | **MIKO Tweaks** | DPI optimization at proxy and kernel level |
 | ⚙️ | **Kernel Tuning** | BBR, TCP Keepalive, timeout configuration |
 | 🧱 | **Firewall** | Automatic UFW setup synced with instance changes |
 | 🔄 | **Lifecycle** | systemd services, binary updates, clean reinstall, full removal |
@@ -108,12 +118,17 @@ sudo ./install.sh
 sudo mytelemtinfo
 ```
 
-TUI panel for post-install management:
+TUI panel with 9 sections:
 
-- Instance control — start, stop, restart, add, remove, links, logs
-- Network tuning — Keepalive, BBR, nft SYN limiter, timeouts
-- Security — UFW, rate-limit, TSPU
-- VLESS Reality — change link, bind/unbind to instances, IP test
+1. **Proxy management** — start, stop, restart, add and remove instances, links, logs, full removal
+2. **Network tuning** — Keepalive, BBR
+3. **nft SYN Limiter** — limiter settings, counters
+4. **Timeouts** — telemt timeout configuration
+5. **UFW / Rate-limit** — firewall management
+6. **Custom domain** — bind domain to client links
+7. **VLESS Reality** — change link, bind/unbind to instances, IP test
+8. **Web Panel** — install, remove and manage telemt_panel
+9. **MIKO Tweaks** — DPI optimization
 
 ---
 
@@ -122,10 +137,11 @@ TUI panel for post-install management:
 ```bash
 sudo ./install.sh              # Interactive installation
 sudo ./install.sh --update     # Update telemt binary
+sudo ./install.sh --clean      # Clean wipe + fresh install
 sudo ./install.sh --purge      # Full removal of all components
 ```
 
-On re-run — choose: install over existing, clean install, or removal only.
+On re-run without flags — choose: install over existing, clean install, or removal only.
 
 ---
 
@@ -133,7 +149,7 @@ On re-run — choose: install over existing, clean install, or removal only.
 
 ### 📚 Источники / References
 
-[telemt server guide](https://assyoucandy.github.io/telemt-server-guide/) · [keepalive guide](https://assyoucandy.github.io/telemt-server-guide/telemt-keepalive-guide.html) · [nft tune](https://h1de0x.github.io/telemt-tune/) · [telemt releases](https://github.com/telemt/telemt/releases)· [telemt-panel](https://github.com/amirotin/telemt_panel)
+[telemt server guide](https://assyoucandy.github.io/telemt-server-guide/) · [keepalive guide](https://assyoucandy.github.io/telemt-server-guide/telemt-keepalive-guide.html) · [nft tune](https://h1de0x.github.io/telemt-tune/) · [telemt releases](https://github.com/telemt/telemt/releases)
 
 Часть кода написана с помощью Claude (Anthropic)
 
