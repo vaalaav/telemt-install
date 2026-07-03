@@ -40,7 +40,7 @@ sudo ./install.sh
 | 🛡️ | **VLESS Reality** | Интеграция xray-core — одиночные ссылки, подписки, балансировка |
 | 📊 | **Web-панель** | telemt_panel — управление через браузер с авторизацией |
 | 🔍 | **Защита от DPI** | Rate-limit через xt_recent, nftables SYN-лимитер, TSPU-режим |
-| 🧬 | **MIKO-фиксы** | DPI-оптимизация на уровне параметров прокси и ядра |
+| 🧬 | **MEKO-фиксы** | DPI-оптимизация на уровне параметров прокси и ядра |
 | ⚙️ | **Тюнинг ядра** | BBR, TCP Keepalive, настройка таймаутов |
 | 🧱 | **Файрвол** | Автонастройка UFW с синхронизацией при добавлении/удалении инстансов |
 | 🔄 | **Жизненный цикл** | systemd-сервисы, обновление бинарника, чистая переустановка, полное удаление |
@@ -64,7 +64,7 @@ TUI-панель с 9 разделами:
 6. **Свой домен** — привязка домена к ссылкам
 7. **VLESS Reality** — смена ссылки, привязка/отвязка от инстансов, тест IP
 8. **Web-панель** — установка, удаление и управление telemt_panel
-9. **MIKO-фиксы** — DPI-оптимизация
+9. **MEKO-фиксы** — DPI-оптимизация
 
 ---
 
@@ -104,7 +104,7 @@ sudo ./install.sh
 | 🛡️ | **VLESS Reality** | xray-core integration — single links, subscriptions, load balancing |
 | 📊 | **Web Panel** | telemt_panel — browser-based management with authentication |
 | 🔍 | **DPI Protection** | Rate-limiting via xt_recent, nftables SYN limiter, TSPU mode |
-| 🧬 | **MIKO Tweaks** | DPI optimization at proxy and kernel level |
+| 🧬 | **MEKO Tweaks** | DPI optimization at proxy and kernel level |
 | ⚙️ | **Kernel Tuning** | BBR, TCP Keepalive, timeout configuration |
 | 🧱 | **Firewall** | Automatic UFW setup synced with instance changes |
 | 🔄 | **Lifecycle** | systemd services, binary updates, clean reinstall, full removal |
@@ -128,7 +128,7 @@ TUI panel with 9 sections:
 6. **Custom domain** — bind domain to client links
 7. **VLESS Reality** — change link, bind/unbind to instances, IP test
 8. **Web Panel** — install, remove and manage telemt_panel
-9. **MIKO Tweaks** — DPI optimization
+9. **MEKO Tweaks** — DPI optimization
 
 ---
 
@@ -149,7 +149,7 @@ On re-run without flags — choose: install over existing, clean install, or rem
 
 ### 📚 Источники / References
 
-[telemt server guide](https://assyoucandy.github.io/telemt-server-guide/) · [keepalive guide](https://assyoucandy.github.io/telemt-server-guide/telemt-keepalive-guide.html) · [nft tune](https://h1de0x.github.io/telemt-tune/) · [telemt releases](https://github.com/telemt/telemt/releases)
+[telemt server guide](https://assyoucandy.github.io/telemt-server-guide/) · [keepalive guide](https://assyoucandy.github.io/telemt-server-guide/telemt-keepalive-guide.html) · [nft tune](https://h1de0x.github.io/telemt-tune/) · [telemt releases](https://github.com/telemt/telemt/releases)· [MEKO fixes](https://github.com/Mekotofeuka/MTPROTO_FIX_By_MEKO)
 
 Часть кода написана с помощью Claude (Anthropic)
 
